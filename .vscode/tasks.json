@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "C64: Build",
+      "type": "shell",
+      "command": "java",
+      "args": [
+        "-jar",
+        "/Users/brianmorrice/dev/tools/kickassembler/KickAss.jar",
+        "${workspaceFolder}/src/main.asm",
+        "-odir",
+        "${workspaceFolder}/build",
+        "-o",
+        "${workspaceFolder}/build/shooter.prg"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/src"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "C64: Run in VICE",
+      "type": "shell",
+      "command": "/opt/homebrew/bin/x64sc",
+      "args": [
+        "${workspaceFolder}/build/shooter.prg"
+      ],
+      "dependsOn": "C64: Build",
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    }
+  ]
+}
