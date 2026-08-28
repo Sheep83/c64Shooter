@@ -26,7 +26,7 @@ init:                                 // Program entry point called by the BASIC
     lda #147                          // A = PETSCII control code 147 ("clear screen").
     jsr $ffd2                         // Call KERNAL CHROUT; it interprets A and clears the screen.
 
-    jsr setupSprites                  // Initialise sprite enable flags, pointers, colours and starting positions.
+    jsr setupSprites                  // Initialise hardware sprite presentation and seed logical object positions.
 
     // --- Crude on-screen debug markers ---
     lda #24                           // A = screen-code value 24.
@@ -40,7 +40,7 @@ init:                                 // Program entry point called by the BASIC
     lda #01                           // A = 1 pixel per update.
     sta MOB_X_VEL                     // Store mob horizontal velocity in zero-page variable $002B.
 
-    jsr mainLoop                      // Enter the game loop. NOTE: mainLoop never returns, so JMP would also suit this.
+    jsr mainLoop                      // Enter the game loop. It never returns in the current program.
 
 
 checkRaster:                          // Frame-pacing routine: wait for raster line 255.
@@ -52,9 +52,10 @@ checkRaster:                          // Frame-pacing routine: wait for raster l
 
 mainLoop:                             // Main update loop. One pass is intended roughly once per video frame.
     jsr checkRaster                   // Wait until VIC-II reaches raster line 255.
-    jsr checkStick
-    jsr renderPlayer                    // Read joystick port 2 and update player position/fire state.
-    jsr moveMobs                      // Move all seven enemy sprites.
+    jsr checkStick                    // Update logical player object (object 0) from joystick input.
+    jsr renderPlayer                  // Copy logical player position into VIC hardware sprite 0.
+    jsr moveMobs                      // Update logical enemy objects 1-7 in RAM.
+    jsr renderMobs                    // Copy enemy object positions into VIC hardware sprites 1-7.
     //lda SPR_X                         // A = player sprite's 8-bit X coordinate from VIC register $D000.
     //sta SCREEN_START + 3              // Display raw X byte as a screen code in row 0, column 3.
     //lda SPR_Y                         // A = player sprite's Y coordinate from VIC register $D001.
@@ -86,37 +87,37 @@ checkStick:
         lda STICK_2                   // A = joystick port 2 state from CIA1 $DC00.
         and #1                        // Keep only bit 0 (UP). Z=1 when UP is pressed because input is active-low.
         beq up                        // If UP is pressed, skip this increment and continue at 'up'.
-        inc OBJECT_Y                     // Otherwise increment player Y: move one pixel downward.
+        inc OBJECT_Y                  // Otherwise increment object 0 Y: move player one pixel downward.
         lda OBJECT_Y                     // Reload the resulting Y coordinate into A.
         cmp #231                      // Test lower vertical boundary.
         beq !+                        // If Y reached 231, branch to local '+' label and undo the movement.
         jmp up                        // Otherwise continue with the other half of vertical input processing.
     !:
-        dec OBJECT_Y                     // Undo the increment: player is not allowed beyond the lower boundary.
+        dec OBJECT_Y                  // Undo the increment: player is not allowed beyond the lower boundary.
         jmp up                        // Continue with UP/down processing.
 
     up:                               // Second half of the vertical movement pair.
         lda STICK_2                   // Read joystick port 2 again.
         and #2                        // Keep only bit 1 (DOWN). Z=1 when DOWN is pressed.
         beq right                     // If DOWN is pressed, skip this decrement and proceed to horizontal input.
-        dec OBJECT_Y                     // Otherwise decrement Y: move one pixel upward.
+        dec OBJECT_Y                  // Otherwise decrement object 0 Y: move player one pixel upward.
         lda OBJECT_Y                  // Reload new Y coordinate.
         cmp #49                       // Test upper vertical boundary.
         beq !+                        // If Y reached 49, branch and undo the movement.
         jmp right                     // Otherwise continue to horizontal input.
     !:
-        inc OBJECT_Y                     // Undo the decrement at the upper boundary.
+        inc OBJECT_Y                  // Undo the decrement at the upper boundary.
         jmp right                     // Continue to horizontal input.
 
     right:                            // First half of the horizontal movement pair.
         lda STICK_2                   // Read joystick port 2.
         and #4                        // Keep bit 2 (LEFT). Z=1 when LEFT is pressed.
         beq left                      // LEFT pressed: skip the X increment and continue at 'left'.
-        inc OBJECT_X                     // Otherwise increment low X byte: one pixel to the right.
+        inc OBJECT_X                  // Increment object 0 low X byte: one pixel to the right.
         lda OBJECT_X                  // Reload the new low X byte.
         cmp #00                       // Did low byte wrap from 255 to 0 (crossing X=255 -> X=256)?
-        beq setOverflow               // Yes: toggle player bit 0 in $D010, the ninth X-coordinate bit.
-        cmp #66                       // Low byte 66 may mean X=66 or X=322 depending on $D010 bit 0.
+        beq setOverflow               // Yes: toggle object 0 bit 8 in the logical OBJECT_X_MSB bitfield.
+        cmp #66                       // Low byte 66 may mean X=66 or X=322 depending on logical MSB bit 0.
         beq checkRightBounds          // Resolve that ambiguity before enforcing the right boundary.
         jmp left                      // Continue with the other half of horizontal input processing.
 
@@ -124,10 +125,10 @@ checkStick:
         lda STICK_2                   // Read joystick port 2 again.
         and #8                        // Keep bit 3 (RIGHT). Z=1 when RIGHT is pressed.
         beq fire                      // RIGHT pressed: skip the X decrement and proceed to fire processing.
-        dec OBJECT_X                     // Otherwise decrement low X byte: one pixel to the left.
+        dec OBJECT_X                  // Decrement object 0 low X byte: one pixel to the left.
         lda OBJECT_X                     // Reload new low X byte.
         cmp #255                      // Did low byte wrap from 0 to 255 (crossing X=256 -> X=255)?
-        beq setOverflow               // Yes: toggle player bit 0 in $D010.
+        beq setOverflow               // Yes: toggle object 0 bit 8 in logical RAM.
         cmp #22                       // Low byte 22 is the attempted position beyond the desired left edge.
         beq checkLeftBounds           // Check the ninth X bit to determine whether this really is left-side X=22.
         jmp fire                      // Continue to fire processing.
@@ -143,44 +144,69 @@ checkStick:
 
 
 checkRightBounds:                     // Called when player's low X byte has become 66.
-    lda OBJECT_X_MSB      // A = $D010, containing the ninth X bit for all eight hardware sprites.
+    lda OBJECT_X_MSB                  // A = logical X-MSB bitfield for objects 0-7; bit 0 belongs to player.
     and #%00000001                    // Isolate bit 0, which belongs to player/hardware sprite 0.
     beq !+                            // MSB=0 means actual X=66: not the far-right boundary, so leave it alone.
-    dec OBJECT_X                         // MSB=1 means actual X=322: undo movement to keep player inside boundary.
+    dec OBJECT_X                     // MSB=1 means actual X=322: undo movement to keep player inside boundary.
 !:
     rts                               // Return to joystick routine/main loop.
 
 
 checkLeftBounds:                      // Called when player's low X byte has become 22.
-    lda OBJECT_X_MSB     // Read shared sprite X-MSB register $D010.
+    lda OBJECT_X_MSB                  // Read logical object X-MSB bitfield from RAM.
     and #%00000001                    // Isolate player's bit 0.
     bne !+                            // MSB=1 means actual X=278, not the left edge; do nothing.
-    inc OBJECT_X                        // MSB=0 means actual X=22: undo movement, keeping player at X=23.
+    inc OBJECT_X                     // MSB=0 means actual X=22: undo movement, keeping player at X=23.
 !:
     rts                               // Return.
 
 
 setOverflow:                          // Toggle player's ninth X-coordinate bit when low byte wraps.
-    lda OBJECT_X_MSB      // Read all eight sprite X-MSB bits from $D010.
+    lda OBJECT_X_MSB                  // Read logical object X-MSB bits from RAM.
     eor #%00000001                    // Toggle ONLY bit 0. Other sprites' ninth X bits are preserved.
-    sta OBJECT_X_MSB      // Write modified bitfield back to $D010.
+    sta OBJECT_X_MSB                 // Store updated logical bitfield; renderer later copies it to VIC.
     rts                               // Return.
 
 // ============================================================================
-// Sprite Render Routines
+// RENDER LOGICAL OBJECT STATE INTO VIC-II HARDWARE SPRITES
 // ============================================================================
-renderPlayer:
-    lda OBJECT_X
-    sta SPR_X
-    lda OBJECT_Y
-    sta SPR_Y
-    lda SPRITE_OVERFLOW_REGISTER
-    and #%11111110          // clear bit 0, preserve bits 1-7
-    sta TEMP_X              // keep the cleaned hardware value
-    lda OBJECT_X_MSB
-    and #%00000001          // isolate player MSB only
-    ora TEMP_X              // combine it with preserved hardware bits
-    sta SPRITE_OVERFLOW_REGISTER
+renderPlayer:                         // Render logical object 0 into hardware sprite 0.
+    lda OBJECT_X                     // A = object 0 low X byte (OBJECT_X+0).
+    sta SPR_X                        // Copy it to hardware sprite 0 X register ($D000).
+    lda OBJECT_Y                     // A = object 0 Y coordinate (OBJECT_Y+0).
+    sta SPR_Y                        // Copy it to hardware sprite 0 Y register ($D001).
+
+    // $D010 is shared by all eight hardware sprites, so renderPlayer must
+    // replace only bit 0 and preserve the current hardware values in bits 1-7.
+    lda SPRITE_OVERFLOW_REGISTER     // A = current hardware X-MSB bitfield ($D010).
+    and #%11111110                   // Clear hardware sprite 0 bit; preserve sprites 1-7.
+    sta TEMP_X                       // Save that preserved hardware value in scratch RAM.
+    lda OBJECT_X_MSB                 // A = logical X-MSB bits for objects 0-7.
+    and #%00000001                   // Keep only logical object 0's ninth X bit.
+    ora TEMP_X                       // Merge logical player bit with preserved enemy hardware bits.
+    sta SPRITE_OVERFLOW_REGISTER     // Update $D010.
+    rts
+
+renderMobs:                           // Render logical objects 1-7 into hardware sprites 1-7.
+    ldx #01                         // X = logical object index; object 0 is reserved for player.
+    ldy #02                         // Y = VIC coordinate offset: $D000+2 is hardware sprite 1 X.
+!:
+    lda OBJECT_X,x                  // Read current logical object's low X byte.
+    sta SPR_X,y                     // Write it to the corresponding hardware sprite X register.
+    lda OBJECT_Y,x                  // Read current logical object's Y coordinate.
+    sta SPR_Y,y                     // SPR_Y ($D001) + same even offset reaches that sprite's Y register.
+
+    inx                             // Advance to next logical object: 1,2,3...7.
+    iny                             // Advance VIC offset by two because X/Y registers are interleaved.
+    iny                             // Hardware offsets therefore run 2,4,6...14.
+    cpx #08                         // Object 8 means objects 1-7 are complete.
+    bne !-
+
+    // TEMPORARY 1:1 renderer: logical objects 0-7 currently map directly to
+    // hardware sprites 0-7, so their eight MSB bits have exactly the layout $D010 expects.
+    lda OBJECT_X_MSB                // Read logical X-MSB byte for objects 0-7.
+    sta SPRITE_OVERFLOW_REGISTER    // Copy all eight bits to hardware in one operation.
+                                      // This stops being sufficient once >8 logical sprites/multiplexing arrive.
     rts
 
 // ============================================================================
@@ -193,17 +219,16 @@ setupSprites:
     lda #$ff                          // A = %11111111.
     sta SPRITE_ENABLE                 // $D015: set all eight enable bits, turning sprites 0-7 on.
 
-    // --- Set sprite pointers $07F8-$07FF to $80-$87 ---
-    //
-    // In VIC bank 0, pointer $80 means $80 * 64 = $2000.
-    // Therefore pointers $80-$87 select the eight 64-byte blocks beginning
-    // at $2000, $2040, $2080 ... $21C0.
+    // --- Set hardware sprite pointers $07F8-$07FF ---
+    // Each VIC sprite pointer is the bitmap address divided by 64.
+    // The assembler calculates the values from playerSprite/enemySpriteA/B,
+    // so moving the bitmap block does not require hand-editing pointer numbers.
 
    ldx #$00                           // X = 0: index into the eight sprite-pointer bytes.
 
 pointerLoop:
-    lda spritePointers,x
-    sta HW_SPRITE_POINTER,x
+    lda spritePointers,x              // A = pointer value for this hardware sprite slot.
+    sta HW_SPRITE_POINTER,x          // Store into $07F8+X (hardware sprite pointer table).
     inx
     cpx #$08
     bne pointerLoop
@@ -222,40 +247,42 @@ colourLoop:
     cpx #07                           // Have seven mob colour registers been written?
     bne colourLoop                    // No: repeat.
 
-    // --- Initialise mob direction bitfield ---
-    lda #%00000000                    // A = all direction bits clear.
-    sta SPRITES_DIR                   // Every mob therefore begins in the routine's "moving right" state.
+    // --- Initialise logical direction bitfield ---
+    // OBJECT_DIR is two bytes because the pool can hold 16 objects. For this
+    // prototype only objects 1-7 are active, but clear both bytes now.
+    ldx #01                           // X=1 selects the second direction byte (objects 8-15).
+    lda #%00000000                    // A = all direction bits clear = initial "moving right" state.
+    sta OBJECT_DIR                    // Clear direction bits for objects 0-7.
+    sta OBJECT_DIR,x                  // Clear direction bits for objects 8-15.
 
     // --- Player starting position ---
     lda #146                          // A = initial player X low byte.
-    sta OBJECT_X                         // $D000: hardware sprite 0 X = 146. $D010 bit 0 remains clear initially.
+    sta OBJECT_X                     // Seed logical object 0 X low byte; no VIC register is touched here.
     lda #200                          // A = initial player Y.
-    sta OBJECT_Y                        // $D001: hardware sprite 0 Y = 200.
+    sta OBJECT_Y                     // Seed logical object 0 Y.
     lda #0
-    sta OBJECT_X_MSB
+    sta OBJECT_X_MSB                 // Clear X bit 8 for logical objects 0-7.
 
     // --- Mob starting X positions ---
     lda #31                           // A = first mob's X position.
-    ldx #00                           // X = offset 0 into interleaved sprite coordinate registers.
+    ldx #01                           // X = logical object 1, the first enemy.
 
 xposLoop:
+    sta OBJECT_X,x                    // Store low X byte in the current logical object.
     clc                               // Clear carry so the following ADC performs exactly A + 28.
-    sta SPR_2_X,x                     // Store A at $D002 + X: X coordinate of current mob.
-    inx                               // X += 1...
-    inx                               // ...and X += 1 again, because VIC sprite coordinates are X,Y pairs.
     adc #28                           // A = previous mob X + 28; spaces mobs horizontally.
-    cpx #14                           // Offsets used are 0,2,4,6,8,10,12: seven mobs total.
+    inx
+    cpx #08
     bne xposLoop                      // Repeat until all seven mob X positions are set.
 
     // --- Mob starting Y positions ---
-    lda #54                           // A = common starting Y coordinate for every mob.
-    ldx #00                           // Reset coordinate-register offset to zero.
+    lda #54                           // A = common starting Y coordinate for every enemy object.
+    ldx #01                           // X = logical object 1 again.
 
 yposLoop:
-    sta SPR_2_Y,x                     // Store A at $D003 + X: current mob's Y coordinate.
-    inx                               // X += 1...
-    inx                               // ...X += 1 again to reach next sprite's Y register.
-    cpx #14                           // Seven mobs written?
+    sta OBJECT_Y,x                    // Store Y directly in the current logical object.
+    inx                               // Next logical object.
+    cpx #08                           // Reached object 8? Then objects 1-7 are initialised.
     bne yposLoop                      // No: repeat.
 
     rts                               // Sprite setup complete; return to init.
@@ -265,23 +292,16 @@ yposLoop:
 // MOB UPDATE DISPATCH
 // ============================================================================
 
-moveMobs:
-    ldx #02                           // X = 2, the offset from SPR_X ($D000) to sprite 1's X register ($D002).
-    ldy #01                           // Y = 1; used to generate a one-bit mask for each mob.
+moveMobs:                             // Update logical enemy objects 1-7.
+    ldx #01                           // X is now ALWAYS the logical object index in game logic.
 
 mobLoop:
-    tya                               // A = Y. First pass A=1, then 2,4,8,... due to TAY below.
-    asl                               // Shift A left one bit: 1->2->4->8->16->32->64->128.
-                                      // ASL also moves old bit 7 into Carry and sets Z/N from result.
-    sta CURRENT_SPRITE                // Save this mob's bit mask in RAM ($2300).
-                                      // Masks correspond to $D010 bits for hardware sprites 1-7.
-    tay                               // Y = generated mask, ready to become the basis for next iteration.
-    jsr move                          // Move the mob whose VIC register offset is in X.
-    // jsr overflowMob                // Disabled old experiment/debug call.
-    inx                               // X += 1...
-    inx                               // ...X += 1: advance from one sprite's X register to the next.
-    cpx #16                           // After offsets 2,4,6,8,10,12,14, X becomes 16.
-    bne mobLoop                       // If X != 16, process another mob.
+    lda objectBitMask,x              // Convert object index into a one-bit mask (object 1 -> %00000010, etc.).
+    sta CURRENT_SPRITE                // Cache mask for packed OBJECT_DIR / OBJECT_X_MSB operations.
+    jsr move                          // Update this object's logical position and direction.
+    inx                               // Next logical enemy object.
+    cpx #08                           // Object 8 means objects 1-7 have all been processed.
+    bne mobLoop                       // Not finished: update the next enemy.
     rts                               // All seven mobs updated; return to mainLoop.
 
 
@@ -290,7 +310,7 @@ mobLoop:
 // ============================================================================
 
 move:
-    lda SPRITES_DIR                   // A = direction bitfield for all mobs.
+    lda OBJECT_DIR                   // A = packed direction bits for logical objects 0-7.
     and CURRENT_SPRITE                // Keep only the bit belonging to the current mob.
     bne !+                            // Non-zero => this mob's direction bit is set: take left-moving branch.
     beq !++                           // Zero => direction bit clear: take right-moving branch.
@@ -298,27 +318,27 @@ move:
 
 !:                                    // Local '+' label: current mob is moving LEFT.
     sec                               // Set Carry before SBC. On 6502, C=1 means "no borrow in".
-    lda SPR_X,x                       // A = current mob's low X byte. X selects $D002,$D004,...,$D00E.
+    lda OBJECT_X,x                   // A = current logical object's low X byte.
     sbc MOB_X_VEL                     // A = A - velocity - (1-C). With SEC and velocity=1, subtract exactly 1.
-    sta SPR_X,x                       // Write updated low X byte back to the VIC-II register.
+    sta OBJECT_X,x                   // Store updated low X byte back into logical RAM.
 
     cmp #255                          // Did low byte become 255? This is the 256->255 crossing when MSB was set.
-    beq overflowMob                   // Toggle this mob's $D010 bit to move from X>=256 back into X<256.
+    beq overflowMob                   // Toggle this object's logical ninth-X bit (256 -> 255 crossing).
 
     cmp #23                           // Low byte 23 is a possible left reversal coordinate.
-    beq checkMobLeftBoundary          // Check $D010 because low=23 could mean X=23 or X=279.
+    beq checkMobLeftBoundary          // Check logical MSB because low=23 could mean X=23 or X=279.
 
     rts                               // No overflow/reversal event: movement for this mob is complete.
 
 
 !:                                    // Second local '+' label: current mob is moving RIGHT.
     clc                               // Clear Carry before ADC so addition is exactly A + velocity.
-    lda SPR_X,x                       // A = current mob's low X byte.
+    lda OBJECT_X,x                   // A = current logical object's low X byte.
     adc MOB_X_VEL                     // Add horizontal velocity (currently 1).
-    sta SPR_X,x                       // Store updated low X byte.
+    sta OBJECT_X,x                   // Store updated low X byte in logical RAM.
 
     cmp #0                            // Did low byte wrap 255->0, crossing X=255 -> X=256?
-    beq overflowMob                   // Toggle this mob's ninth X bit in $D010.
+    beq overflowMob                   // Toggle this object's logical ninth-X bit.
 
     cmp #66                           // Low byte 66 is a possible right reversal coordinate.
     beq checkMobRightBoundary         // Check MSB because low=66 could mean X=66 or X=322.
@@ -326,37 +346,36 @@ move:
     rts                               // Normal movement complete.
 
 
-overflowMob:                          // Toggle the ninth X-coordinate bit for CURRENT_SPRITE.
-    lda SPRITE_OVERFLOW_REGISTER      // A = all eight sprite X-MSB bits from $D010.
+overflowMob:                          // Toggle current logical object's ninth X-coordinate bit.
+    lda OBJECT_X_MSB                 // A = packed X-MSB bits for logical objects 0-7.
     eor CURRENT_SPRITE                // Toggle only the bit represented by CURRENT_SPRITE.
-    sta SPRITE_OVERFLOW_REGISTER      // Write the updated shared bitfield back to $D010.
+    sta OBJECT_X_MSB                 // Save the updated logical X-MSB bitfield in RAM.
     rts                               // Return directly to moveMobs (because this routine was reached by branch).
 
 
 reverseMob:                           // Reverse current mob and drop it down one row.
-    lda SPR_Y,x                       // A = current mob's Y coordinate.
-                                      // X points at its X register; SPR_Y ($D001) + same X reaches its Y register.
+    lda OBJECT_Y,x                   // A = current logical object's Y coordinate.
     clc                               // Clear carry so the vertical displacement is exactly 24.
     adc #24                           // A = Y + 24 pixels.
-    sta SPR_Y,x                       // Store the new lower Y coordinate.
+    sta OBJECT_Y,x                   // Store new logical Y coordinate.
 
-    lda SPRITES_DIR                   // A = direction bits for all mobs.
+    lda OBJECT_DIR                   // A = packed direction bits for logical objects 0-7.
     eor CURRENT_SPRITE                // Toggle only the current mob's direction bit.
-    sta SPRITES_DIR                   // Save the changed direction bitfield.
+    sta OBJECT_DIR                   // Save the changed direction bitfield.
     rts                               // Return to moveMobs.
 
 
 checkMobRightBoundary:                // Resolve ambiguity when mob low X byte is 66.
-    lda SPRITE_OVERFLOW_REGISTER      // A = shared ninth-X-bit register $D010.
+    lda OBJECT_X_MSB                 // A = logical X-MSB bitfield for objects 0-7.
     and CURRENT_SPRITE                // Isolate the current mob's ninth X bit.
-    beq !+                            // Bit clear => actual X=66, so this is NOT the right boundary.
+    beq !+                            // Bit clear => actual X=66, not the far-right boundary.
     jmp reverseMob                    // Bit set => actual X=256+66=322: reverse and descend.
 !:
     rts                               // X=66: continue moving right on future frames.
 
 
 checkMobLeftBoundary:                 // Resolve ambiguity when mob low X byte is 23.
-    lda SPRITE_OVERFLOW_REGISTER      // A = shared ninth-X-bit register $D010.
+    lda OBJECT_X_MSB                 // A = logical X-MSB bitfield for objects 0-7.
     and CURRENT_SPRITE                // Isolate current mob's ninth X bit.
     bne !+                            // Bit set => actual X=256+23=279, so this is NOT the left boundary.
     jmp reverseMob                    // Bit clear => actual X=23: reverse and descend.
@@ -377,8 +396,22 @@ spritePointers:
     .byte enemySpriteB / 64
     .byte enemySpriteA / 64
 
+// ============================================================================
+// LOGICAL OBJECT BIT-MASK LOOKUP TABLE
+// ============================================================================
+
+objectBitMask:
+    .byte %00000001
+    .byte %00000010
+    .byte %00000100
+    .byte %00001000
+    .byte %00010000
+    .byte %00100000
+    .byte %01000000
+    .byte %10000000
+
 // ---------------------------------------------------------
-// Logical object state
+// LOGICAL OBJECT STATE POOL
 // ---------------------------------------------------------
 
 .const MAX_OBJECTS = 16
@@ -393,6 +426,9 @@ OBJECT_Y:
 
 OBJECT_X_MSB:
     .fill 2, 0                 // $2020-$2021 : X bit 8 for objects 0-15
+
+OBJECT_DIR:
+    .fill 2, 0                 // $2022-$2023 : one packed direction bit per logical object
 
 // ============================================================================
 // SPRITE BITMAP DATA
