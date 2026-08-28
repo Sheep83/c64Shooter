@@ -12,8 +12,9 @@
         "-odir",
         "${workspaceFolder}/build",
         "-o",
-        "${workspaceFolder}/build/shooter.prg"
-      ],
+        "${workspaceFolder}/build/shooter.prg",
+        "-vicesymbols"
+],
       "options": {
         "cwd": "${workspaceFolder}/src"
       },
@@ -24,15 +25,15 @@
       "problemMatcher": []
     },
     {
-      "label": "C64: Run in VICE",
-      "type": "shell",
-      "command": "/opt/homebrew/bin/x64sc",
-      "args": [
+    "label": "C64: Run in VICE",
+    "type": "shell",
+    "command": "/opt/homebrew/bin/x64sc",
+    "args": [
         "${workspaceFolder}/build/shooter.prg"
-      ],
-      "dependsOn": "C64: Build",
-      "dependsOrder": "sequence",
-      "problemMatcher": []
-    }
+    ],
+    "dependsOn": "C64: Build",
+    "dependsOrder": "sequence",
+    "problemMatcher": []
+}
   ]
 }

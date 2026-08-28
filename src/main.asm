@@ -52,16 +52,13 @@ checkRaster:                          // Frame-pacing routine: wait for raster l
 
 mainLoop:                             // Main update loop. One pass is intended roughly once per video frame.
     jsr checkRaster                   // Wait until VIC-II reaches raster line 255.
-    jsr checkStick                    // Read joystick port 2 and update player position/fire state.
+    jsr checkStick
+    jsr renderPlayer                    // Read joystick port 2 and update player position/fire state.
     jsr moveMobs                      // Move all seven enemy sprites.
-
-    lda SPR_X                         // A = player sprite's 8-bit X coordinate from VIC register $D000.
-    // jsr $ffd2                       // Old/disabled debug experiment; CHROUT would interpret A as a character.
-    sta SCREEN_START + 3              // Display raw X byte as a screen code in row 0, column 3.
-
-    lda SPR_Y                         // A = player sprite's Y coordinate from VIC register $D001.
-    sta SCREEN_START + 43             // Display raw Y byte as a screen code in row 1, column 3.
-
+    //lda SPR_X                         // A = player sprite's 8-bit X coordinate from VIC register $D000.
+    //sta SCREEN_START + 3              // Display raw X byte as a screen code in row 0, column 3.
+    //lda SPR_Y                         // A = player sprite's Y coordinate from VIC register $D001.
+    //sta SCREEN_START + 43             // Display raw Y byte as a screen code in row 1, column 3.
     jmp mainLoop                      // Repeat forever. JMP is correct here: unlike JSR it does not leak return addresses.
 
 
@@ -89,34 +86,34 @@ checkStick:
         lda STICK_2                   // A = joystick port 2 state from CIA1 $DC00.
         and #1                        // Keep only bit 0 (UP). Z=1 when UP is pressed because input is active-low.
         beq up                        // If UP is pressed, skip this increment and continue at 'up'.
-        inc SPR_Y                     // Otherwise increment player Y: move one pixel downward.
-        lda SPR_Y                     // Reload the resulting Y coordinate into A.
+        inc OBJECT_Y                     // Otherwise increment player Y: move one pixel downward.
+        lda OBJECT_Y                     // Reload the resulting Y coordinate into A.
         cmp #231                      // Test lower vertical boundary.
         beq !+                        // If Y reached 231, branch to local '+' label and undo the movement.
         jmp up                        // Otherwise continue with the other half of vertical input processing.
     !:
-        dec SPR_Y                     // Undo the increment: player is not allowed beyond the lower boundary.
+        dec OBJECT_Y                     // Undo the increment: player is not allowed beyond the lower boundary.
         jmp up                        // Continue with UP/down processing.
 
     up:                               // Second half of the vertical movement pair.
         lda STICK_2                   // Read joystick port 2 again.
         and #2                        // Keep only bit 1 (DOWN). Z=1 when DOWN is pressed.
         beq right                     // If DOWN is pressed, skip this decrement and proceed to horizontal input.
-        dec SPR_Y                     // Otherwise decrement Y: move one pixel upward.
-        lda SPR_Y                     // Reload new Y coordinate.
+        dec OBJECT_Y                     // Otherwise decrement Y: move one pixel upward.
+        lda OBJECT_Y                  // Reload new Y coordinate.
         cmp #49                       // Test upper vertical boundary.
         beq !+                        // If Y reached 49, branch and undo the movement.
         jmp right                     // Otherwise continue to horizontal input.
     !:
-        inc SPR_Y                     // Undo the decrement at the upper boundary.
+        inc OBJECT_Y                     // Undo the decrement at the upper boundary.
         jmp right                     // Continue to horizontal input.
 
     right:                            // First half of the horizontal movement pair.
         lda STICK_2                   // Read joystick port 2.
         and #4                        // Keep bit 2 (LEFT). Z=1 when LEFT is pressed.
         beq left                      // LEFT pressed: skip the X increment and continue at 'left'.
-        inc SPR_X                     // Otherwise increment low X byte: one pixel to the right.
-        lda SPR_X                     // Reload the new low X byte.
+        inc OBJECT_X                     // Otherwise increment low X byte: one pixel to the right.
+        lda OBJECT_X                  // Reload the new low X byte.
         cmp #00                       // Did low byte wrap from 255 to 0 (crossing X=255 -> X=256)?
         beq setOverflow               // Yes: toggle player bit 0 in $D010, the ninth X-coordinate bit.
         cmp #66                       // Low byte 66 may mean X=66 or X=322 depending on $D010 bit 0.
@@ -127,8 +124,8 @@ checkStick:
         lda STICK_2                   // Read joystick port 2 again.
         and #8                        // Keep bit 3 (RIGHT). Z=1 when RIGHT is pressed.
         beq fire                      // RIGHT pressed: skip the X decrement and proceed to fire processing.
-        dec SPR_X                     // Otherwise decrement low X byte: one pixel to the left.
-        lda SPR_X                     // Reload new low X byte.
+        dec OBJECT_X                     // Otherwise decrement low X byte: one pixel to the left.
+        lda OBJECT_X                     // Reload new low X byte.
         cmp #255                      // Did low byte wrap from 0 to 255 (crossing X=256 -> X=255)?
         beq setOverflow               // Yes: toggle player bit 0 in $D010.
         cmp #22                       // Low byte 22 is the attempted position beyond the desired left edge.
@@ -146,29 +143,45 @@ checkStick:
 
 
 checkRightBounds:                     // Called when player's low X byte has become 66.
-    lda SPRITE_OVERFLOW_REGISTER      // A = $D010, containing the ninth X bit for all eight hardware sprites.
+    lda OBJECT_X_MSB      // A = $D010, containing the ninth X bit for all eight hardware sprites.
     and #%00000001                    // Isolate bit 0, which belongs to player/hardware sprite 0.
     beq !+                            // MSB=0 means actual X=66: not the far-right boundary, so leave it alone.
-    dec SPR_X                         // MSB=1 means actual X=322: undo movement to keep player inside boundary.
+    dec OBJECT_X                         // MSB=1 means actual X=322: undo movement to keep player inside boundary.
 !:
     rts                               // Return to joystick routine/main loop.
 
 
 checkLeftBounds:                      // Called when player's low X byte has become 22.
-    lda SPRITE_OVERFLOW_REGISTER      // Read shared sprite X-MSB register $D010.
+    lda OBJECT_X_MSB     // Read shared sprite X-MSB register $D010.
     and #%00000001                    // Isolate player's bit 0.
     bne !+                            // MSB=1 means actual X=278, not the left edge; do nothing.
-    inc SPR_X                         // MSB=0 means actual X=22: undo movement, keeping player at X=23.
+    inc OBJECT_X                        // MSB=0 means actual X=22: undo movement, keeping player at X=23.
 !:
     rts                               // Return.
 
 
 setOverflow:                          // Toggle player's ninth X-coordinate bit when low byte wraps.
-    lda SPRITE_OVERFLOW_REGISTER      // Read all eight sprite X-MSB bits from $D010.
+    lda OBJECT_X_MSB      // Read all eight sprite X-MSB bits from $D010.
     eor #%00000001                    // Toggle ONLY bit 0. Other sprites' ninth X bits are preserved.
-    sta SPRITE_OVERFLOW_REGISTER      // Write modified bitfield back to $D010.
+    sta OBJECT_X_MSB      // Write modified bitfield back to $D010.
     rts                               // Return.
 
+// ============================================================================
+// Sprite Render Routines
+// ============================================================================
+renderPlayer:
+    lda OBJECT_X
+    sta SPR_X
+    lda OBJECT_Y
+    sta SPR_Y
+    lda SPRITE_OVERFLOW_REGISTER
+    and #%11111110          // clear bit 0, preserve bits 1-7
+    sta TEMP_X              // keep the cleaned hardware value
+    lda OBJECT_X_MSB
+    and #%00000001          // isolate player MSB only
+    ora TEMP_X              // combine it with preserved hardware bits
+    sta SPRITE_OVERFLOW_REGISTER
+    rts
 
 // ============================================================================
 // SPRITE INITIALISATION
@@ -215,9 +228,11 @@ colourLoop:
 
     // --- Player starting position ---
     lda #146                          // A = initial player X low byte.
-    sta SPR_X                         // $D000: hardware sprite 0 X = 146. $D010 bit 0 remains clear initially.
+    sta OBJECT_X                         // $D000: hardware sprite 0 X = 146. $D010 bit 0 remains clear initially.
     lda #200                          // A = initial player Y.
-    sta SPR_Y                         // $D001: hardware sprite 0 Y = 200.
+    sta OBJECT_Y                        // $D001: hardware sprite 0 Y = 200.
+    lda #0
+    sta OBJECT_X_MSB
 
     // --- Mob starting X positions ---
     lda #31                           // A = first mob's X position.
@@ -383,7 +398,7 @@ OBJECT_X_MSB:
 // SPRITE BITMAP DATA
 // ============================================================================
 
-* = $2400                            // Assemble following data beginning at address $2000.
+* = $2400                            // Assemble following data beginning at address $2400.
                                       // Each VIC-II sprite occupies a 64-byte slot:
                                       // 63 bytes = 24x21 one-bit bitmap (3 bytes per row x 21 rows),
                                       // byte 64 = unused by the VIC and serves as padding/alignment.
