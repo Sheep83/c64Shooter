@@ -2,6 +2,10 @@
 :BasicUpstart2(init)                  // Generate a BASIC stub at $0801 that executes SYS <address of init>.
 
 #import "variables.asm"               // Import the symbolic names for VIC-II/CIA registers and our RAM variables.
+.const MAX_OBJECTS = 16
+.const TYPE_NONE   = 0
+.const TYPE_PLAYER = 1
+.const TYPE_ENEMY  = 2
 
 
 // ============================================================================
@@ -28,17 +32,23 @@ init:                                 // Program entry point called by the BASIC
 
     jsr setupSprites                  // Initialise hardware sprite presentation and seed logical object positions.
 
-    // --- Crude on-screen debug markers ---
-    lda #24                           // A = screen-code value 24.
-    sta SCREEN_START                  // Store it at the first screen cell ($0400).
-    lda #58                           // A = screen-code value 58.
-    sta SCREEN_START + 1              // Put it in column 1 of row 0.
-    sta SCREEN_START + 41             // Put the same value in column 1 of row 1.
-    lda #25                           // A = screen-code value 25.
-    sta SCREEN_START + 40             // Put it in column 0 of row 1.
 
     lda #01                           // A = 1 pixel per update.
     sta MOB_X_VEL                     // Store mob horizontal velocity in zero-page variable $002B.
+    // --- Init game objects ---
+    lda #01                           //Init player object
+    sta OBJECT_ACTIVE
+    lda #TYPE_PLAYER
+    sta OBJECT_TYPE
+    ldx #00
+    !:
+    inx
+    lda #01
+    sta OBJECT_ACTIVE,x
+    lda #TYPE_ENEMY
+    sta OBJECT_TYPE,x
+    cpx #07
+    bne !-
 
     jsr mainLoop                      // Enter the game loop. It never returns in the current program.
 
@@ -54,25 +64,19 @@ mainLoop:                             // Main update loop. One pass is intended 
     jsr checkRaster                   // Wait until VIC-II reaches raster line 255.
     jsr checkStick                    // Update logical player object (object 0) from joystick input.
     jsr renderPlayer                  // Copy logical player position into VIC hardware sprite 0.
-    jsr moveMobs                      // Update logical enemy objects 1-7 in RAM.
+    jsr updateObjects                      // Update logical enemy objects 1-7 in RAM.
     jsr renderMobs                    // Copy enemy object positions into VIC hardware sprites 1-7.
-    //lda SPR_X                         // A = player sprite's 8-bit X coordinate from VIC register $D000.
-    //sta SCREEN_START + 3              // Display raw X byte as a screen code in row 0, column 3.
-    //lda SPR_Y                         // A = player sprite's Y coordinate from VIC register $D001.
-    //sta SCREEN_START + 43             // Display raw Y byte as a screen code in row 1, column 3.
     jmp mainLoop                      // Repeat forever. JMP is correct here: unlike JSR it does not leak return addresses.
 
 
 /*
     JOYSTICK PORT 2 ($DC00)
-
     Joystick inputs are ACTIVE LOW:
         bit 0 = up
         bit 1 = down
         bit 2 = left
         bit 3 = right
         bit 4 = fire
-
     A pressed direction therefore produces a 0 bit.
 
     This routine's control flow is slightly counter-intuitive. For movement,
@@ -170,6 +174,7 @@ setOverflow:                          // Toggle player's ninth X-coordinate bit 
 // ============================================================================
 // RENDER LOGICAL OBJECT STATE INTO VIC-II HARDWARE SPRITES
 // ============================================================================
+
 renderPlayer:                         // Render logical object 0 into hardware sprite 0.
     lda OBJECT_X                     // A = object 0 low X byte (OBJECT_X+0).
     sta SPR_X                        // Copy it to hardware sprite 0 X register ($D000).
@@ -292,24 +297,33 @@ yposLoop:
 // MOB UPDATE DISPATCH
 // ============================================================================
 
-moveMobs:                             // Update logical enemy objects 1-7.
-    ldx #01                           // X is now ALWAYS the logical object index in game logic.
+updateObjects:
+    ldx #0                      // Begin with logical object 0.
 
-mobLoop:
-    lda objectBitMask,x              // Convert object index into a one-bit mask (object 1 -> %00000010, etc.).
-    sta CURRENT_SPRITE                // Cache mask for packed OBJECT_DIR / OBJECT_X_MSB operations.
-    jsr move                          // Update this object's logical position and direction.
-    inx                               // Next logical enemy object.
-    cpx #08                           // Object 8 means objects 1-7 have all been processed.
-    bne mobLoop                       // Not finished: update the next enemy.
-    rts                               // All seven mobs updated; return to mainLoop.
+objectLoop:
+    lda OBJECT_ACTIVE,x         // Is this object slot currently occupied?
+    beq nextObject              // No: ignore it.
+
+    lda OBJECT_TYPE,x           // What kind of object occupies this slot?
+    cmp #TYPE_ENEMY
+    bne nextObject              // Not an enemy: nothing to update here yet.
+    lda objectBitMask,x
+    sta CURRENT_SPRITE
+    jsr moveEnemy               // X remains the current logical object index.
+
+nextObject:
+    inx                         // Advance to the next object slot.
+    cpx #MAX_OBJECTS            // Have we scanned the entire pool?
+    bne objectLoop
+
+    rts
 
 
 // ============================================================================
 // INDIVIDUAL MOB MOVEMENT
 // ============================================================================
 
-move:
+moveEnemy:
     lda OBJECT_DIR                   // A = packed direction bits for logical objects 0-7.
     and CURRENT_SPRITE                // Keep only the bit belonging to the current mob.
     bne !+                            // Non-zero => this mob's direction bit is set: take left-moving branch.
@@ -414,8 +428,6 @@ objectBitMask:
 // LOGICAL OBJECT STATE POOL
 // ---------------------------------------------------------
 
-.const MAX_OBJECTS = 16
-
 * = $2000
 
 OBJECT_X:
@@ -429,6 +441,12 @@ OBJECT_X_MSB:
 
 OBJECT_DIR:
     .fill 2, 0                 // $2022-$2023 : one packed direction bit per logical object
+
+OBJECT_ACTIVE:
+    .fill MAX_OBJECTS, 0
+
+OBJECT_TYPE:
+    .fill MAX_OBJECTS, 0
 
 // ============================================================================
 // SPRITE BITMAP DATA
