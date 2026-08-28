@@ -22,7 +22,6 @@
 .var SPR_2_X = $d002
 .var SPR_2_Y = $d003
 .var STICK_2 = $dc00
-// .var ENABLE = $d015
 .var VIC_BANK = $dd00
 .var SPRITE_DATA_START = $2000
 .var SPRITE_DETECTION = $d01e
@@ -30,4 +29,4 @@
 .var SPRITES_DIR = $002a
 .var MOB_X_VEL = $002b
 .var TEMP_X = $002c
-
+.var HW_SPRITE_POINTER = $07f8

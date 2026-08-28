@@ -186,15 +186,14 @@ setupSprites:
     // Therefore pointers $80-$87 select the eight 64-byte blocks beginning
     // at $2000, $2040, $2080 ... $21C0.
 
-    ldx #00                           // X = 0: index into the eight sprite-pointer bytes.
-    lda #$80                          // A = first sprite pointer value ($80 -> sprite data at $2000).
+   ldx #$00                           // X = 0: index into the eight sprite-pointer bytes.
 
 pointerLoop:
-    sta $07f8,x                      // Store A into sprite pointer table entry $07F8 + X.
-    inx                               // X = X + 1; advance to next hardware sprite pointer.
-    adc #01                           // A = A + 1 + Carry. NOTE: no CLC here; current carry state can affect this.
-    cpx #08                           // Have all eight pointer entries (0-7) been written?
-    bne pointerLoop                   // No: repeat.
+    lda spritePointers,x
+    sta HW_SPRITE_POINTER,x
+    inx
+    cpx #$08
+    bne pointerLoop
                                       // Yes: fall through. X is now 8.
 
     // --- Set sprite colours ---
@@ -349,25 +348,47 @@ checkMobLeftBoundary:                 // Resolve ambiguity when mob low X byte i
 !:
     rts                               // X=279: continue moving left on future frames.
 
-
 // ============================================================================
-// LEGACY / UNREACHABLE CALL
+// SPRITE LOOKUP POINTER TABLE
 // ============================================================================
 
-jsr init                              // This appears to be an old relic. Normal execution never reaches here:
-                                      // mainLoop loops forever. BasicUpstart2 already transfers control to init.
+spritePointers:
+    .byte playerSprite / 64
+    .byte enemySpriteA / 64
+    .byte enemySpriteB / 64
+    .byte enemySpriteA / 64
+    .byte enemySpriteB / 64
+    .byte enemySpriteA / 64
+    .byte enemySpriteB / 64
+    .byte enemySpriteA / 64
 
+// ---------------------------------------------------------
+// Logical object state
+// ---------------------------------------------------------
+
+.const MAX_OBJECTS = 16
+
+* = $2000
+
+OBJECT_X:
+    .fill MAX_OBJECTS, 0       // $2000-$200F : X low byte for objects 0-15
+
+OBJECT_Y:
+    .fill MAX_OBJECTS, 0       // $2010-$201F : Y position for objects 0-15
+
+OBJECT_X_MSB:
+    .fill 2, 0                 // $2020-$2021 : X bit 8 for objects 0-15
 
 // ============================================================================
 // SPRITE BITMAP DATA
 // ============================================================================
 
-* = $2000                             // Assemble following data beginning at address $2000.
+* = $2400                            // Assemble following data beginning at address $2000.
                                       // Each VIC-II sprite occupies a 64-byte slot:
                                       // 63 bytes = 24x21 one-bit bitmap (3 bytes per row x 21 rows),
                                       // byte 64 = unused by the VIC and serves as padding/alignment.
 
-// sprite 1 / hardware sprite 0 / player
+playerSprite:
 .byte $00,$00,$00,$7f,$ff,$fe,$40,$18 // Raw bitmap bytes. Each group of 3 bytes represents one 24-pixel sprite row.
 .byte $02,$40,$18,$02,$40,$18,$02,$40 // Bits set to 1 are foreground pixels; 0 bits are transparent.
 .byte $18,$02,$40,$18,$02,$40,$18,$02 // These data bytes are not CPU instructions; VIC-II reads them directly.
@@ -377,100 +398,50 @@ jsr init                              // This appears to be an old relic. Normal
 .byte $40,$18,$02,$40,$18,$02,$40,$18
 .byte $02,$7f,$ff,$fe,$00,$00,$00,$0a // Final byte is padding; VIC uses only the first 63 bytes of the slot.
 
-// sprite 2 / hardware sprite 1 / mob 1
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7 // Same 64-byte sprite-slot format as above.
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04 // Padding byte.
+enemySpriteA:
+    .byte $00,$18,$00
+    .byte $00,$3c,$00
+    .byte $00,$7e,$00
+    .byte $01,$ff,$80
+    .byte $03,$ff,$c0
+    .byte $07,$db,$e0
+    .byte $0f,$ff,$f0
+    .byte $1f,$ff,$f8
+    .byte $3f,$ff,$fc
+    .byte $3c,$ff,$3c
+    .byte $3c,$ff,$3c
+    .byte $3f,$ff,$fc
+    .byte $1f,$ff,$f8
+    .byte $0f,$ff,$f0
+    .byte $07,$bd,$e0
+    .byte $03,$18,$c0
+    .byte $06,$18,$60
+    .byte $0c,$00,$30
+    .byte $18,$00,$18
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00              // 64th byte padding
 
-// sprite 3 / hardware sprite 2 / mob 2
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-// sprite 4 / hardware sprite 3 / mob 3
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-// sprite 5 / hardware sprite 4 / mob 4
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-// sprite 6 / hardware sprite 5 / mob 5
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-// sprite 7 / hardware sprite 6 / mob 6
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-// sprite 8 / hardware sprite 7 / mob 7
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$00,$00
-.byte $00,$ff,$e7,$ff,$ff,$e7,$ff,$ff
-.byte $e7,$ff,$ff,$e7,$ff,$ff,$e7,$ff
-.byte $ff,$e7,$ff,$ff,$e7,$ff,$ff,$e7
-.byte $ff,$ff,$e7,$ff,$ff,$e7,$ff,$04
-
-
-// ============================================================================
-// OLD DISABLED reverseMob EXPERIMENT
-// ============================================================================
-//
-// Everything below was already commented out in the current source. It appears
-// to be an earlier attempt at reversing a mob at X=76 and changing a separate
-// per-sprite velocity/direction representation.
-//
-// reverseMob:                         // Old version of reverse routine.
-//     lda SPR_X,x                     // Load current sprite's low X coordinate.
-//     cmp #76                         // Compare it with 76.
-//     beq !+                          // If equal, continue to local '+' label.
-//     rts                             // Otherwise return.
-// !:
-//     lda SPRITES_DIR                 // Load shared direction bitfield.
-//     eor CURRENT_SPRITE              // Toggle current mob's direction bit.
-//     sta SPRITES_DIR                 // Save changed direction state.
-//     and CURRENT_SPRITE              // Test the newly toggled bit.
-//     bne !+                          // If now set, continue.
-//     rts                             // Otherwise return.
-// !:
-//     lda SPRITE_1_VEL,x              // Load an old per-sprite velocity value.
-//     eor #%10000000                  // Toggle its high bit, presumably using bit 7 as sign/direction.
-//     sta SPRITE_1_VEL,x              // Save modified velocity.
-//     // adc SPR_X,x                   // Disabled experiment: add X coordinate.
-//     rts                             // Return.
+    enemySpriteB:
+    .byte $00,$00,$00
+    .byte $0c,$00,$30
+    .byte $06,$00,$60
+    .byte $03,$00,$c0
+    .byte $03,$81,$c0
+    .byte $07,$c3,$e0
+    .byte $0f,$e7,$f0
+    .byte $1f,$ff,$f8
+    .byte $3f,$ff,$fc
+    .byte $7f,$ff,$fe
+    .byte $7e,$7e,$7e
+    .byte $7f,$ff,$fe
+    .byte $3f,$ff,$fc
+    .byte $1f,$ff,$f8
+    .byte $0f,$ff,$f0
+    .byte $07,$e7,$e0
+    .byte $03,$c3,$c0
+    .byte $01,$81,$80
+    .byte $03,$00,$c0
+    .byte $06,$00,$60
+    .byte $00,$00,$00
+    .byte $00              // 64th byte padding
