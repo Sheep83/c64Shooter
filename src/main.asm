@@ -29,9 +29,7 @@ init:                                 // Program entry point called by the BASIC
     // --- Clear the screen ---
     lda #147                          // A = PETSCII control code 147 ("clear screen").
     jsr $ffd2                         // Call KERNAL CHROUT; it interprets A and clears the screen.
-
     jsr setupSprites                  // Initialise hardware sprite presentation and seed logical object positions.
-
 
     lda #01                           // A = 1 pixel per update.
     sta MOB_X_VEL                     // Store mob horizontal velocity in zero-page variable $002B.
@@ -52,22 +50,20 @@ init:                                 // Program entry point called by the BASIC
 
     jsr mainLoop                      // Enter the game loop. It never returns in the current program.
 
-
 checkRaster:                          // Frame-pacing routine: wait for raster line 255.
     lda RASTER                        // Read current VIC-II raster line low byte from $D012 into A.
     cmp #255                          // Compare A with 255; internally performs A-255 and sets flags, without changing A.
     bne checkRaster                   // If Z=0 (not raster line 255), loop and read it again.
     rts                               // Raster reached 255: return to caller.
 
-
 mainLoop:                             // Main update loop. One pass is intended roughly once per video frame.
     jsr checkRaster                   // Wait until VIC-II reaches raster line 255.
     jsr checkStick                    // Update logical player object (object 0) from joystick input.
-    jsr renderPlayer                  // Copy logical player position into VIC hardware sprite 0.
+    //jsr renderPlayer                  // Copy logical player position into VIC hardware sprite 0.
     jsr updateObjects                      // Update logical enemy objects 1-7 in RAM.
-    jsr renderMobs                    // Copy enemy object positions into VIC hardware sprites 1-7.
+    //jsr renderMobs                    // Copy enemy object positions into VIC hardware sprites 1-7.
+    jsr renderSprites
     jmp mainLoop                      // Repeat forever. JMP is correct here: unlike JSR it does not leak return addresses.
-
 
 /*
     JOYSTICK PORT 2 ($DC00)
@@ -146,7 +142,6 @@ checkStick:
     !:
         rts                           // Return to mainLoop.
 
-
 checkRightBounds:                     // Called when player's low X byte has become 66.
     lda OBJECT_X_MSB                  // A = logical X-MSB bitfield for objects 0-7; bit 0 belongs to player.
     and #%00000001                    // Isolate bit 0, which belongs to player/hardware sprite 0.
@@ -155,7 +150,6 @@ checkRightBounds:                     // Called when player's low X byte has bec
 !:
     rts                               // Return to joystick routine/main loop.
 
-
 checkLeftBounds:                      // Called when player's low X byte has become 22.
     lda OBJECT_X_MSB                  // Read logical object X-MSB bitfield from RAM.
     and #%00000001                    // Isolate player's bit 0.
@@ -163,7 +157,6 @@ checkLeftBounds:                      // Called when player's low X byte has bec
     inc OBJECT_X                     // MSB=0 means actual X=22: undo movement, keeping player at X=23.
 !:
     rts                               // Return.
-
 
 setOverflow:                          // Toggle player's ninth X-coordinate bit when low byte wraps.
     lda OBJECT_X_MSB                  // Read logical object X-MSB bits from RAM.
@@ -212,6 +205,43 @@ renderMobs:                           // Render logical objects 1-7 into hardwar
     lda OBJECT_X_MSB                // Read logical X-MSB byte for objects 0-7.
     sta SPRITE_OVERFLOW_REGISTER    // Copy all eight bits to hardware in one operation.
                                       // This stops being sufficient once >8 logical sprites/multiplexing arrive.
+    rts
+
+renderSprites:
+    ldy #00                  // Y = hardware sprite slot
+    lda #00
+    sta TEMP_MSB
+
+renderLoop:
+    lda HW_OBJECT,y         // Find logical object assigned to this VIC slot.
+    tax                     // X = logical object index.
+    lda OBJECT_X_MSB
+    and objectBitMask,x
+    beq !noMsb+
+
+    lda TEMP_MSB
+    ora HW_BIT_MASK,y
+    sta TEMP_MSB
+
+!noMsb:
+    sty TEMP_Y_REG          // Preserve the hardware slot number.
+
+    lda HW_SPRITE_OFFSET,y  // Convert slot 0-7 into VIC offset 0,2,4...14.
+    tay                     // Y now indexes the VIC coordinate registers.
+
+    lda OBJECT_X,x          // Read logical object's X position.
+    sta SPR_X,y             // Write it to this hardware sprite's X register.
+
+    lda OBJECT_Y,x          // Read logical object's Y position.
+    sta SPR_Y,y             // Write it to this hardware sprite's Y register.
+
+    ldy TEMP_Y_REG          // Restore Y = hardware slot number.
+
+    iny                     // Next hardware slot.
+    cpy #8
+    bne renderLoop
+    lda TEMP_MSB
+    sta SPRITE_OVERFLOW_REGISTER
     rts
 
 // ============================================================================
@@ -318,7 +348,6 @@ nextObject:
 
     rts
 
-
 // ============================================================================
 // INDIVIDUAL MOB MOVEMENT
 // ============================================================================
@@ -424,6 +453,16 @@ objectBitMask:
     .byte %01000000
     .byte %10000000
 
+HW_BIT_MASK:
+    .byte %00000001
+    .byte %00000010
+    .byte %00000100
+    .byte %00001000
+    .byte %00010000
+    .byte %00100000
+    .byte %01000000
+    .byte %10000000
+
 // ---------------------------------------------------------
 // LOGICAL OBJECT STATE POOL
 // ---------------------------------------------------------
@@ -447,6 +486,12 @@ OBJECT_ACTIVE:
 
 OBJECT_TYPE:
     .fill MAX_OBJECTS, 0
+
+HW_OBJECT:
+    .byte 0,1,2,3,4,5,6,7
+
+HW_SPRITE_OFFSET:
+    .byte 0,2,4,6,8,10,12,14
 
 // ============================================================================
 // SPRITE BITMAP DATA

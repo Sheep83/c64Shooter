@@ -29,4 +29,7 @@
 .var SPRITES_DIR = $002a
 .var MOB_X_VEL = $002b
 .var TEMP_X = $002c
+.var TEMP_X_REG = $002d
+.var TEMP_Y_REG = $002e
+.var TEMP_MSB = $002f
 .var HW_SPRITE_POINTER = $07f8
