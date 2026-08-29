@@ -25,4 +25,5 @@
 .var TEMP_X_REG = $002d
 .var TEMP_Y_REG = $002e
 .var TEMP_MSB = $002f
+.var JOY_STATE = $0030
 .var HW_SPRITE_POINTER = $07f8
