@@ -38,6 +38,10 @@ init:                                 // Program entry point called by the BASIC
     sta OBJECT_ACTIVE
     lda #TYPE_PLAYER
     sta OBJECT_TYPE
+    lda #playerSprite / 64
+    sta OBJECT_SPRITE
+    lda #02
+    sta OBJECT_COLOUR
     ldx #00
     !:
     inx
@@ -45,6 +49,10 @@ init:                                 // Program entry point called by the BASIC
     sta OBJECT_ACTIVE,x
     lda #TYPE_ENEMY
     sta OBJECT_TYPE,x
+    lda spritePointers,x
+    sta OBJECT_SPRITE,x
+    lda #03
+    sta OBJECT_COLOUR,x
     cpx #07
     bne !-
 
@@ -215,15 +223,20 @@ renderSprites:
 renderLoop:
     lda HW_OBJECT,y         // Find logical object assigned to this VIC slot.
     tax                     // X = logical object index.
-    lda OBJECT_X_MSB
-    and objectBitMask,x
-    beq !noMsb+
 
-    lda TEMP_MSB
-    ora HW_BIT_MASK,y
-    sta TEMP_MSB
+    lda OBJECT_X_MSB        // Load packed X-MSB flags for logical objects 0-7.
+    and objectBitMask,x     // Test the X-MSB bit belonging to logical object X.
+    beq !noMsb+             // If clear, this object's X coordinate is below 256.
+
+    lda TEMP_MSB            // Load the hardware X-MSB byte we're building.
+    ora HW_BIT_MASK,y       // Set the bit for the VIC slot rendering this object.
+    sta TEMP_MSB            // Save the updated hardware X-MSB byte.
 
 !noMsb:
+    lda OBJECT_SPRITE,x     // Get the sprite graphic owned by logical object X.
+    sta HW_SPRITE_POINTER,y // Assign that graphic to hardware sprite slot Y.
+    lda OBJECT_COLOUR,x
+    sta HW_SPRITE_COLOUR,y
     sty TEMP_Y_REG          // Preserve the hardware slot number.
 
     lda HW_SPRITE_OFFSET,y  // Convert slot 0-7 into VIC offset 0,2,4...14.
@@ -268,19 +281,6 @@ pointerLoop:
     cpx #$08
     bne pointerLoop
                                       // Yes: fall through. X is now 8.
-
-    // --- Set sprite colours ---
-    lda #02                           // A = C64 colour 2 (red).
-    sta SPRITE_1_COLOUR               // $D027: player/hardware sprite 0 colour = red.
-
-    lda #03                           // A = C64 colour 3 (cyan).
-    ldx #00                           // X = 0, used as offset from sprite 1's colour register.
-
-colourLoop:
-    sta SPRITE_2_COLOUR,x             // Write cyan to $D028 + X (sprites 1 through 7).
-    inx                               // Advance to next sprite colour register.
-    cpx #07                           // Have seven mob colour registers been written?
-    bne colourLoop                    // No: repeat.
 
     // --- Initialise logical direction bitfield ---
     // OBJECT_DIR is two bytes because the pool can hold 16 objects. For this
@@ -488,10 +488,16 @@ OBJECT_TYPE:
     .fill MAX_OBJECTS, 0
 
 HW_OBJECT:
-    .byte 0,1,2,3,4,5,6,7
+    .byte 1,0,2,3,4,5,6,7
 
 HW_SPRITE_OFFSET:
     .byte 0,2,4,6,8,10,12,14
+
+OBJECT_SPRITE:
+    .fill MAX_OBJECTS, 0
+
+OBJECT_COLOUR:
+    .fill MAX_OBJECTS, 0
 
 // ============================================================================
 // SPRITE BITMAP DATA

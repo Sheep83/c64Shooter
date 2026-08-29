@@ -5,14 +5,7 @@
 .var BG_COLOUR = $d021
 .var RASTER = $d012
 .var SCREEN_START = $0400
-.var SPRITE_1_COLOUR = $d027
-.var SPRITE_2_COLOUR = $d028
-.var SPRITE_3_COLOUR = $d029
-.var SPRITE_4_COLOUR = $d02a
-.var SPRITE_5_COLOUR = $d02b
-.var SPRITE_6_COLOUR = $d02c
-.var SPRITE_7_COLOUR = $d02d
-.var SPRITE_8_COLOUR = $d02e
+.var HW_SPRITE_COLOUR = $d027
 .var SPRITE_ENABLE = $d015 //each bit enables/disables sprites 1-8
 .var SPRITE_MODE = $d01c //each bit enables/disables multicolour on sprites 1-8
 .var SPRITE_OVERFLOW_REGISTER = $d010
