@@ -2,10 +2,10 @@
 :BasicUpstart2(init)                    // Generate a BASIC stub at $0801 that executes SYS <address of init>.
 
 #import "variables.asm"                 // Import the symbolic names for VIC-II/CIA registers and our RAM variables.
-.const MAX_OBJECTS = 16
-.const TYPE_NONE   = 0
-.const TYPE_PLAYER = 1
-.const TYPE_ENEMY  = 2
+.const MAX_OBJECTS = 16                 // Maximum number of logical objects.
+.const TYPE_NONE   = 0                  // Object slot is unused.
+.const TYPE_PLAYER = 1                  // Object is the player.
+.const TYPE_ENEMY  = 2                  // Object is an enemy.
 
 
 // ============================================================================
@@ -34,27 +34,28 @@ init:                                   // Program entry point called by the BAS
     lda #01                             // A = 1 pixel per update.
     sta MOB_X_VEL                       // Store mob horizontal velocity in zero-page variable $002B.
     // --- Init game objects ---
-    lda #01                             //Init player object
-    sta OBJECT_ACTIVE
-    lda #TYPE_PLAYER
-    sta OBJECT_TYPE
-    lda #playerSprite / 64
-    sta OBJECT_SPRITE
-    lda #02
-    sta OBJECT_COLOUR
-    ldx #00
-    !:
-    inx
-    lda #01
-    sta OBJECT_ACTIVE,x
-    lda #TYPE_ENEMY
-    sta OBJECT_TYPE,x
-    lda spritePointers,x
-    sta OBJECT_SPRITE,x
-    lda #03
-    sta OBJECT_COLOUR,x
-    cpx #07
-    bne !-
+    lda #01                             // Init player object
+    sta OBJECT_ACTIVE                   // Mark player object active.
+    lda #TYPE_PLAYER                    // Load player object type.
+    sta OBJECT_TYPE                     // Set object 0 as the player.
+    lda #playerSprite / 64              // Load player sprite pointer.
+    sta OBJECT_SPRITE                   // Store player's sprite graphic.
+    lda #02                             // Load player colour.
+    sta OBJECT_COLOUR                   // Store player colour.
+    ldx #00                             // Start before first enemy slot.
+    !:                                  // Local loop label.
+    inx                                 // Advance to next enemy object.
+    lda #01                             // Load active flag.
+    sta OBJECT_ACTIVE,x                 // Mark enemy object active.
+    lda #TYPE_ENEMY                     // Load enemy object type.
+    sta OBJECT_TYPE,x                   // Set current object as enemy.
+    lda spritePointers,x                // Load this enemy's sprite pointer.
+    sta OBJECT_SPRITE,x                 // Store enemy sprite graphic.
+    lda #03                             // Load enemy colour.
+    sta OBJECT_COLOUR,x                 // Store enemy colour.
+    cpx #08                             // Finished enemy object 7?
+    bne !-                              // No: initialise next enemy.
+    jsr setupRasterIRQ
 
     jsr mainLoop                        // Enter the game loop. It never returns in the current program.
 
@@ -67,7 +68,8 @@ checkRaster:                            // Frame-pacing routine: wait for raster
 mainLoop:                               // Main update loop. One pass is intended roughly once per video frame.
     jsr checkRaster                     // Wait until VIC-II reaches raster line 255.
     jsr updateObjects                   // Update logical enemy objects 1-7 in RAM.
-    jsr renderSprites
+    jsr renderSprites                   // Copy logical objects to VIC sprites.
+    //jsr renderPlayerLate                // Render multiplexed player
     jmp mainLoop                        // Repeat forever. JMP is correct here: unlike JSR it does not leak return addresses.
 
 // ------------------------------------------------------------
@@ -76,12 +78,12 @@ mainLoop:                               // Main update loop. One pass is intende
 
 updatePlayer:
         lda STICK_2                     // Read joystick port 2 once and keep the result.
-        sta JOY_STATE
+        sta JOY_STATE                   // Save joystick state for this update.
         // ------------------------------------------------------------
         // UP
         // ------------------------------------------------------------
         lda JOY_STATE                   // Isolate joystick bit 0: UP. If UP is not pressed, result is non-zero.
-        and #%00000001
+        and #%00000001                  // Keep only joystick UP bit.
         bne !down+                      // UP not pressed -> skip the entire UP section.
         lda OBJECT_Y,x                  // Load this player's current Y coordinate.
         cmp #49                         // Are we already at the upper movement limit?
@@ -92,10 +94,10 @@ updatePlayer:
         // DOWN
         // ------------------------------------------------------------
         lda JOY_STATE                   // Isolate joystick bit 1: DOWN.
-        and #%00000010
+        and #%00000010                  // Keep only joystick DOWN bit.
         bne !left+                      // DOWN not pressed -> skip DOWN section.
         lda OBJECT_Y,x                  // Load current Y coordinate.
-        cmp #231                      // Are we already at the bottom movement limit?
+        cmp #230                      // Are we already at the bottom movement limit?
         beq !left+                      // Yes -> don't move further down.
         inc OBJECT_Y,x                  // Otherwise move player down one pixel.
     !left:
@@ -103,7 +105,7 @@ updatePlayer:
         // LEFT
         // ------------------------------------------------------------
         lda JOY_STATE                   // Isolate joystick bit 2: LEFT.
-        and #%00000100
+        and #%00000100                  // Keep only joystick LEFT bit.
         bne !right+                     // LEFT not pressed -> skip LEFT section.
         lda OBJECT_X_MSB,x              // Read the ninth X bit for this logical object. 0 = X is in range 0-255, 1 = X is in range 256-511
         bne !moveLeft+                  // If MSB is 1, x>255, so we cannot be at the left boundary (X=23), safe to move left immediately.
@@ -122,17 +124,17 @@ updatePlayer:
         // RIGHT
         // ------------------------------------------------------------
         lda JOY_STATE                   // Isolate joystick bit 3: RIGHT.
-        and #%00001000
+        and #%00001000                  // Keep only joystick RIGHT bit.
         bne !fire+                      // RIGHT not pressed -> skip RIGHT section.
         lda OBJECT_X_MSB,x              // Read the ninth X bit.
         beq !moveRight+                 // If MSB is 0, X is below 256, cannot be at the right boundary, safe to move right immediately.
         lda OBJECT_X,x                  // MSB is 1, so inspect the low byte.
-        cmp #66                         // Low byte 66 means X = 322
+        cmp #65                         // Low byte 66 means X = 322
         beq !fire+                      // Already at right boundary -> do not move further right.
     !moveRight:
         inc OBJECT_X,x                  // Move right one pixel. INC updates Z-Flag. Normal example:100 -> 101, Wrap example:255 -> 0, Z-Flag=1
         bne !fire+                      // Branch if the INC result was non-zero. No branch, low byte wrapped 255=>0, x becomes 256
-        lda #1
+        lda #1                          // Load high X bit value.
         sta OBJECT_X_MSB,x              // Set the ninth X bit to complete the 255 -> 256 transition.
     !fire:
         // ------------------------------------------------------------
@@ -150,16 +152,15 @@ updatePlayer:
 // ============================================================================
 
 renderSprites:
-    ldy #00                             // Y = hardware sprite slot
-    lda #00
-    sta TEMP_MSB
+    ldy #01                             // Y = hardware sprite slot
+    lda #00                             // Clear hardware X-MSB accumulator.
+    sta TEMP_MSB                        // Start with no hardware MSB bits set.
 
 renderLoop:
     lda HW_OBJECT,y                     // Find logical object assigned to this VIC slot.
     tax                                 // X = logical object index.
 
-    lda OBJECT_X_MSB,x                  // Load packed X-MSB flags for logical objects 0-7.
-    //and objectBitMask,x               // Test the X-MSB bit belonging to logical object X.
+    lda OBJECT_X_MSB,x                  // Read this logical object's ninth X bit.
     beq !noMsb+                         // If clear, this object's X coordinate is below 256.
 
     lda TEMP_MSB                        // Load the hardware X-MSB byte we're building.
@@ -169,8 +170,8 @@ renderLoop:
 !noMsb:
     lda OBJECT_SPRITE,x                 // Get the sprite graphic owned by logical object X.
     sta HW_SPRITE_POINTER,y             // Assign that graphic to hardware sprite slot Y.
-    lda OBJECT_COLOUR,x
-    sta HW_SPRITE_COLOUR,y
+    lda OBJECT_COLOUR,x                 // Load this object's colour.
+    sta HW_SPRITE_COLOUR,y              // Set hardware sprite colour.
     sty TEMP_Y_REG                      // Preserve the hardware slot number.
 
     lda HW_SPRITE_OFFSET,y              // Convert slot 0-7 into VIC offset 0,2,4...14.
@@ -185,10 +186,41 @@ renderLoop:
     ldy TEMP_Y_REG                      // Restore Y = hardware slot number.
 
     iny                                 // Next hardware slot.
-    cpy #8
-    bne renderLoop
-    lda TEMP_MSB
-    sta SPRITE_OVERFLOW_REGISTER
+    cpy #8                              // Have all eight VIC slots been rendered?
+    bne renderLoop                      // No: render next hardware slot.
+    lda TEMP_MSB                        // Load completed hardware X-MSB byte.
+    sta SPRITE_OVERFLOW_REGISTER        // Write packed X-MSB bits to $D010.
+    rts                                 // Return to main loop.
+
+    renderPlayerLate:
+!:
+    lda RASTER                          // Wait until raster line 180.
+    cmp #180
+    bne !-
+    ldx #0                              // Object 0 is the player.
+
+    lda OBJECT_SPRITE,x                 // Reuse hardware sprite 0.
+    sta HW_SPRITE_POINTER
+
+    lda OBJECT_COLOUR,x
+    sta HW_SPRITE_COLOUR
+
+    lda OBJECT_X,x
+    sta SPR_X
+
+    lda OBJECT_Y,x
+    sta SPR_Y
+
+    lda SPRITE_OVERFLOW_REGISTER        // Hardware sprite 0 uses bit 0 of $D010.
+    and #%11111110                      // Clear hardware sprite 0's existing MSB.
+
+    ldy OBJECT_X_MSB,x                  // Load object 0 MSB into Y
+    beq !noPlayerMsb+                   // MSB=0
+    ora #%00000001                      // Player X >= 256 (MSB=1): set hardware sprite 0's MSB.
+
+
+!noPlayerMsb:
+    sta SPRITE_OVERFLOW_REGISTER        //Write HW MSB
     rts
 
 // ============================================================================
@@ -200,26 +232,12 @@ setupSprites:
     // --- Enable all eight hardware sprites ---
     lda #$ff                            // A = %11111111.
     sta SPRITE_ENABLE                   // $D015: set all eight enable bits, turning sprites 0-7 on.
-
-    // --- Set hardware sprite pointers $07F8-$07FF ---
-    // Each VIC sprite pointer is the bitmap address divided by 64.
-    // The assembler calculates the values from playerSprite/enemySpriteA/B,
-    // so moving the bitmap block does not require hand-editing pointer numbers.
-
-   ldx #$00                             // X = 0: index into the eight sprite-pointer bytes.
-
-pointerLoop:
-    lda spritePointers,x                // A = pointer value for this hardware sprite slot.
-    sta HW_SPRITE_POINTER,x             // Store into $07F8+X (hardware sprite pointer table).
-    inx
-    cpx #$08
-    bne pointerLoop                     // Yes: fall through. X is now 8.
     // --- Player starting position ---
     lda #146                          // A = initial player X low byte.
     sta OBJECT_X                        // Seed logical object 0 X low byte; no VIC register is touched here.
     lda #200                          // A = initial player Y.
     sta OBJECT_Y                        // Seed logical object 0 Y.
-    lda #0
+    lda #0                              // Load clear ninth X bit.
     sta OBJECT_X_MSB                    // Clear X bit 8 for logical objects 0-7.
     // --- Mob starting X positions ---
     lda #31                             // A = first mob's X position.
@@ -228,8 +246,8 @@ xposLoop:
     sta OBJECT_X,x                      // Store low X byte in the current logical object.
     clc                                 // Clear carry so the following ADC performs exactly A + 28.
     adc #28                             // A = previous mob X + 28; spaces mobs horizontally.
-    inx
-    cpx #08
+    inx                                 // Advance to next enemy object.
+    cpx #09                             // Finished enemy object 7?
     bne xposLoop                        // Repeat until all seven mob X positions are set.
     // --- Mob starting Y positions ---
     lda #54                             // A = common starting Y coordinate for every enemy object.
@@ -237,7 +255,7 @@ xposLoop:
 yposLoop:
     sta OBJECT_Y,x                      // Store Y directly in the current logical object.
     inx                                 // Next logical object.
-    cpx #08                             // Reached object 8? Then objects 1-7 are initialised.
+    cpx #09                             // Reached object 8? Then objects 1-7 are initialised.
     bne yposLoop                        // No: repeat.
     rts                                 // Sprite setup complete; return to init.
 
@@ -249,27 +267,27 @@ updateObjects:
     ldx #0                              // Begin with logical object 0.
 
 objectLoop:
-    lda OBJECT_ACTIVE,x
-    beq nextObject
-    lda OBJECT_TYPE,x
-    cmp #TYPE_PLAYER
-    beq updatePlayerObject
-    cmp #TYPE_ENEMY
-    beq updateEnemyObject
-    jmp nextObject
+    lda OBJECT_ACTIVE,x                 // Read current object's active flag.
+    beq nextObject                      // Inactive: skip this object.
+    lda OBJECT_TYPE,x                   // Read current object's type.
+    cmp #TYPE_PLAYER                    // Is this the player?
+    beq updatePlayerObject              // Yes: run player update.
+    cmp #TYPE_ENEMY                     // Is this an enemy?
+    beq updateEnemyObject               // Yes: run enemy update.
+    jmp nextObject                      // Unknown type: skip object.
 
 updatePlayerObject:
-    jsr updatePlayer
-    jmp nextObject
+    jsr updatePlayer                    // Update player object in X.
+    jmp nextObject                      // Continue object scan.
 
 updateEnemyObject:
-    jsr moveEnemy
+    jsr moveEnemy                       // Update enemy object in X.
 
 nextObject:
     inx                                 // Advance to the next object slot.
     cpx #MAX_OBJECTS                    // Have we scanned the entire pool?
-    bne objectLoop
-    rts
+    bne objectLoop                      // No: process next object.
+    rts                                 // Object update pass complete.
 
 // ============================================================================
 // INDIVIDUAL MOB MOVEMENT
@@ -278,9 +296,7 @@ nextObject:
 moveEnemy:
     lda OBJECT_DIR,x                    // Read this object's direction directly
     bne !+                              // Non-zero => this mob's direction bit is set: take left-moving branch.
-    beq !++                             // Zero => direction bit clear: take right-moving branch.
-                                        // One of these branches must occur; the BEQ is effectively unconditional here.
-
+    beq !++                             // Zero => direction bit clear: take right-moving branch. One of these branches must occur; the BEQ is effectively unconditional here.
 !:                                      // Local '+' label: current mob is moving LEFT.
     sec                                 // Set Carry before SBC. On 6502, C=1 means "no borrow in".
     lda OBJECT_X,x                      // A = current logical object's low X byte.
@@ -312,7 +328,7 @@ moveEnemy:
 
 
 overflowMob:                            // Toggle current logical object's ninth X-coordinate bit.
-    lda OBJECT_X_MSB,x                  // A = packed X-MSB bits for logical objects 0-7.
+    lda OBJECT_X_MSB,x                  // Read this logical object's ninth X bit.
     eor #01                             // Toggle 0 <=> 1
     sta OBJECT_X_MSB,x                  // Store new direction
     rts                                 // Return directly to moveMobs (because this routine was reached by branch).
@@ -324,7 +340,7 @@ reverseMob:                             // Reverse current mob and drop it down 
     adc #24                             // A = Y + 24 pixels.
     sta OBJECT_Y,x                      // Store new logical Y coordinate.
 
-    lda OBJECT_DIR,x                    // A = packed direction bits for logical objects 0-7.
+    lda OBJECT_DIR,x                    // Read this logical object's direction.
     eor #01                             // Toggle left/right
     sta OBJECT_DIR,x                    // Store new direction
     rts                                 // Return to moveMobs.
@@ -333,53 +349,109 @@ checkMobRightBoundary:
     lda OBJECT_X_MSB,x                  // Read this object's ninth X bit.
     beq !+                              // 0 => X=66, not right boundary.
     jmp reverseMob                      // 1 => X=322, reverse and descend.
-!:
-    rts
+!:                                      // Local continuation label.
+    rts                                 // Right boundary check complete.
 
 checkMobLeftBoundary:
     lda OBJECT_X_MSB,x                  // Read this object's ninth X bit.
     bne !+                              // 1 => X=279, not left boundary.
     jmp reverseMob                      // 0 => X=23, reverse and descend.
-!:
+!:                                      // Local continuation label.
+    rts                                 // Left boundary check complete.
+
+// ============================================================================
+// Experimental IRQ Interrupt
+// ============================================================================
+setupRasterIRQ:
+    sei
+    lda #150                          // Tell VIC we want raster line 150.
+    sta RASTER
+    lda VIC_CONTROL_1                   // Raster bit 8 lives in bit 7 of $D011.
+    and #%01111111                      // Clear it because 150 is below raster 256.
+    sta VIC_CONTROL_1
+    lda #<rasterIRQ                     // Point the normal C64 IRQ vector at our routine.
+    sta IRQ_VECTOR
+    lda #>rasterIRQ
+    sta IRQ_VECTOR + 1                  // Enable VIC raster interrupts.
+    lda #%00000001
+    sta IRQ_ENABLE
+    cli
     rts
+
+rasterIRQ:
+    lda IRQ_STATUS
+    and #%00000001
+    beq !notRaster+
+
+    txa
+    pha
+    tya
+    pha
+
+    ldx #0
+
+    lda OBJECT_SPRITE,x
+    sta HW_SPRITE_POINTER
+
+    lda OBJECT_COLOUR,x
+    sta HW_SPRITE_COLOUR
+
+    lda OBJECT_X,x
+    sta SPR_X
+
+    lda OBJECT_Y,x
+    sta SPR_Y
+
+    lda SPRITE_OVERFLOW_REGISTER
+    and #%11111110
+
+    ldy OBJECT_X_MSB,x
+    beq !noPlayerMsb+
+
+    ora #%00000001
+
+!noPlayerMsb:
+    sta SPRITE_OVERFLOW_REGISTER
+
+    pla
+    tay
+    pla
+    tax
+
+    lda #%00000001
+    sta IRQ_STATUS
+
+!notRaster:
+    jmp $ea31
 
 // ============================================================================
 // SPRITE LOOKUP POINTER TABLE
 // ============================================================================
 
 spritePointers:
-    .byte playerSprite / 64
-    .byte enemySpriteA / 64
-    .byte enemySpriteB / 64
-    .byte enemySpriteA / 64
-    .byte enemySpriteB / 64
-    .byte enemySpriteA / 64
-    .byte enemySpriteB / 64
-    .byte enemySpriteA / 64
+    .byte playerSprite / 64             // Player sprite pointer.
+    .byte enemySpriteA / 64             // Enemy A sprite pointer.
+    .byte enemySpriteB / 64             // Enemy B sprite pointer.
+    .byte enemySpriteA / 64             // Enemy A sprite pointer.
+    .byte enemySpriteB / 64             // Enemy B sprite pointer.
+    .byte enemySpriteA / 64             // Enemy A sprite pointer.
+    .byte enemySpriteB / 64             // Enemy B sprite pointer.
+    .byte enemySpriteA / 64             // Enemy A sprite pointer.
+    .byte enemySpriteB / 64             // Enemy B sprite pointer.
 
 // ============================================================================
 // LOGICAL OBJECT BIT-MASK LOOKUP TABLE
 // ============================================================================
 
-objectBitMask:
-    .byte %00000001
-    .byte %00000010
-    .byte %00000100
-    .byte %00001000
-    .byte %00010000
-    .byte %00100000
-    .byte %01000000
-    .byte %10000000
-
 HW_BIT_MASK:
-    .byte %00000001
-    .byte %00000010
-    .byte %00000100
-    .byte %00001000
-    .byte %00010000
-    .byte %00100000
-    .byte %01000000
-    .byte %10000000
+    .byte %00000001                     // Hardware sprite 0 MSB mask.
+    .byte %00000010                     // Hardware sprite 1 MSB mask.
+    .byte %00000100                     // Hardware sprite 2 MSB mask.
+    .byte %00001000                     // Hardware sprite 3 MSB mask.
+    .byte %00010000                     // Hardware sprite 4 MSB mask.
+    .byte %00100000                     // Hardware sprite 5 MSB mask.
+    .byte %01000000                     // Hardware sprite 6 MSB mask.
+    .byte %10000000                     // Hardware sprite 7 MSB mask.
 
 // ---------------------------------------------------------
 // LOGICAL OBJECT STATE POOL
@@ -394,28 +466,28 @@ OBJECT_Y:
     .fill MAX_OBJECTS, 0                // $2010-$201F : Y position for objects 0-15
 
 OBJECT_X_MSB:
-    .fill MAX_OBJECTS, 0                // $2020-$2021 : X bit 8 for objects 0-15
+    .fill MAX_OBJECTS, 0                // $2020-$202F : X bit 8 for objects 0-15
 
 OBJECT_DIR:
-    .fill MAX_OBJECTS, 0                // $2022-$2023 : one packed direction bit per logical object
+    .fill MAX_OBJECTS, 0                // $2030-$203F : direction for objects 0-15
 
 OBJECT_ACTIVE:
-    .fill MAX_OBJECTS, 0
+    .fill MAX_OBJECTS, 0                // Object active flags.
 
 OBJECT_TYPE:
-    .fill MAX_OBJECTS, 0
+    .fill MAX_OBJECTS, 0                // Object type values.
 
 HW_OBJECT:
-    .byte 0,1,2,3,4,5,6,7
+    .byte 1,2,3,4,5,6,7,8               // Hardware slot to logical object map.
 
 HW_SPRITE_OFFSET:
-    .byte 0,2,4,6,8,10,12,14
+    .byte 0,2,4,6,8,10,12,14            // VIC X/Y register offsets by slot.
 
 OBJECT_SPRITE:
-    .fill MAX_OBJECTS, 0
+    .fill MAX_OBJECTS, 0                // Sprite pointer owned by each object.
 
 OBJECT_COLOUR:
-    .fill MAX_OBJECTS, 0
+    .fill MAX_OBJECTS, 0                // Sprite colour owned by each object.
 
 // ============================================================================
 // SPRITE BITMAP DATA
