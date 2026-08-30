@@ -1,32 +1,32 @@
 //----------------------------------------------------------
-//				Variables
+// C64 hardware registers and working zero-page variables
 //----------------------------------------------------------
-.var BORDER_COLOUR = $d020
-.var BG_COLOUR = $d021
-.var RASTER = $d012
-.var SCREEN_START = $0400
-.var HW_SPRITE_COLOUR = $d027
-.var SPRITE_ENABLE = $d015 //each bit enables/disables sprites 1-8
-.var SPRITE_MODE = $d01c //each bit enables/disables multicolour on sprites 1-8
+
+// VIC-II / CIA hardware registers used by the current program.
+.var BORDER_COLOUR            = $d020
+.var RASTER                   = $d012
+.var HW_SPRITE_COLOUR         = $d027
+.var SPRITE_ENABLE            = $d015
 .var SPRITE_OVERFLOW_REGISTER = $d010
-.var VIC_MEMORY_SETUP = $d018 //VIC base addresses
-.var SPR_X = $d000
-.var SPR_Y = $d001
-.var SPR_2_X = $d002
-.var SPR_2_Y = $d003
-.var STICK_2 = $dc00
-.var VIC_BANK = $dd00
-.var SPRITE_DATA_START = $2000
-.var SPRITE_DETECTION = $d01e
-.var SPRITES_DIR = $002a
-.var MOB_X_VEL = $002b
-.var TEMP_X = $002c
-.var TEMP_X_REG = $002d
-.var TEMP_Y_REG = $002e
-.var TEMP_MSB = $002f
-.var JOY_STATE = $0030
-.var HW_SPRITE_POINTER = $07f8
-.var IRQ_VECTOR      = $0314
-.var IRQ_ENABLE      = $d01a
-.var IRQ_STATUS      = $d019
-.var VIC_CONTROL_1   = $d011
+.var VIC_MEMORY_SETUP         = $d018
+.var SPR_X                    = $d000
+.var SPR_Y                    = $d001
+.var STICK_2                  = $dc00
+.var VIC_BANK                 = $dd00
+.var HW_SPRITE_POINTER        = $07f8
+.var IRQ_VECTOR               = $0314
+.var IRQ_ENABLE               = $d01a
+.var IRQ_STATUS               = $d019
+.var VIC_CONTROL_1            = $d011
+
+// Working state / scratch bytes.
+// NOTE: these are in BASIC's zero-page workspace. That is acceptable while
+// this program owns the machine, but moving them to a deliberately reserved
+// area is a sensible later cleanup before the engine grows.
+.var MOB_X_VEL                = $002b
+.var TEMP_Y_REG               = $002e
+.var TEMP_MSB                 = $002f
+.var JOY_STATE                = $0030
+.var TEMP_OBJECT              = $0031
+.var TEMP_SORT_Y              = $0032
+.var TEMP_OBJECT_Y            = $0034

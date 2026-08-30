@@ -7,6 +7,33 @@
 .const TYPE_PLAYER = 1                  // Object is the player.
 .const TYPE_ENEMY  = 2                  // Object is an enemy.
 
+// ============================================================================
+// CURRENT ENGINE SHAPE
+// ============================================================================
+//
+// Logical objects live in RAM (OBJECT_X, OBJECT_Y, etc.).  They are not tied
+// permanently to any of the C64's eight hardware sprites.
+//
+// Late in each PAL frame:
+//   updateObjects()             - change logical game state
+//   buildSortedObjectList()     - collect active object numbers
+//   sortObjectsByY()            - order those numbers from top to bottom
+//   prepareNinthSpriteEvent()   - decide how the ninth object can reuse a slot
+//
+// At the start of the next frame:
+//   renderSprites()             - map the first eight objects to VIC sprites 0-7
+//   armPreparedEvent()          - tell VIC-II which raster line should IRQ
+//
+// Later, asynchronously:
+//   multiplexIRQ()              - VIC-II reaches that raster line; the CPU
+//                                 temporarily leaves mainLoop, rewrites one
+//                                 hardware sprite for object #9, acknowledges
+//                                 the IRQ, then returns through the KERNAL.
+//
+// This is deliberately still a ONE-EVENT prototype.  It proves the separation
+// between logical objects and hardware sprites before we generalise it into a
+// full multiplexer.
+
 
 // ============================================================================
 // INITIALISATION
@@ -53,24 +80,39 @@ init:                                   // Program entry point called by the BAS
     sta OBJECT_SPRITE,x                 // Store enemy sprite graphic.
     lda #03                             // Load enemy colour.
     sta OBJECT_COLOUR,x                 // Store enemy colour.
-    cpx #08                             // Finished enemy object 7?
+    cpx #08                             // Finished enemy object 8?
     bne !-                              // No: initialise next enemy.
-    jsr setupRasterIRQ
 
     jsr mainLoop                        // Enter the game loop. It never returns in the current program.
 
-checkRaster:                            // Frame-pacing routine: wait for raster line 255.
-    lda RASTER                          // Read current VIC-II raster line low byte from $D012 into A.
-    cmp #255                          // Compare A with 255; internally performs A-255 and sets flags, without changing A.
-    bne checkRaster                     // If Z=0 (not raster line 255), loop and read it again.
-    rts                                 // Raster reached 255: return to caller.
+mainLoop:
+    // The frame is deliberately split into two phases.
+    //
+    // 1. During raster lines 256-311 (the bottom of the PAL frame), update
+    //    logical game state and prepare the sprite layout for the NEXT frame.
+    //    Doing the variable-duration work here prevents us from missing an
+    //    early sprite such as an enemy at Y=40.
+    //
+    // 2. At raster 0-19, copy the first eight sorted objects to the VIC-II and
+    //    arm the one prepared raster event.  The IRQ later recycles one of
+    //    those hardware sprites for the ninth logical object.
+    //
+    // waitForFrameEnd followed by waitForFrameStart also guarantees that this
+    // loop cannot update the game twice during the same frame.
 
-mainLoop:                               // Main update loop. One pass is intended roughly once per video frame.
-    jsr checkRaster                     // Wait until VIC-II reaches raster line 255.
-    jsr updateObjects                   // Update logical enemy objects 1-7 in RAM.
-    jsr renderSprites                   // Copy logical objects to VIC sprites.
-    //jsr renderPlayerLate                // Render multiplexed player
-    jmp mainLoop                        // Repeat forever. JMP is correct here: unlike JSR it does not leak return addresses.
+    jsr waitForFrameEnd
+
+    jsr updateObjects
+    jsr buildSortedObjectList
+    jsr sortObjectsByY
+    jsr prepareNinthSpriteEvent
+
+    jsr waitForFrameStart
+
+    jsr renderSprites
+    jsr armPreparedEvent
+
+    jmp mainLoop
 
 // ------------------------------------------------------------
 // Update player position from joystick inputs
@@ -152,12 +194,12 @@ updatePlayer:
 // ============================================================================
 
 renderSprites:
-    ldy #01                             // Y = hardware sprite slot
+    ldy #00                             // Y = hardware sprite slot
     lda #00                             // Clear hardware X-MSB accumulator.
     sta TEMP_MSB                        // Start with no hardware MSB bits set.
 
 renderLoop:
-    lda HW_OBJECT,y                     // Find logical object assigned to this VIC slot.
+    lda SORTED_OBJECTS,y                     // Find logical object assigned to this VIC slot.
     tax                                 // X = logical object index.
 
     lda OBJECT_X_MSB,x                  // Read this logical object's ninth X bit.
@@ -192,37 +234,6 @@ renderLoop:
     sta SPRITE_OVERFLOW_REGISTER        // Write packed X-MSB bits to $D010.
     rts                                 // Return to main loop.
 
-    renderPlayerLate:
-!:
-    lda RASTER                          // Wait until raster line 180.
-    cmp #180
-    bne !-
-    ldx #0                              // Object 0 is the player.
-
-    lda OBJECT_SPRITE,x                 // Reuse hardware sprite 0.
-    sta HW_SPRITE_POINTER
-
-    lda OBJECT_COLOUR,x
-    sta HW_SPRITE_COLOUR
-
-    lda OBJECT_X,x
-    sta SPR_X
-
-    lda OBJECT_Y,x
-    sta SPR_Y
-
-    lda SPRITE_OVERFLOW_REGISTER        // Hardware sprite 0 uses bit 0 of $D010.
-    and #%11111110                      // Clear hardware sprite 0's existing MSB.
-
-    ldy OBJECT_X_MSB,x                  // Load object 0 MSB into Y
-    beq !noPlayerMsb+                   // MSB=0
-    ora #%00000001                      // Player X >= 256 (MSB=1): set hardware sprite 0's MSB.
-
-
-!noPlayerMsb:
-    sta SPRITE_OVERFLOW_REGISTER        //Write HW MSB
-    rts
-
 // ============================================================================
 // SPRITE INITIALISATION
 // ============================================================================
@@ -238,7 +249,7 @@ setupSprites:
     lda #200                          // A = initial player Y.
     sta OBJECT_Y                        // Seed logical object 0 Y.
     lda #0                              // Load clear ninth X bit.
-    sta OBJECT_X_MSB                    // Clear X bit 8 for logical objects 0-7.
+    sta OBJECT_X_MSB                    // Clear X bit 8 for logical object 0.
     // --- Mob starting X positions ---
     lda #31                             // A = first mob's X position.
     ldx #01                             // X = logical object 1, the first enemy.
@@ -247,15 +258,17 @@ xposLoop:
     clc                                 // Clear carry so the following ADC performs exactly A + 28.
     adc #28                             // A = previous mob X + 28; spaces mobs horizontally.
     inx                                 // Advance to next enemy object.
-    cpx #09                             // Finished enemy object 7?
-    bne xposLoop                        // Repeat until all seven mob X positions are set.
+    cpx #09                             // Finished enemy object 8?
+    bne xposLoop                        // Repeat until all eight enemy X positions are set.
     // --- Mob starting Y positions ---
-    lda #54                             // A = common starting Y coordinate for every enemy object.
+    lda #40                             // A = common starting Y coordinate for every enemy object.
     ldx #01                             // X = logical object 1 again.
 yposLoop:
     sta OBJECT_Y,x                      // Store Y directly in the current logical object.
+    clc
+    adc #12
     inx                                 // Next logical object.
-    cpx #09                             // Reached object 8? Then objects 1-7 are initialised.
+    cpx #09                             // Reached object 8? Then objects 1-8 are initialised.
     bne yposLoop                        // No: repeat.
     rts                                 // Sprite setup complete; return to init.
 
@@ -334,12 +347,7 @@ overflowMob:                            // Toggle current logical object's ninth
     rts                                 // Return directly to moveMobs (because this routine was reached by branch).
 
 
-reverseMob:                             // Reverse current mob and drop it down one row.
-    lda OBJECT_Y,x                      // A = current logical object's Y coordinate.
-    clc                                 // Clear carry so the vertical displacement is exactly 24.
-    adc #24                             // A = Y + 24 pixels.
-    sta OBJECT_Y,x                      // Store new logical Y coordinate.
-
+reverseMob:                             // Reverse horizontal direction at a screen edge.
     lda OBJECT_DIR,x                    // Read this logical object's direction.
     eor #01                             // Toggle left/right
     sta OBJECT_DIR,x                    // Store new direction
@@ -348,81 +356,287 @@ reverseMob:                             // Reverse current mob and drop it down 
 checkMobRightBoundary:
     lda OBJECT_X_MSB,x                  // Read this object's ninth X bit.
     beq !+                              // 0 => X=66, not right boundary.
-    jmp reverseMob                      // 1 => X=322, reverse and descend.
+    jmp reverseMob                      // 1 => X=322, reverse direction.
 !:                                      // Local continuation label.
     rts                                 // Right boundary check complete.
 
 checkMobLeftBoundary:
     lda OBJECT_X_MSB,x                  // Read this object's ninth X bit.
     bne !+                              // 1 => X=279, not left boundary.
-    jmp reverseMob                      // 0 => X=23, reverse and descend.
+    jmp reverseMob                      // 0 => X=23, reverse direction.
 !:                                      // Local continuation label.
     rts                                 // Left boundary check complete.
 
 // ============================================================================
-// Experimental IRQ Interrupt
+// Sort objects by Y value
 // ============================================================================
-setupRasterIRQ:
-    sei
-    lda #150                          // Tell VIC we want raster line 150.
-    sta RASTER
-    lda VIC_CONTROL_1                   // Raster bit 8 lives in bit 7 of $D011.
-    and #%01111111                      // Clear it because 150 is below raster 256.
-    sta VIC_CONTROL_1
-    lda #<rasterIRQ                     // Point the normal C64 IRQ vector at our routine.
-    sta IRQ_VECTOR
-    lda #>rasterIRQ
-    sta IRQ_VECTOR + 1                  // Enable VIC raster interrupts.
-    lda #%00000001
-    sta IRQ_ENABLE
-    cli
+buildSortedObjectList:
+    lda #0
+    sta SORTED_COUNT
+
+    ldx #0
+
+!collect:
+    lda OBJECT_ACTIVE,x
+    beq !next+
+
+    ldy SORTED_COUNT
+    txa
+    sta SORTED_OBJECTS,y
+
+    inc SORTED_COUNT
+
+!next:
+    inx
+    cpx #MAX_OBJECTS
+    bne !collect-
+
     rts
 
-rasterIRQ:
+sortObjectsByY:
+    lda SORTED_COUNT
+    cmp #2
+    bcc !done+
+
+    ldy #1
+
+!outer:
+    lda SORTED_OBJECTS,y
+    sta TEMP_OBJECT
+
+    tax
+    lda OBJECT_Y,x
+    sta TEMP_SORT_Y
+
+    dey
+
+!inner:
+    lda SORTED_OBJECTS,y
+    tax
+
+    lda OBJECT_Y,x
+    cmp TEMP_SORT_Y
+    bcc !insert+
+    beq !insert+
+
+    lda SORTED_OBJECTS,y
+    sta SORTED_OBJECTS + 1,y
+
+    dey
+    bpl !inner-
+
+    lda TEMP_OBJECT
+    sta SORTED_OBJECTS
+
+    jmp !next+
+
+!insert:
+    lda TEMP_OBJECT
+    sta SORTED_OBJECTS + 1,y
+
+!next:
+    iny
+    iny
+    cpy SORTED_COUNT
+    bcc !outer-
+
+!done:
+    rts
+
+// ============================================================================
+// Multiplex IRQ
+// ============================================================================
+multiplexIRQ:
     lda IRQ_STATUS
     and #%00000001
     beq !notRaster+
 
-    txa
-    pha
-    tya
-    pha
+    // Which VIC sprite are we recycling?
+    ldy PREP_EVENT_SLOT
 
-    ldx #0
-
-    lda OBJECT_SPRITE,x
-    sta HW_SPRITE_POINTER
-
-    lda OBJECT_COLOUR,x
-    sta HW_SPRITE_COLOUR
-
-    lda OBJECT_X,x
-    sta SPR_X
-
-    lda OBJECT_Y,x
-    sta SPR_Y
-
-    lda SPRITE_OVERFLOW_REGISTER
-    and #%11111110
-
-    ldy OBJECT_X_MSB,x
-    beq !noPlayerMsb+
-
-    ora #%00000001
-
-!noPlayerMsb:
-    sta SPRITE_OVERFLOW_REGISTER
-
-    pla
-    tay
-    pla
+    // Which logical object is replacing it?
+    lda PREP_EVENT_OBJECT
     tax
 
+    // Graphics and colour.
+    lda OBJECT_SPRITE,x
+    sta HW_SPRITE_POINTER,y
+
+    lda OBJECT_COLOUR,x
+    sta HW_SPRITE_COLOUR,y
+
+    // Convert hardware sprite slot 0-7 into VIC coordinate offset 0,2,4...
+    lda HW_SPRITE_OFFSET,y
+    tay
+
+    lda OBJECT_X,x
+    sta SPR_X,y
+
+    lda OBJECT_Y,x
+    sta SPR_Y,y
+
+    // Recover hardware sprite number.
+    ldy PREP_EVENT_SLOT
+
+    // Clear this hardware sprite's X-MSB bit first.
+    lda SPRITE_OVERFLOW_REGISTER
+    and HW_CLEAR_MASK,y
+    sta SPRITE_OVERFLOW_REGISTER
+
+    // Set it again if this logical object's X is >255.
+    lda OBJECT_X_MSB,x
+    beq !msbDone+
+
+    lda SPRITE_OVERFLOW_REGISTER
+    ora HW_BIT_MASK,y
+    sta SPRITE_OVERFLOW_REGISTER
+
+!msbDone:
+
+    // Acknowledge the raster interrupt.
     lda #%00000001
     sta IRQ_STATUS
 
+    // One-shot: this event has now happened.
+    lda IRQ_ENABLE
+    and #%11111110
+    sta IRQ_ENABLE
+
 !notRaster:
     jmp $ea31
+
+// ============================================================================
+// Prepare the single multiplex event used by the current prototype
+//
+// Builds a frozen description of the ninth sprite event in RAM.
+// Does NOT arm an IRQ or alter any VIC-II state.
+// ============================================================================
+
+prepareNinthSpriteEvent:
+
+    lda #0
+    sta PREP_EVENT_VALID                // Assume no usable event until proven otherwise.
+
+    lda #$ff
+    sta PREP_EVENT_SLOT
+    sta PREP_EVENT_OBJECT               // Helpful when inspecting RAM in the monitor.
+
+    lda SORTED_COUNT
+    cmp #9
+    bcc !done+                          // Fewer than 9 objects: no multiplexing required.
+
+    lda SORTED_OBJECTS + 8              // Ninth object in vertical order.
+    sta PREP_EVENT_OBJECT
+
+    tax
+    lda OBJECT_Y,x
+    sta TEMP_OBJECT_Y                   // Y of object waiting to be rendered.
+
+    ldy #0                              // Begin searching hardware slots 0-7.
+
+!findSlot:
+    lda SORTED_OBJECTS,y                // Object initially assigned to this hardware slot.
+    tax
+
+    lda OBJECT_Y,x
+    clc
+    adc #24
+    bcs !nextSlot+                   // Safe point is after raster 255:
+                                 // don't use this slot in this simple event search.
+
+    cmp TEMP_OBJECT_Y
+    bcc !slotFound+
+
+!nextSlot:
+    iny
+    cpy #8
+    bne !findSlot-
+
+    lda #$ff
+    sta PREP_EVENT_OBJECT               // No legal slot: discard candidate.
+    rts
+
+!slotFound:
+    sty PREP_EVENT_SLOT                  // Hardware slot that will be recycled.
+
+    // Trigger comfortably before the waiting object reaches its Y position.
+    // A four-line lead occasionally flickered because another IRQ could delay
+    // ours; twelve lines proved stable in testing.
+    lda TEMP_OBJECT_Y
+    sec
+    sbc #12
+    sta PREP_EVENT_RASTER
+
+    lda #1
+    sta PREP_EVENT_VALID
+
+!done:
+    rts
+
+// ============================================================================
+// Prepare VIC Raster interrupt
+// ============================================================================
+
+armPreparedEvent:
+    sei
+
+    // Start with raster IRQ disabled.
+    lda IRQ_ENABLE
+    and #%11111110
+    sta IRQ_ENABLE
+
+    lda PREP_EVENT_VALID
+    beq !done+
+
+    // Install our raster IRQ handler.
+    lda #<multiplexIRQ
+    sta IRQ_VECTOR
+    lda #>multiplexIRQ
+    sta IRQ_VECTOR + 1
+
+    // prepareNinthSpriteEvent currently creates events below raster 256, so
+    // clear the VIC-II raster compare high bit ($D011 bit 7).
+    lda VIC_CONTROL_1
+    and #%01111111
+    sta VIC_CONTROL_1
+
+    lda PREP_EVENT_RASTER
+    sta RASTER
+
+    // Clear any stale raster interrupt flag before arming.
+    lda #%00000001
+    sta IRQ_STATUS
+
+    lda IRQ_ENABLE
+    ora #%00000001
+    sta IRQ_ENABLE
+
+!done:
+    cli
+    rts
+
+// ============================================================================
+// Establish frame lock
+// ============================================================================
+waitForFrameStart:
+
+!wait:
+    lda VIC_CONTROL_1
+    bmi !wait-                       // Bit 7 set = raster 256-311.
+
+    lda RASTER
+    cmp #20
+    bcs !wait-                       // Wait until raster 0-19 of genuine next frame.
+
+    rts
+
+waitForFrameEnd:
+
+!wait:
+    lda VIC_CONTROL_1
+    bpl !wait-                       // Wait until raster bit 8 becomes 1:
+                                    // we've entered raster 256-311.
+    rts
 
 // ============================================================================
 // SPRITE LOOKUP POINTER TABLE
@@ -453,6 +667,16 @@ HW_BIT_MASK:
     .byte %01000000                     // Hardware sprite 6 MSB mask.
     .byte %10000000                     // Hardware sprite 7 MSB mask.
 
+HW_CLEAR_MASK:
+    .byte %11111110
+    .byte %11111101
+    .byte %11111011
+    .byte %11110111
+    .byte %11101111
+    .byte %11011111
+    .byte %10111111
+    .byte %01111111
+
 // ---------------------------------------------------------
 // LOGICAL OBJECT STATE POOL
 // ---------------------------------------------------------
@@ -477,9 +701,6 @@ OBJECT_ACTIVE:
 OBJECT_TYPE:
     .fill MAX_OBJECTS, 0                // Object type values.
 
-HW_OBJECT:
-    .byte 1,2,3,4,5,6,7,8               // Hardware slot to logical object map.
-
 HW_SPRITE_OFFSET:
     .byte 0,2,4,6,8,10,12,14            // VIC X/Y register offsets by slot.
 
@@ -488,6 +709,25 @@ OBJECT_SPRITE:
 
 OBJECT_COLOUR:
     .fill MAX_OBJECTS, 0                // Sprite colour owned by each object.
+
+SORTED_OBJECTS:
+    .fill MAX_OBJECTS, $ff
+
+SORTED_COUNT:
+    .byte 0
+
+PREP_EVENT_VALID:
+    .byte 0                  // 0 = no multiplex event this frame, 1 = event prepared
+
+PREP_EVENT_RASTER:
+    .byte 0                  // Raster line at which slot becomes reusable
+
+PREP_EVENT_SLOT:
+    .byte $ff                // Hardware sprite slot to recycle
+
+PREP_EVENT_OBJECT:
+    .byte $ff                // Logical object to put into that slot
+
 
 // ============================================================================
 // SPRITE BITMAP DATA
