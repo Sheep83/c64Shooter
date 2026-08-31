@@ -111,6 +111,12 @@ mainLoop:
 setupSprites:
     lda #$ff                                // Load A from #$ff.
     sta SPRITE_ENABLE                       // Enable all 8 hardware sprites
+    lda #%11111111
+    sta SPRITE_MODE                         // $D01C: all hardware sprites use multicolour mode
+    lda #$0b
+    sta SPRITE_COLOUR_1
+    lda #$0f
+    sta SPRITE_COLOUR_2
 
     lda #146                                // Load A from #146.
     sta OBJECT_X                            // Player X
@@ -1027,14 +1033,29 @@ ENGINE_STATE_END:
 * = $2400
 
 playerSprite:
-.byte $00,$00,$00,$7f,$ff,$fe,$40,$18
-.byte $02,$40,$18,$02,$40,$18,$02,$40
-.byte $18,$02,$40,$18,$02,$40,$18,$02
-.byte $40,$18,$02,$40,$18,$02,$7f,$ff
-.byte $fe,$40,$18,$02,$40,$18,$02,$40
-.byte $18,$02,$40,$18,$02,$40,$18,$02
-.byte $40,$18,$02,$40,$18,$02,$40,$18
-.byte $02,$7f,$ff,$fe,$00,$00,$00,$0a
+
+    .byte $00,$3c,$00
+    .byte $00,$3c,$00
+    .byte $00,$ff,$00
+    .byte $00,$eb,$00
+    .byte $03,$eb,$c0
+    .byte $03,$eb,$c0
+    .byte $0f,$eb,$f0
+    .byte $0f,$d7,$f0
+    .byte $3f,$d7,$fc
+    .byte $3f,$d7,$fc
+    .byte $ff,$d7,$ff
+    .byte $ff,$d7,$ff
+    .byte $3f,$d7,$fc
+    .byte $3f,$ff,$fc
+    .byte $0f,$d7,$f0
+    .byte $0f,$d7,$f0
+    .byte $0f,$c3,$f0
+    .byte $03,$c3,$c0
+    .byte $03,$c3,$c0
+    .byte $02,$82,$80
+    .byte $02,$82,$80
+    .byte $00            // 64th padding byte
 
 enemySpriteA:
     .byte $00,$18,$00
