@@ -30,3 +30,5 @@
 .var TEMP_OBJECT              = $0031
 .var TEMP_SORT_Y              = $0032
 .var TEMP_OBJECT_Y            = $0034
+.var TEMP_EVENT_INDEX         = $0035
+.var TEMP_FREE_RASTER         = $0036

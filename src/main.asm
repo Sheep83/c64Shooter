@@ -6,6 +6,9 @@
 .const TYPE_NONE   = 0                  // Object slot is unused.
 .const TYPE_PLAYER = 1                  // Object is the player.
 .const TYPE_ENEMY  = 2                  // Object is an enemy.
+.const MAX_EVENTS = MAX_OBJECTS - 8     // At most 8 objects need multiplexing.
+.const FLAG_RENDER    = %00000001
+.const FLAG_COLLIDE   = %00000010
 
 // ============================================================================
 // CURRENT ENGINE SHAPE
@@ -80,7 +83,7 @@ init:                                   // Program entry point called by the BAS
     sta OBJECT_SPRITE,x                 // Store enemy sprite graphic.
     lda #03                             // Load enemy colour.
     sta OBJECT_COLOUR,x                 // Store enemy colour.
-    cpx #08                             // Finished enemy object 8?
+    cpx #15                             // Finished enemy object 8?
     bne !-                              // No: initialise next enemy.
 
     jsr mainLoop                        // Enter the game loop. It never returns in the current program.
@@ -105,12 +108,12 @@ mainLoop:
     jsr updateObjects
     jsr buildSortedObjectList
     jsr sortObjectsByY
-    jsr prepareNinthSpriteEvent
+    //jsr buildBatchSpriteSchedule
 
     jsr waitForFrameStart
 
     jsr renderSprites
-    jsr armPreparedEvent
+    jsr armFirstBatch
 
     jmp mainLoop
 
@@ -194,12 +197,24 @@ updatePlayer:
 // ============================================================================
 
 renderSprites:
-    ldy #00                             // Y = hardware sprite slot
-    lda #00                             // Clear hardware X-MSB accumulator.
-    sta TEMP_MSB                        // Start with no hardware MSB bits set.
+    lda SORTED_COUNT
+    cmp #8
+    bcc !countReady+
+
+    lda #8                              // More than 8 objects:
+                                        // first pass can render only 8.
+
+!countReady:
+    sta RENDER_COUNT
+
+    beq !none+                          // No active objects at all.
+
+    ldy #00                             // Y = hardware sprite slot.
+    lda #00
+    sta TEMP_MSB
 
 renderLoop:
-    lda SORTED_OBJECTS,y                     // Find logical object assigned to this VIC slot.
+    lda SORTED_OBJECTS,y                // Find logical object assigned to this VIC slot.
     tax                                 // X = logical object index.
 
     lda OBJECT_X_MSB,x                  // Read this logical object's ninth X bit.
@@ -227,12 +242,18 @@ renderLoop:
 
     ldy TEMP_Y_REG                      // Restore Y = hardware slot number.
 
-    iny                                 // Next hardware slot.
-    cpy #8                              // Have all eight VIC slots been rendered?
-    bne renderLoop                      // No: render next hardware slot.
-    lda TEMP_MSB                        // Load completed hardware X-MSB byte.
-    sta SPRITE_OVERFLOW_REGISTER        // Write packed X-MSB bits to $D010.
-    rts                                 // Return to main loop.
+    iny
+    cpy RENDER_COUNT
+    bne renderLoop
+
+    lda TEMP_MSB
+    sta SPRITE_OVERFLOW_REGISTER
+    rts
+
+!none:
+    lda #0
+    sta SPRITE_OVERFLOW_REGISTER
+    rts
 
 // ============================================================================
 // SPRITE INITIALISATION
@@ -258,7 +279,7 @@ xposLoop:
     clc                                 // Clear carry so the following ADC performs exactly A + 28.
     adc #28                             // A = previous mob X + 28; spaces mobs horizontally.
     inx                                 // Advance to next enemy object.
-    cpx #09                             // Finished enemy object 8?
+    cpx #16                             // Finished enemy object 8?
     bne xposLoop                        // Repeat until all eight enemy X positions are set.
     // --- Mob starting Y positions ---
     lda #40                             // A = common starting Y coordinate for every enemy object.
@@ -268,7 +289,7 @@ yposLoop:
     clc
     adc #12
     inx                                 // Next logical object.
-    cpx #09                             // Reached object 8? Then objects 1-8 are initialised.
+    cpx #16                             // Reached object 8? Then objects 1-8 are initialised.
     bne yposLoop                        // No: repeat.
     rts                                 // Sprite setup complete; return to init.
 
@@ -444,28 +465,519 @@ sortObjectsByY:
     rts
 
 // ============================================================================
-// Multiplex IRQ
+// buildBatchSpriteSchedule
 // ============================================================================
+//
+// Builds the multiplex schedule for logical objects beyond the first eight.
+//
+// IMPORTANT:
+//   This routine does NOT touch VIC registers.
+//   The existing single-event multiplexer remains responsible for the live
+//   display while we test this.
+//
+// For each additional object we need:
+//
+//      old sprite finished
+//              |
+//              v
+//      SLOT_FREE_RASTER
+//              <=
+//      chosen IRQ raster
+//              <=
+//      OBJECT_Y - 12
+//              ^
+//              |
+//      new sprite prepared in time
+//
+// Several assignments can therefore share one IRQ whenever their valid
+// raster ranges overlap.
+//
+// The resulting schedule is stored in:
+//
+//      BATCH_RASTER[]
+//      BATCH_FIRST_ASSIGN[]
+//      BATCH_ASSIGN_COUNT[]
+//
+// with the actual slot/object pairs in:
+//
+//      ASSIGN_SLOT[]
+//      ASSIGN_OBJECT[]
+//
+// ============================================================================
+
+buildBatchSpriteSchedule:
+
+    // Start with an empty schedule.
+
+    lda #0
+    sta BATCH_COUNT
+    sta BATCH_INDEX
+    sta SCHED_ASSIGN_INDEX
+
+
+    // ------------------------------------------------------------------------
+    // Work out when each of the eight VIC sprite slots becomes reusable.
+    //
+    // renderSprites maps:
+    //
+    //      SORTED_OBJECTS[0] -> VIC slot 0
+    //      SORTED_OBJECTS[1] -> VIC slot 1
+    //      ...
+    //
+    // A normal sprite is 21 raster lines tall. We retain our existing
+    // conservative 24-line reuse distance.
+    // ------------------------------------------------------------------------
+
+    ldy #0
+
+!initSlots:
+
+    cpy RENDER_COUNT
+    bcs !unusedSlot+
+
+    lda SORTED_OBJECTS,y
+    tax
+
+    lda OBJECT_Y,x
+    clc
+    adc #24
+
+    // If Y+24 crosses 255, don't attempt to reuse this slot during the
+    // current low-raster scheduler.
+
+    bcs !unavailableSlot+
+
+    sta SLOT_FREE_RASTER,y
+    jmp !nextInit+
+
+
+!unusedSlot:
+
+    // No initial object occupies this VIC slot.
+    // It is available immediately.
+
+    lda #0
+    sta SLOT_FREE_RASTER,y
+    jmp !nextInit+
+
+
+!unavailableSlot:
+
+    lda #$ff
+    sta SLOT_FREE_RASTER,y
+
+
+!nextInit:
+
+    iny
+    cpy #8
+    bne !initSlots-
+
+
+    // ------------------------------------------------------------------------
+    // If there are at most eight objects, renderSprites can display all of
+    // them at frame start and no multiplex schedule is required.
+    // ------------------------------------------------------------------------
+
+    lda SORTED_COUNT
+    cmp #9
+    bcs !needsSchedule+
+
+    jmp !done+
+
+!needsSchedule:
+
+
+    // SORTED_OBJECTS[0..7] are the initial eight.
+    // Start scheduling at SORTED_OBJECTS[8].
+
+    lda #8
+    sta SCHED_OBJECT_INDEX
+
+
+// ============================================================================
+// Begin a new batch.
+// ============================================================================
+
+!startBatch:
+
+    lda SCHED_OBJECT_INDEX
+    cmp SORTED_COUNT
+    bcc !objectsRemain+
+
+    jmp !done+
+
+!objectsRemain:
+
+    lda #0
+    sta SCHED_BATCH_SIZE
+    sta SCHED_BATCH_EARLIEST
+
+    lda #$ff
+    sta SCHED_BATCH_LATEST
+
+
+// ============================================================================
+// Try to add the current object to this batch.
+// ============================================================================
+
+!tryObject:
+
+    ldy SCHED_OBJECT_INDEX
+
+    lda SORTED_OBJECTS,y
+    sta TEMP_OBJECT
+    tax
+
+
+    // ------------------------------------------------------------------------
+    // Latest acceptable IRQ line for this object:
+    //
+    //      OBJECT_Y - 12
+    //
+    // 12 is our already-tested IRQ preparation margin.
+    // ------------------------------------------------------------------------
+
+    lda OBJECT_Y,x
+    cmp #12
+    bcs !deadlineOk+
+
+    jmp !cannotSchedule+
+
+!deadlineOk:
+
+    sec
+    sbc #12
+    sta TEMP_OBJECT_Y             // Scratch now contains this object's deadline.
+
+
+    // ------------------------------------------------------------------------
+    // Find the BEST available VIC slot.
+    //
+    // A candidate slot must:
+    //
+    //      SLOT_FREE_RASTER <= object deadline
+    //
+    // and, if this batch already contains assignments, its free time must
+    // still overlap the batch's common timing window.
+    //
+    // Of the valid candidates, choose the one with the LATEST free raster.
+    //
+    // Why latest?
+    //
+    // If slots are free at 60, 80 and 100 and this object can use any of
+    // them, consuming the 100 slot leaves 60 and 80 available for later
+    // objects with tighter requirements.
+    // ------------------------------------------------------------------------
+
+    lda #$ff
+    sta SCHED_SELECTED_SLOT
+
+    lda #0
+    sta SCHED_SELECTED_FREE
+
+    ldy #0
+
+
+!findSlot:
+
+    lda SLOT_FREE_RASTER,y
+
+    cmp #$ff
+    beq !nextSlot+
+
+    // Must be free no later than this object's deadline.
+
+    cmp TEMP_OBJECT_Y
+    bcc !checkBatch+
+    beq !checkBatch+
+
+    jmp !nextSlot+
+
+
+!checkBatch:
+
+    // If a batch already exists, the candidate's free raster must not be
+    // later than the batch's current latest permissible IRQ line.
+
+    ldx SCHED_BATCH_SIZE
+    beq !candidate+
+
+    cmp SCHED_BATCH_LATEST
+    bcc !candidate+
+    beq !candidate+
+
+    jmp !nextSlot+
+
+
+!candidate:
+
+    // Prefer the candidate with the latest free raster.
+
+    cmp SCHED_SELECTED_FREE
+    bcc !nextSlot+
+
+    sta SCHED_SELECTED_FREE
+    sty SCHED_SELECTED_SLOT
+
+
+!nextSlot:
+
+    iny
+    cpy #8
+    bne !findSlot-
+
+
+    // Did we find anything?
+
+    lda SCHED_SELECTED_SLOT
+    cmp #$ff
+    beq !noSlot+
+
+
+    // ------------------------------------------------------------------------
+    // Work out the common timing interval after adding this assignment.
+    //
+    // earliest = max(current earliest, selected slot free)
+    // latest   = min(current latest, object deadline)
+    // ------------------------------------------------------------------------
+
+    lda SCHED_SELECTED_FREE
+    cmp SCHED_BATCH_EARLIEST
+    bcc !earliestReady+
+    sta SCHED_BATCH_EARLIEST
+
+!earliestReady:
+
+    lda TEMP_OBJECT_Y
+    cmp SCHED_BATCH_LATEST
+    bcs !latestReady+
+    sta SCHED_BATCH_LATEST
+
+!latestReady:
+
+
+    // ------------------------------------------------------------------------
+    // Record the assignment.
+    // ------------------------------------------------------------------------
+
+    ldx SCHED_ASSIGN_INDEX
+
+    lda SCHED_SELECTED_SLOT
+    sta ASSIGN_SLOT,x
+
+    lda TEMP_OBJECT
+    sta ASSIGN_OBJECT,x
+
+    inc SCHED_ASSIGN_INDEX
+    inc SCHED_BATCH_SIZE
+
+
+    // ------------------------------------------------------------------------
+    // This hardware slot will now contain the new object.
+    //
+    // Its next safe reuse point becomes:
+    //
+    //      OBJECT_Y + 24
+    // ------------------------------------------------------------------------
+
+    ldx TEMP_OBJECT
+
+    lda OBJECT_Y,x
+    clc
+    adc #24
+
+    ldy SCHED_SELECTED_SLOT
+
+    bcs !markUnavailable+
+
+    sta SLOT_FREE_RASTER,y
+    jmp !assignmentDone+
+
+
+!markUnavailable:
+
+    lda #$ff
+    sta SLOT_FREE_RASTER,y
+
+
+!assignmentDone:
+
+    inc SCHED_OBJECT_INDEX
+
+    // Have we scheduled every object?
+
+    lda SCHED_OBJECT_INDEX
+    cmp SORTED_COUNT
+    bcs !finishBatch+
+
+    // Otherwise see whether the next object can join this batch.
+
+    jmp !tryObject-
+
+
+// ============================================================================
+// No slot can accept this object in the CURRENT batch.
+// ============================================================================
+
+!noSlot:
+
+    // If the current batch already contains assignments, finish it.
+    //
+    // The same object will then be reconsidered as the first object of a new
+    // batch.
+
+    lda SCHED_BATCH_SIZE
+    bne !finishBatch+
+
+
+    // If even an empty batch cannot find a slot, this object genuinely cannot
+    // be represented this frame with the available eight VIC sprites.
+    //
+    // Skip it rather than corrupting the schedule.
+
+!cannotSchedule:
+
+    inc SCHED_OBJECT_INDEX
+
+    lda SCHED_OBJECT_INDEX
+    cmp SORTED_COUNT
+    bcs !done+
+
+    jmp !startBatch-
+
+
+// ============================================================================
+// Commit the completed batch.
+// ============================================================================
+
+!finishBatch:
+
+    lda SCHED_BATCH_SIZE
+    bne !commitBatch+
+
+    jmp !startBatch-
+
+!commitBatch:
+
+
+    ldx BATCH_COUNT
+
+
+    // ------------------------------------------------------------------------
+    // Run the batch at the LATEST raster line common to every assignment.
+    //
+    // This maximises the time available for outgoing sprites to finish while
+    // preserving the 12-line lead for incoming sprites.
+    // ------------------------------------------------------------------------
+
+    lda SCHED_BATCH_LATEST
+    sta BATCH_RASTER,x
+
+
+    // First assignment = current assignment index - batch size.
+
+    lda SCHED_ASSIGN_INDEX
+    sec
+    sbc SCHED_BATCH_SIZE
+    sta BATCH_FIRST_ASSIGN,x
+
+
+    lda SCHED_BATCH_SIZE
+    sta BATCH_ASSIGN_COUNT,x
+
+    inc BATCH_COUNT
+
+
+    // If objects remain, start another batch.
+    //
+    // Notice that SCHED_OBJECT_INDEX was NOT incremented when !noSlot caused
+    // us to finish a batch. Therefore that object is reconsidered here.
+
+    lda SCHED_OBJECT_INDEX
+    cmp SORTED_COUNT
+    bcs !done+
+
+    jmp !startBatch-
+
+!done:
+    rts
+
+// ============================================================================
+// Batch multiplex IRQ - PHASE 1
+// ============================================================================
+//
+// Executes every slot -> object assignment belonging to BATCH 0.
+//
+// For this first live test we deliberately stop after the first batch.
+// Later we will chain to BATCH 1, BATCH 2, etc.
+// ============================================================================
+
 multiplexIRQ:
+
     lda IRQ_STATUS
     and #%00000001
     beq !notRaster+
 
-    // Which VIC sprite are we recycling?
-    ldy PREP_EVENT_SLOT
+    // We're only executing batch zero in this test.
+    ldx #0
 
-    // Which logical object is replacing it?
-    lda PREP_EVENT_OBJECT
+    // Y = first assignment belonging to this batch.
+    lda BATCH_FIRST_ASSIGN,x
+    tay
+
+    // Work out the assignment index immediately after this batch.
+    //
+    // TEMP_OBJECT_Y is safe scratch here:
+    //
+    //     end = first + count
+
+    clc
+    adc BATCH_ASSIGN_COUNT,x
+    sta TEMP_OBJECT_Y
+
+
+// ---------------------------------------------------------------------------
+// Execute one assignment.
+// ---------------------------------------------------------------------------
+
+!assignmentLoop:
+
+    // Preserve the assignment-table index while we use Y for VIC slot work.
+    sty TEMP_Y_REG
+
+    // Which hardware slot are we rewriting?
+    lda ASSIGN_SLOT,y
+    sta SCHED_SELECTED_SLOT
+
+    // Which logical object will occupy it?
+    lda ASSIGN_OBJECT,y
     tax
 
-    // Graphics and colour.
+
+    // ------------------------------------------------------------------------
+    // Sprite graphic and colour.
+    // ------------------------------------------------------------------------
+
+    ldy SCHED_SELECTED_SLOT
+
     lda OBJECT_SPRITE,x
     sta HW_SPRITE_POINTER,y
 
     lda OBJECT_COLOUR,x
     sta HW_SPRITE_COLOUR,y
 
-    // Convert hardware sprite slot 0-7 into VIC coordinate offset 0,2,4...
+
+    // ------------------------------------------------------------------------
+    // X / Y position.
+    //
+    // VIC sprite coordinate registers are interleaved:
+    //
+    //     slot 0 -> offsets 0,1
+    //     slot 1 -> offsets 2,3
+    //     ...
+    // ------------------------------------------------------------------------
+
     lda HW_SPRITE_OFFSET,y
     tay
 
@@ -475,15 +987,17 @@ multiplexIRQ:
     lda OBJECT_Y,x
     sta SPR_Y,y
 
-    // Recover hardware sprite number.
-    ldy PREP_EVENT_SLOT
 
-    // Clear this hardware sprite's X-MSB bit first.
+    // ------------------------------------------------------------------------
+    // Update this hardware sprite's ninth X bit.
+    // ------------------------------------------------------------------------
+
+    ldy SCHED_SELECTED_SLOT
+
     lda SPRITE_OVERFLOW_REGISTER
     and HW_CLEAR_MASK,y
     sta SPRITE_OVERFLOW_REGISTER
 
-    // Set it again if this logical object's X is >255.
     lda OBJECT_X_MSB,x
     beq !msbDone+
 
@@ -493,16 +1007,45 @@ multiplexIRQ:
 
 !msbDone:
 
-    // Acknowledge the raster interrupt.
+
+    // ------------------------------------------------------------------------
+    // Restore assignment index and move to the next assignment.
+    // ------------------------------------------------------------------------
+
+    ldy TEMP_Y_REG
+    iny
+
+    cpy TEMP_OBJECT_Y
+    bne !assignmentLoop-
+
+
+    // ------------------------------------------------------------------------
+    // Acknowledge this raster IRQ.
+    // ------------------------------------------------------------------------
+
     lda #%00000001
     sta IRQ_STATUS
 
-    // One-shot: this event has now happened.
+
+    // ------------------------------------------------------------------------
+    // PHASE 1 ONLY:
+    //
+    // Disable raster IRQs after batch zero.
+    //
+    // Later this becomes:
+    //
+    //     advance BATCH_INDEX
+    //     arm BATCH_RASTER[next]
+    //
+    // ------------------------------------------------------------------------
+
     lda IRQ_ENABLE
     and #%11111110
     sta IRQ_ENABLE
 
+
 !notRaster:
+
     jmp $ea31
 
 // ============================================================================
@@ -574,44 +1117,67 @@ prepareNinthSpriteEvent:
     rts
 
 // ============================================================================
-// Prepare VIC Raster interrupt
+// Arm first sprite batch
+// ============================================================================
+//
+// Arms BATCH 0 only.
+//
+// The IRQ itself currently executes that batch and then disables raster IRQs.
 // ============================================================================
 
-armPreparedEvent:
+armFirstBatch:
+
     sei
 
-    // Start with raster IRQ disabled.
+    // Disable raster IRQ while configuring it.
     lda IRQ_ENABLE
     and #%11111110
     sta IRQ_ENABLE
 
-    lda PREP_EVENT_VALID
+
+    // No batches this frame?
+    lda BATCH_COUNT
     beq !done+
 
-    // Install our raster IRQ handler.
+
+    // Start with batch zero.
+    lda #0
+    sta BATCH_INDEX
+
+
+    // Install batch IRQ handler.
     lda #<multiplexIRQ
     sta IRQ_VECTOR
+
     lda #>multiplexIRQ
     sta IRQ_VECTOR + 1
 
-    // prepareNinthSpriteEvent currently creates events below raster 256, so
-    // clear the VIC-II raster compare high bit ($D011 bit 7).
+
+    // Current scheduler only creates raster events below 256.
     lda VIC_CONTROL_1
     and #%01111111
     sta VIC_CONTROL_1
 
-    lda PREP_EVENT_RASTER
+
+    // Arm first batch raster.
+    ldx #0
+    lda BATCH_RASTER,x
     sta RASTER
 
-    // Clear any stale raster interrupt flag before arming.
+
+    // Clear any stale raster IRQ flag.
     lda #%00000001
     sta IRQ_STATUS
 
+
+    // Enable VIC raster IRQ.
     lda IRQ_ENABLE
     ora #%00000001
     sta IRQ_ENABLE
 
+
 !done:
+
     cli
     rts
 
@@ -643,20 +1209,27 @@ waitForFrameEnd:
 // ============================================================================
 
 spritePointers:
-    .byte playerSprite / 64             // Player sprite pointer.
-    .byte enemySpriteA / 64             // Enemy A sprite pointer.
-    .byte enemySpriteB / 64             // Enemy B sprite pointer.
-    .byte enemySpriteA / 64             // Enemy A sprite pointer.
-    .byte enemySpriteB / 64             // Enemy B sprite pointer.
-    .byte enemySpriteA / 64             // Enemy A sprite pointer.
-    .byte enemySpriteB / 64             // Enemy B sprite pointer.
-    .byte enemySpriteA / 64             // Enemy A sprite pointer.
-    .byte enemySpriteB / 64             // Enemy B sprite pointer.
+    .byte playerSprite / 64     // Object 0
+    .byte enemySpriteA / 64     // Object 1
+    .byte enemySpriteB / 64     // Object 2
+    .byte enemySpriteA / 64     // Object 3
+    .byte enemySpriteB / 64     // Object 4
+    .byte enemySpriteA / 64     // Object 5
+    .byte enemySpriteB / 64     // Object 6
+    .byte enemySpriteA / 64     // Object 7
+    .byte enemySpriteB / 64     // Object 8
+    .byte enemySpriteA / 64     // Object 9
+    .byte enemySpriteB / 64     // Object 10
+    .byte enemySpriteA / 64     // Object 11
+    .byte enemySpriteB / 64     // Object 12
+    .byte enemySpriteA / 64     // Object 13
+    .byte enemySpriteB / 64     // Object 14
+    .byte enemySpriteA / 64     // Object 15
 
 // ============================================================================
-// LOGICAL OBJECT BIT-MASK LOOKUP TABLE
+// Read Only Engine Lookup Tables
 // ============================================================================
-
+* = $1f00
 HW_BIT_MASK:
     .byte %00000001                     // Hardware sprite 0 MSB mask.
     .byte %00000010                     // Hardware sprite 1 MSB mask.
@@ -676,6 +1249,12 @@ HW_CLEAR_MASK:
     .byte %11011111
     .byte %10111111
     .byte %01111111
+
+LOOKUP_TABLES_END:
+
+.if (LOOKUP_TABLES_END > $2000) {
+    .error "Lookup tables overlap engine runtime state"
+}
 
 // ---------------------------------------------------------
 // LOGICAL OBJECT STATE POOL
@@ -727,6 +1306,101 @@ PREP_EVENT_SLOT:
 
 PREP_EVENT_OBJECT:
     .byte $ff                // Logical object to put into that slot
+
+// ============================================================================
+// FUTURE BATCH SPRITE SCHEDULE
+// ============================================================================
+//
+// A batch is one raster IRQ.
+//
+// Each batch can update one or more hardware sprite slots.
+// This lets several logical objects be installed during a single IRQ when
+// their safe timing windows overlap.
+//
+// Example:
+//
+//   batch 0 @ raster 88
+//      slot 0 -> object 8
+//      slot 1 -> object 9
+//      slot 2 -> object 10
+//
+//   batch 1 @ raster 148
+//      slot 0 -> object 11
+//      slot 3 -> object 12
+//
+// With 16 logical objects:
+//   - first 8 can be rendered at frame start
+//   - at most 8 further assignments are needed
+//   - therefore at most 8 batches are ever required
+// ============================================================================
+
+BATCH_COUNT:
+    .byte 0                              // Number of raster batches this frame.
+
+BATCH_INDEX:
+    .byte 0                              // Batch currently being executed by IRQ.
+
+BATCH_RASTER:
+    .fill MAX_EVENTS, 0                  // Raster line for each batch.
+
+BATCH_FIRST_ASSIGN:
+    .fill MAX_EVENTS, $ff                // First assignment belonging to batch.
+
+BATCH_ASSIGN_COUNT:
+    .fill MAX_EVENTS, 0                  // Number of assignments in batch.
+
+ASSIGN_SLOT:
+    .fill MAX_EVENTS, $ff                // Hardware slot for each assignment.
+
+ASSIGN_OBJECT:
+    .fill MAX_EVENTS, $ff                // Logical object for each assignment.
+
+SLOT_FREE_RASTER:
+    .fill 8, $ff                         // Earliest safe reuse point for each VIC slot.
+
+
+// ---------------------------------------------------------------------------
+// Scheduler working state
+//
+// This is ordinary RAM rather than more zero-page scratch. Scheduler code
+// runs outside the raster-critical IRQ, so readability is more important than
+// saving a cycle here.
+// ---------------------------------------------------------------------------
+
+SCHED_OBJECT_INDEX:
+    .byte 0                              // SORTED_OBJECTS entry being considered.
+
+SCHED_ASSIGN_INDEX:
+    .byte 0                              // Next free ASSIGN_* entry.
+
+SCHED_BATCH_SIZE:
+    .byte 0                              // Assignments currently in working batch.
+
+SCHED_BATCH_EARLIEST:
+    .byte 0                              // Earliest raster common to current batch.
+
+SCHED_BATCH_LATEST:
+    .byte $ff                            // Latest raster common to current batch.
+
+SCHED_SELECTED_SLOT:
+    .byte $ff                            // Candidate hardware slot.
+
+SCHED_SELECTED_FREE:
+    .byte $ff                            // Candidate slot's free raster.
+
+RENDER_COUNT:
+    .byte 0
+
+OBJECT_FLAGS:
+    .fill MAX_OBJECTS, 0
+
+ENGINE_STATE_END:
+
+.if (ENGINE_STATE_END > $2400) {
+    .error "Engine state overlaps sprite bitmap data"
+}
+
+
 
 
 // ============================================================================
