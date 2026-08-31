@@ -7,6 +7,10 @@
 .const TYPE_PLAYER = 1
 .const TYPE_ENEMY  = 2
 
+.const DEBUG_SCREEN = $0400
+.const DEBUG_COLOUR = $d800
+.const DEBUG_FRAMES = 50
+
 // ============================================================================
 // ENGINE SHAPE
 // ============================================================================
@@ -45,6 +49,7 @@ init:
     lda #0                                  // Load A from #0.
     sta BORDER_COLOUR                       // Debug border off
 
+    jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
 
     lda #1                                  // Load A from #1.
@@ -93,6 +98,7 @@ mainLoop:
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
+    jsr updateCycleDebug                    // Record remaining frame budget; refresh the display every 50 frames.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
@@ -573,6 +579,153 @@ buildBatchSpriteSchedule:
 !done:
     rts                                     // Return to the calling routine.
 
+// --- Routine: setupDebugDisplay --------------------------------------------
+// Draw "FREE 00000", colour it white, and initialise the rolling cycle minimum.
+setupDebugDisplay:
+    ldx #0                                  // Start at the first character in the debug label.
+!labelLoop:
+    lda debugLabel,x                        // Load the next prebuilt screen code.
+    sta DEBUG_SCREEN,x                      // Write it into the top-left of screen RAM.
+    lda #1                                  // Use C64 colour 1: white.
+    sta DEBUG_COLOUR,x                      // Set this character's colour RAM entry.
+    inx                                     // Advance to the next debug character.
+    cpx #10                                 // Label plus five digits occupies ten characters.
+    bne !labelLoop-                         // Keep copying until all ten characters are written.
+
+    lda #0                                  // Start the one-second frame counter at zero.
+    sta DEBUG_FRAME_COUNT                   // Store the current debug frame count.
+    lda #$ff                                // $ffff is higher than any possible PAL-frame free-cycle value.
+    sta DEBUG_MIN_LO                        // Initialise low byte of the rolling minimum.
+    sta DEBUG_MIN_HI                        // Initialise high byte of the rolling minimum.
+    rts                                     // Return to init.
+
+// --- Routine: updateCycleDebug ---------------------------------------------
+// Track the lowest approximate free-cycle count and display it every 50 frames.
+updateCycleDebug:
+    inc DEBUG_FRAME_COUNT                   // Count one completed BUILD_PLAN preparation.
+    lda DEBUG_FRAME_COUNT                   // Load the updated frame count.
+    cmp #DEBUG_FRAMES                       // Has roughly one PAL second elapsed?
+    bne !sample+                            // If not, skip the relatively expensive decimal display update.
+
+    jsr displayCycleMinimum                 // Display the worst free-cycle figure from the previous interval.
+    lda #0                                  // Begin a fresh 50-frame interval.
+    sta DEBUG_FRAME_COUNT                   // Reset the frame counter.
+    lda #$ff                                // Reset the rolling minimum to the largest possible 16-bit value.
+    sta DEBUG_MIN_LO                        // Reset minimum low byte.
+    sta DEBUG_MIN_HI                        // Reset minimum high byte.
+
+!sample:
+!stableRaster:
+    lda VIC_CONTROL_1                       // Read raster bit 8 from $d011.
+    and #%10000000                          // Keep only raster bit 8.
+    sta DEBUG_RASTER_HI                     // Remember the first high-bit reading.
+    lda RASTER                              // Read raster bits 0-7 from $d012.
+    sta DEBUG_RASTER_LO                     // Save the raster low byte.
+    lda VIC_CONTROL_1                       // Read raster bit 8 again in case line 255/256 was crossed.
+    and #%10000000                          // Keep only raster bit 8.
+    cmp DEBUG_RASTER_HI                     // Did the high bit change between the two reads?
+    bne !stableRaster-                      // Retry if the sample straddled the 255/256 boundary.
+
+    lda #$38                                // 312 PAL lines = $0138; start with its low byte.
+    sec                                     // Set carry so SBC performs an ordinary subtraction.
+    sbc DEBUG_RASTER_LO                     // Low byte of free lines = $38 - raster low byte.
+    sta DEBUG_FREE_LO                       // Temporarily store free raster lines, low byte.
+    lda #$01                                // Load high byte of PAL's 312-line total.
+    sbc #0                                  // Apply any borrow from the low-byte subtraction.
+    ldx DEBUG_RASTER_HI                     // Load sampled raster bit 8.
+    beq !haveFreeLines+                     // If clear, the sampled raster was below line 256.
+    sec                                     // No borrow is wanted for this explicit high-raster subtraction.
+    sbc #1                                  // Subtract the raster's 256-line high component.
+!haveFreeLines:
+    sta DEBUG_FREE_HI                       // Store free raster lines, high byte.
+
+    lda DEBUG_FREE_LO                       // Preserve the line count before multiplying it.
+    sta DEBUG_LINES_LO                      // Save original free-line low byte.
+    lda DEBUG_FREE_HI                       // Load original free-line high byte.
+    sta DEBUG_LINES_HI                      // Save original free-line high byte.
+
+    ldx #6                                  // Multiplying by 64 is six 16-bit left shifts.
+!times64:
+    asl DEBUG_FREE_LO                       // Shift low byte left; outgoing bit 7 enters carry.
+    rol DEBUG_FREE_HI                       // Shift high byte left and rotate the carry into bit 0.
+    dex                                     // One of the six shifts is complete.
+    bne !times64-                           // Repeat until free lines have been multiplied by 64.
+
+    lda DEBUG_FREE_LO                       // Convert x64 to x63 by subtracting the original line count.
+    sec                                     // Set carry for an ordinary 16-bit subtraction.
+    sbc DEBUG_LINES_LO                      // Subtract original low byte.
+    sta DEBUG_FREE_LO                       // Store approximate free cycles, low byte.
+    lda DEBUG_FREE_HI                       // Load multiplied high byte.
+    sbc DEBUG_LINES_HI                      // Subtract original high byte plus any borrow.
+    sta DEBUG_FREE_HI                       // Store approximate free cycles, high byte.
+
+    lda DEBUG_FREE_HI                       // Compare new free-cycle high byte with the rolling minimum.
+    cmp DEBUG_MIN_HI                        // Set flags from FREE_HI - MIN_HI.
+    bcc !newMinimum+                        // A smaller high byte is definitely a new minimum.
+    bne !done+                              // A larger high byte cannot be a new minimum.
+    lda DEBUG_FREE_LO                       // High bytes match, so compare low bytes.
+    cmp DEBUG_MIN_LO                        // Set flags from FREE_LO - MIN_LO.
+    bcs !done+                              // Equal or larger means the existing minimum is still lower.
+
+!newMinimum:
+    lda DEBUG_FREE_LO                       // Load the new minimum low byte.
+    sta DEBUG_MIN_LO                        // Store it as the rolling worst-case free budget.
+    lda DEBUG_FREE_HI                       // Load the new minimum high byte.
+    sta DEBUG_MIN_HI                        // Store it as the rolling worst-case free budget.
+
+!done:
+    rts                                     // Return to the main loop.
+
+// --- Routine: displayCycleMinimum ------------------------------------------
+// Convert the 16-bit rolling minimum to five decimal digits at DEBUG_SCREEN+5.
+displayCycleMinimum:
+    lda DEBUG_MIN_LO                        // Copy the rolling minimum so conversion can destructively subtract.
+    sta DEBUG_VALUE_LO                      // Working decimal value, low byte.
+    lda DEBUG_MIN_HI                        // Copy minimum high byte.
+    sta DEBUG_VALUE_HI                      // Working decimal value, high byte.
+
+    ldx #0                                  // Begin with the 10000s decimal place.
+!digitLoop:
+    ldy #0                                  // Y counts how many times this decimal divisor fits.
+!subtractLoop:
+    lda DEBUG_VALUE_HI                      // Compare the remaining value's high byte first.
+    cmp debugDivisorHi,x                    // Compare against this decimal divisor's high byte.
+    bcc !emitDigit+                         // Smaller high byte means the divisor no longer fits.
+    bne !subtract+                          // Larger high byte means the divisor definitely fits.
+    lda DEBUG_VALUE_LO                      // High bytes match, so compare the low bytes.
+    cmp debugDivisorLo,x                    // Compare remaining low byte with divisor low byte.
+    bcc !emitDigit+                         // Stop when the remaining value is smaller than the divisor.
+
+!subtract:
+    lda DEBUG_VALUE_LO                      // Load current working value low byte.
+    sec                                     // Set carry for an ordinary 16-bit subtraction.
+    sbc debugDivisorLo,x                    // Subtract divisor low byte.
+    sta DEBUG_VALUE_LO                      // Store the reduced working low byte.
+    lda DEBUG_VALUE_HI                      // Load current working value high byte.
+    sbc debugDivisorHi,x                    // Subtract divisor high byte plus any borrow.
+    sta DEBUG_VALUE_HI                      // Store the reduced working high byte.
+    iny                                     // One more divisor fitted into this decimal digit.
+    bne !subtractLoop-                      // Continue until the remaining value is below the divisor.
+
+!emitDigit:
+    tya                                     // Copy the decimal digit count into A.
+    clc                                     // Clear carry before converting the digit to a screen code.
+    adc #48                                 // Screen codes 48-57 display digits 0-9.
+    sta DEBUG_SCREEN + 5,x                  // Write this digit after the "FREE " label.
+    inx                                     // Advance to the next decimal place.
+    cpx #5                                  // Five digits cover every possible PAL-frame cycle count.
+    bne !digitLoop-                         // Convert the remaining decimal places.
+    rts                                     // Return to updateCycleDebug.
+
+debugLabel:
+    .byte 6,18,5,5,32,48,48,48,48,48       // Screen codes for "FREE 00000".
+
+debugDivisorLo:
+    .byte $10,$e8,$64,$0a,$01              // Low bytes: 10000, 1000, 100, 10, 1.
+
+debugDivisorHi:
+    .byte $27,$03,$00,$00,$00              // High bytes: 10000, 1000, 100, 10, 1.
+
 // --- Routine: swapRenderPlans ----------------------------------------------
 // Exchange BUILD_PLAN and LIVE_PLAN at the frame boundary.
 swapRenderPlans:
@@ -852,6 +1005,18 @@ RENDER_COUNT:          .fill 16, 0      // Initial hardware-sprite count per pla
 IRQ_ASSIGN_INDEX:      .byte 0
 IRQ_ASSIGN_END:        .byte 0
 IRQ_SELECTED_SLOT:     .byte $ff
+
+DEBUG_FRAME_COUNT:     .byte 0
+DEBUG_RASTER_LO:       .byte 0
+DEBUG_RASTER_HI:       .byte 0
+DEBUG_LINES_LO:        .byte 0
+DEBUG_LINES_HI:        .byte 0
+DEBUG_FREE_LO:         .byte 0
+DEBUG_FREE_HI:         .byte 0
+DEBUG_MIN_LO:          .byte $ff
+DEBUG_MIN_HI:          .byte $ff
+DEBUG_VALUE_LO:        .byte 0
+DEBUG_VALUE_HI:        .byte 0
 
 ENGINE_STATE_END:
 .if (ENGINE_STATE_END > $2400) {
