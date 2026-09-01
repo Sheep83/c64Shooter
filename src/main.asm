@@ -18,7 +18,7 @@
 .const FORMATION_COUNT = 4
 .const PATTERN_COUNT   = 4
 .const CIA1_TIMER_A_LO = $dc04
-.const WAVE_GAP        = 75                 // Frames between completed spawn formations.
+.const WAVE_GAP        = 90                 // Frames between completed spawn formations.
 .const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
 
 .const WAVE_COUNT          = 0
@@ -1026,6 +1026,9 @@ startRandomWave:
     and #%00000011                          // Bottom two bits select one of four formations.
     tay                                     // Y = formation index 0-3.
 
+    lda formationSpriteStart,y               // Read this formation's first visual-sequence entry.
+    sta WAVE_SPRITE_INDEX                    // Seed sprite/colour selection for its first member.
+
     lda formationEnemyCount,y               // Read number of enemies in this formation.
     sta WAVE_ENEMY_COUNT                    // Store target number of successful spawns.
 
@@ -1095,11 +1098,14 @@ spawnEnemy:
     lda #TYPE_ENEMY                         // This logical object behaves as an enemy.
     sta OBJECT_TYPE,x                       // Store enemy object type.
 
-    lda #enemySpriteA / 64                  // Use existing enemy sprite pointer.
+    ldy WAVE_SPRITE_INDEX                  // Y selects this formation member's visual variant.
+    lda enemySpriteSequence,y               // Read the sprite pointer chosen for this member.
     sta OBJECT_SPRITE,x                     // Store sprite bitmap index.
 
-    lda #3                                  // Use existing enemy individual colour.
+    lda enemyColourSequence,y               // Read this member's individual multicolour value.
     sta OBJECT_COLOUR,x                     // Store enemy colour.
+
+    inc WAVE_SPRITE_INDEX                   // Advance only after a successful allocation/spawn.
 
     lda WAVE_PATTERN_ID                     // Read the movement pattern selected for this wave.
     sta OBJECT_PATTERN,x                    // Retain the pattern number for gameplay/debugging.
@@ -1239,6 +1245,7 @@ WAVE_SPAWN_Y:          .byte 0
 WAVE_ADD_X_VALUE:      .byte 0
 WAVE_ADD_Y_VALUE:      .byte 0
 WAVE_PATTERN_ID:       .byte 0
+WAVE_SPRITE_INDEX:      .byte 0              // Current entry in the formation's visual sequence.
 
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
@@ -1323,52 +1330,100 @@ playerSprite:
     .byte $00            // 64th padding byte
 
 enemySpriteA:
-    .byte $00,$18,$00
-    .byte $00,$3c,$00
-    .byte $00,$7e,$00
-    .byte $01,$ff,$80
-    .byte $03,$ff,$c0
-    .byte $07,$db,$e0
-    .byte $0f,$ff,$f0
-    .byte $1f,$ff,$f8
-    .byte $3f,$ff,$fc
-    .byte $3c,$ff,$3c
-    .byte $3c,$ff,$3c
-    .byte $3f,$ff,$fc
-    .byte $1f,$ff,$f8
-    .byte $0f,$ff,$f0
-    .byte $07,$bd,$e0
-    .byte $03,$18,$c0
-    .byte $06,$18,$60
-    .byte $0c,$00,$30
-    .byte $18,$00,$18
+    .byte $00,$28,$00
+    .byte $00,$aa,$00
+    .byte $00,$be,$00
+    .byte $02,$be,$80
+    .byte $02,$7d,$80
+    .byte $0a,$7d,$a0
+    .byte $29,$69,$68
+    .byte $a5,$aa,$5a
+    .byte $96,$be,$96
+    .byte $06,$ff,$90
+    .byte $06,$eb,$90
+    .byte $06,$aa,$90
+    .byte $01,$aa,$40
+    .byte $01,$69,$40
+    .byte $00,$69,$00
+    .byte $00,$7d,$00
+    .byte $01,$41,$40
+    .byte $05,$00,$50
+    .byte $14,$00,$14
     .byte $00,$00,$00
     .byte $00,$00,$00
-    .byte $00
+    .byte $00                              // 64th padding byte
 
-    enemySpriteB:
+enemySpriteB:
+    .byte $00,$28,$00
+    .byte $00,$be,$00
+    .byte $02,$be,$80
+    .byte $0a,$7d,$a0
+    .byte $29,$69,$68
+    .byte $a5,$28,$5a
+    .byte $94,$28,$16
+    .byte $50,$be,$05
+    .byte $42,$ff,$81
+    .byte $0b,$eb,$e0
+    .byte $2b,$aa,$e8
+    .byte $26,$be,$98
+    .byte $05,$aa,$50
+    .byte $01,$69,$40
+    .byte $00,$7d,$00
+    .byte $01,$41,$40
+    .byte $05,$00,$50
+    .byte $04,$00,$10
     .byte $00,$00,$00
-    .byte $0c,$00,$30
-    .byte $06,$00,$60
-    .byte $03,$00,$c0
-    .byte $03,$81,$c0
-    .byte $07,$c3,$e0
-    .byte $0f,$e7,$f0
-    .byte $1f,$ff,$f8
-    .byte $3f,$ff,$fc
-    .byte $7f,$ff,$fe
-    .byte $7e,$7e,$7e
-    .byte $7f,$ff,$fe
-    .byte $3f,$ff,$fc
-    .byte $1f,$ff,$f8
-    .byte $0f,$ff,$f0
-    .byte $07,$e7,$e0
-    .byte $03,$c3,$c0
-    .byte $01,$81,$80
-    .byte $03,$00,$c0
-    .byte $06,$00,$60
     .byte $00,$00,$00
-    .byte $00
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
+
+enemySpriteC:
+    .byte $00,$14,$00
+    .byte $00,$69,$00
+    .byte $01,$aa,$40
+    .byte $06,$be,$90
+    .byte $1a,$ff,$a4
+    .byte $6b,$eb,$e9
+    .byte $6f,$aa,$f9
+    .byte $6e,$96,$b9
+    .byte $6a,$55,$a9
+    .byte $7a,$69,$ad
+    .byte $7e,$aa,$bd
+    .byte $6f,$aa,$f9
+    .byte $1b,$eb,$e4
+    .byte $06,$ff,$90
+    .byte $01,$be,$40
+    .byte $01,$69,$40
+    .byte $05,$28,$50
+    .byte $14,$00,$14
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
+
+enemySpriteD:
+    .byte $00,$3c,$00
+    .byte $00,$eb,$00
+    .byte $01,$eb,$40
+    .byte $05,$eb,$50
+    .byte $14,$eb,$14
+    .byte $50,$eb,$05
+    .byte $41,$be,$41
+    .byte $06,$be,$90
+    .byte $1a,$ff,$a4
+    .byte $6b,$eb,$e9
+    .byte $1b,$aa,$e4
+    .byte $06,$be,$90
+    .byte $01,$aa,$40
+    .byte $01,$69,$40
+    .byte $05,$3c,$50
+    .byte $14,$3c,$14
+    .byte $50,$14,$05
+    .byte $40,$00,$01
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
 
 // --- Spawn formations -------------------------------------------------------
 // Formation data is stored as parallel tables indexed 0-3.  Movement is not
@@ -1379,7 +1434,7 @@ enemySpriteA:
 // 2: simultaneous horizontal line.
 // 3: descending diagonal stream moving left between successive spawns.
 formationEnemyCount:
-    .byte 8, 6, 7, 8
+    .byte 8, 6, 7, 5
 formationInterval:
     .byte 50, 24, 0, 18
 formationStartX:
@@ -1390,6 +1445,37 @@ formationAddX:
     .byte 0, 14, 28, $f8                   // $f8 = -8 for formation 3.
 formationAddY:
     .byte 0, 5, 0, 4
+
+// --- Formation visual sequences --------------------------------------------
+// Each formation has eight visual entries. Shorter formations simply consume
+// the prefix they need. Sprite shape and individual colour are independent of
+// movement pattern, so the same attack geometry can still look varied.
+formationSpriteStart:
+    .byte 0, 8, 16, 24
+
+enemySpriteSequence:
+    // Formation 0: alternating spear/scout with heavier ships in the middle.
+    .byte enemySpriteA/64, enemySpriteB/64, enemySpriteA/64, enemySpriteC/64
+    .byte enemySpriteC/64, enemySpriteA/64, enemySpriteB/64, enemySpriteA/64
+
+    // Formation 1: four visibly different ships cycling through the stagger.
+    .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
+    .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
+
+    // Formation 2: symmetric-looking instant line.
+    .byte enemySpriteD/64, enemySpriteC/64, enemySpriteB/64, enemySpriteA/64
+    .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
+
+    // Formation 3: heavier-looking descending group.
+    .byte enemySpriteC/64, enemySpriteD/64, enemySpriteC/64, enemySpriteB/64
+    .byte enemySpriteD/64, enemySpriteC/64, enemySpriteB/64, enemySpriteA/64
+
+enemyColourSequence:
+    // Individual VIC colour for each matching sprite-sequence entry.
+    .byte 2, 6, 10, 7, 7, 10, 6, 2
+    .byte 6, 13, 7, 10, 6, 13, 7, 10
+    .byte 14, 13, 7, 2, 7, 13, 14, 2
+    .byte 7, 14, 7, 10, 14, 7, 10, 2
 
 // --- Movement pattern offsets ----------------------------------------------
 // Each object stores a byte offset into enemyPatterns as OBJECT_PATH_STEP.
@@ -1435,4 +1521,3 @@ patternSweep:
     .byte 28,  1,  1                       // Cross back down-right.
     .byte 28,  1,  2                       // Steepen the rightward dive.
     .byte $ff,$ff, 2                       // Continue final steep down-left vector until off-screen.
-
