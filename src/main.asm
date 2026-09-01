@@ -52,8 +52,8 @@ init:
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
 
-    lda #1                                  // Load A from #1.
-    sta MOB_X_VEL                           // Enemy horizontal speed
+    //lda #1                                  // Load A from #1.
+    //sta MOB_X_VEL                           // Enemy horizontal speed
 
     lda #1                                  // Load A from #1.
     sta OBJECT_ACTIVE                       // Object 0 = player
@@ -74,8 +74,13 @@ init:
     sta OBJECT_SPRITE,x                     // Store A in OBJECT_SPRITE,x.
     lda #3                                  // Load A from #3.
     sta OBJECT_COLOUR,x                     // Store A in OBJECT_COLOUR,x.
+    lda #0
+    sta OBJECT_PATTERN,x
+    sta OBJECT_PATH_STEP,x
+    sta OBJECT_PATH_TIMER,x
     inx                                     // Increment X by one.
     cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
+    //cpx #02
     bne !enemyInit-                         // Branch to !enemyInit- if the previous result was non-zero/not equal.
 
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
@@ -109,7 +114,7 @@ mainLoop:
 // --- Routine: setupSprites --------------------------------------------------
 // Enable VIC sprites and seed logical object positions.
 setupSprites:
-    lda #$ff                                // Load A from #$ff.
+    lda #$0                              // Load A from #$ff.
     sta SPRITE_ENABLE                       // Enable all 8 hardware sprites
     lda #%11111111
     sta SPRITE_MODE                         // $D01C: all hardware sprites use multicolour mode
@@ -126,6 +131,7 @@ setupSprites:
     sta OBJECT_X_MSB                        // Store A in OBJECT_X_MSB.
 
     lda #31                                 // Load A from #31.
+    //lda #255
     ldx #1                                  // Load X from #1.
 !xLoop:
     sta OBJECT_X,x                          // Store A in OBJECT_X,x.
@@ -163,8 +169,8 @@ updateObjects:
 !enemy:
     cmp #TYPE_ENEMY                         // Compare A with #TYPE_ENEMY; set flags, leaving A unchanged.
     bne !next+                              // Branch to !next+ if the previous result was non-zero/not equal.
-    jsr moveEnemy                           // Call moveEnemy; return here when it executes RTS.
-
+    //jsr moveEnemy                           // Call moveEnemy; return here when it executes RTS.
+    jsr moveEnemyPath
 !next:
     inx                                     // Increment X by one.
     cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
@@ -231,53 +237,64 @@ updatePlayer:
 !done:
     rts                                     // Return to the calling routine.
 
-// --- Routine: moveEnemy -----------------------------------------------------
-// Move one enemy horizontally, handling the ninth X bit and edge reversal.
-moveEnemy:
-    lda OBJECT_DIR,x                        // Load A from OBJECT_DIR,x.
-    beq !right+                             // Branch to !right+ if the previous result was zero/equal.
+// --- Routine: moveEnemyPath -------------------------------------------------
+// Advance one enemy through its table-driven movement pattern.
+// Entry: X = logical object index.
+moveEnemyPath:
+    lda OBJECT_PATH_TIMER,x                // Load frames remaining in the current path segment.
+    bne !move+                             // If non-zero, continue the current segment.
 
-    sec                                     // Set carry before subtraction or a carry-dependent operation.
-    lda OBJECT_X,x                          // Load A from OBJECT_X,x.
-    sbc MOB_X_VEL                           // Subtract MOB_X_VEL from A using carry as the inverted borrow.
-    sta OBJECT_X,x                          // Store A in OBJECT_X,x.
-    cmp #255                                // Compare A with #255; set flags, leaving A unchanged.
-    bne !leftEdge+                          // Branch to !leftEdge+ if the previous result was non-zero/not equal.
-    lda #0                                  // Load A from #0.
-    sta OBJECT_X_MSB,x                      // 256 -> 255
+    ldy OBJECT_PATH_STEP,x                 // Y = byte offset of the current path segment.
+    lda enemyPatternTest,y                 // Read this segment's duration.
+    beq !finished+                         // Duration zero marks the end of the path.
 
-!leftEdge:
-    lda OBJECT_X,x                          // Load A from OBJECT_X,x.
-    cmp #23                                 // Compare A with #23; set flags, leaving A unchanged.
-    bne !done+                              // Branch to !done+ if the previous result was non-zero/not equal.
-    lda OBJECT_X_MSB,x                      // Load A from OBJECT_X_MSB,x.
-    bne !done+                              // Branch to !done+ if the previous result was non-zero/not equal.
-    lda OBJECT_DIR,x                        // Load A from OBJECT_DIR,x.
-    eor #1                                  // XOR A with #1.
-    sta OBJECT_DIR,x                        // Reverse at left edge
+    sta OBJECT_PATH_TIMER,x                // Start this segment's frame countdown.
+
+!move:
+    ldy OBJECT_PATH_STEP,x                 // Y = byte offset of the current path segment.
+
+    lda enemyPatternTest+1,y               // Read signed horizontal delta for this frame.
+    beq !moveY+                            // Zero means no horizontal movement.
+    bmi !moveXLeft+                        // Bit 7 set means a negative horizontal delta.
+
+!moveXRight:
+    clc                                    // Clear carry before adding the positive X delta.
+    adc OBJECT_X,x                         // Add delta to the low byte of the 9-bit X coordinate.
+    sta OBJECT_X,x                         // Store the new low byte.
+    bcc !moveY+                            // No carry means we stayed within this 256-pixel half.
+    inc OBJECT_X_MSB,x                     // Carry means low byte crossed $ff -> $00.
+    jmp !moveY+                            // Continue with vertical movement.
+
+!moveXLeft:
+    clc                                    // Clear carry before adding the two's-complement delta.
+    adc OBJECT_X,x                         // Add negative delta to the low byte.
+    sta OBJECT_X,x                         // Store the new low byte.
+    bcs !moveY+                            // Carry set means no borrow across the 256-pixel boundary.
+    dec OBJECT_X_MSB,x                     // No carry means low byte crossed $00 -> $ff.
+
+!moveY:
+    lda enemyPatternTest+2,y               // Read signed vertical delta for this frame.
+    beq !tick+                             // Zero means no vertical movement.
+    clc                                    // Clear carry before adding the signed delta.
+    adc OBJECT_Y,x                         // Two's-complement addition handles positive and negative Y.
+    sta OBJECT_Y,x                         // Store the new vertical position.
+
+!tick:
+    dec OBJECT_PATH_TIMER,x                // Consume one frame from the current path segment.
+    bne !done+                             // If frames remain, stay on this segment.
+
+    lda OBJECT_PATH_STEP,x                 // Load current byte offset in the path table.
+    clc                                    // Clear carry before adding the segment size.
+    adc #3                                 // Advance past duration, dx and dy.
+    sta OBJECT_PATH_STEP,x                 // Save offset of the next segment.
+
 !done:
-    rts                                     // Return to the calling routine.
+    rts                                    // Current enemy update is complete.
 
-!right:
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    lda OBJECT_X,x                          // Load A from OBJECT_X,x.
-    adc MOB_X_VEL                           // Add MOB_X_VEL to A, including carry.
-    sta OBJECT_X,x                          // Store A in OBJECT_X,x.
-    cmp #0                                  // Compare A with #0; set flags, leaving A unchanged.
-    bne !rightEdge+                         // Branch to !rightEdge+ if the previous result was non-zero/not equal.
-    lda #1                                  // Load A from #1.
-    sta OBJECT_X_MSB,x                      // 255 -> 256
-
-!rightEdge:
-    lda OBJECT_X,x                          // Load A from OBJECT_X,x.
-    cmp #66                                 // Compare A with #66; set flags, leaving A unchanged.
-    bne !done-                              // Branch to !done- if the previous result was non-zero/not equal.
-    lda OBJECT_X_MSB,x                      // Load A from OBJECT_X_MSB,x.
-    beq !done-                              // Branch to !done- if the previous result was zero/equal.
-    lda OBJECT_DIR,x                        // Load A from OBJECT_DIR,x.
-    eor #1                                  // XOR A with #1.
-    sta OBJECT_DIR,x                        // Reverse at right edge
-    rts                                     // Return to the calling routine.
+!finished:
+    lda #0                                 // Zero represents inactive.
+    sta OBJECT_ACTIVE,x                    // Return this logical object to the free pool.
+    rts
 
 // --- Routine: buildSortedObjectList ----------------------------------------
 // Collect active logical object numbers into SORTED_OBJECTS.
@@ -744,15 +761,16 @@ swapRenderPlans:
     rts                                     // Return to the calling routine.
 
 // --- Routine: waitForFrameStart --------------------------------------------
-// Return during raster 0-19 of the next frame.
+// Wait for the next PAL frame boundary, returning shortly after raster 0.
 waitForFrameStart:
-!wait:
-    lda VIC_CONTROL_1                       // Load A from VIC_CONTROL_1.
-    bmi !wait-                              // Still in raster 256-311
-    lda RASTER                              // Load A from RASTER.
-    cmp #20                                 // Compare A with #20; set flags, leaving A unchanged.
-    bcs !wait-                              // Branch to !wait- if carry is set.
-    rts                                     // Return to the calling routine.
+!waitHigh:
+    lda VIC_CONTROL_1                       // Read current raster high bit from $D011.
+    bpl !waitHigh-                          // Wait until raster reaches 256-311.
+
+!waitLow:
+    lda VIC_CONTROL_1                       // Read current raster high bit again.
+    bmi !waitLow-                           // Wait until raster wraps from 311 back to 0-255.
+    rts                                     // New frame has begun; return shortly after raster 0.
 
 // --- Routine: renderSprites -------------------------------------------------
 // Write LIVE_PLAN's initial hardware-sprite snapshot to VIC-II.
@@ -761,11 +779,15 @@ renderSprites:
     sta TEMP_MSB                            // Store A in TEMP_MSB.
 
     ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda RENDER_COUNT,y                      // Load A from RENDER_COUNT,y.
-    beq !none+                              // Branch to !none+ if the previous result was zero/equal.
-    sta TEMP_OBJECT                         // Cache live sprite count
+    lda RENDER_COUNT,y                      // Load the number of initial hardware sprites used by LIVE_PLAN.
+    tax                                     // Copy the count into X for the enable-mask lookup.
+    lda SPRITE_ENABLE_MASK,x                // Load a mask with the first X hardware sprite bits set.
+    sta SPRITE_ENABLE                       // Disable any stale hardware sprites left from the previous frame.
+    txa                                     // Restore the live sprite count to A.
+    beq !none+                              // If zero sprites are live, there is nothing else to render.
+    sta TEMP_OBJECT                         // Cache the live sprite count for the render loop.
 
-    ldx #0                                  // Load X from #0.
+    ldx #0                                  // Start rendering into hardware sprite slot 0.
 !renderLoop:
     txa                                     // Copy X into A.
     clc                                     // Clear carry before an addition or shift-dependent operation.
@@ -815,9 +837,15 @@ armFirstBatch:
     and #%11111110                          // AND A with #%11111110.
     sta IRQ_ENABLE                          // Disable raster IRQ while arming
 
-    ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda BATCH_COUNT,y                       // Load A from BATCH_COUNT,y.
-    beq !done+                              // Branch to !done+ if the previous result was zero/equal.
+    ldy LIVE_PLAN
+    lda BATCH_COUNT,y
+    bne !hasBatch+
+
+    lda #%00000001                          // Select raster interrupt latch.
+    sta IRQ_STATUS                          // Clear any stale raster condition.
+    jmp !done+
+
+!hasBatch:
 
     lda #0                                  // Load A from #0.
     sta BATCH_INDEX                         // Store A in BATCH_INDEX.
@@ -847,10 +875,16 @@ armFirstBatch:
 // --- Routine: multiplexIRQ --------------------------------------------------
 // Apply one prepared LIVE_PLAN batch and chain to the next raster batch.
 multiplexIRQ:
-    lda IRQ_STATUS                          // Load A from IRQ_STATUS.
-    and #%00000001                          // AND A with #%00000001.
-    bne !raster+                            // Branch to !raster+ if the previous result was non-zero/not equal.
-    jmp $ea31                               // Not our VIC raster IRQ
+    lda IRQ_ENABLE                          // Check whether raster IRQ generation is currently enabled.
+    and #%00000001                          // Isolate the VIC raster IRQ enable bit.
+    beq !notRaster+                         // If disabled, this must be some other IRQ source.
+
+    lda IRQ_STATUS                          // Read VIC interrupt status.
+    and #%00000001                          // Isolate the raster interrupt flag.
+    bne !raster+                            // Enabled + pending means this is one of our raster IRQs.
+
+!notRaster:
+    jmp $ea31                               // Let the normal KERNAL IRQ handler deal with it.
 
 !raster:
     lda BATCH_INDEX                         // Load A from BATCH_INDEX.
@@ -920,12 +954,16 @@ multiplexIRQ:
     jmp $ea31                               // Jump unconditionally to $ea31.
 
 !allDone:
-    lda IRQ_ENABLE                          // Load A from IRQ_ENABLE.
-    and #%11111110                          // AND A with #%11111110.
-    sta IRQ_ENABLE                          // No more batches this frame
-    lda #0                                  // Load A from #0.
-    sta BATCH_INDEX                         // Store A in BATCH_INDEX.
-    jmp $ea31                               // Jump unconditionally to $ea31.
+    lda IRQ_ENABLE                          // Load the VIC interrupt-enable register.
+    and #%11111110                          // Clear raster interrupt enable bit.
+    sta IRQ_ENABLE                          // Disable further raster IRQ generation.
+
+    lda #%00000001                          // Select the VIC raster interrupt latch.
+    sta IRQ_STATUS                          // Clear any pending/stale raster condition.
+
+    lda #0                                  // Reset batch position for the next frame.
+    sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
+    jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
 
 // --- Sprite pointer lookup --------------------------------------------------
 spritePointers:
@@ -956,6 +994,10 @@ HW_CLEAR_MASK:
     .byte %11111110,%11111101,%11111011,%11110111
     .byte %11101111,%11011111,%10111111,%01111111
 
+SPRITE_ENABLE_MASK:
+    .byte %00000000,%00000001,%00000011,%00000111,%00001111
+    .byte %00011111,%00111111,%01111111,%11111111
+
 LOOKUP_TABLES_END:
 .if (LOOKUP_TABLES_END > $2000) {
     .error "Lookup tables overlap engine runtime state"
@@ -966,7 +1008,7 @@ LOOKUP_TABLES_END:
 OBJECT_X:              .fill MAX_OBJECTS, 0
 OBJECT_Y:              .fill MAX_OBJECTS, 0
 OBJECT_X_MSB:          .fill MAX_OBJECTS, 0
-OBJECT_DIR:            .fill MAX_OBJECTS, 0
+//OBJECT_DIR:            .fill MAX_OBJECTS, 0
 OBJECT_ACTIVE:         .fill MAX_OBJECTS, 0
 OBJECT_TYPE:           .fill MAX_OBJECTS, 0
 HW_SPRITE_OFFSET:      .byte 0,2,4,6,8,10,12,14
@@ -974,6 +1016,10 @@ OBJECT_SPRITE:         .fill MAX_OBJECTS, 0
 OBJECT_COLOUR:         .fill MAX_OBJECTS, 0
 SORTED_OBJECTS:        .fill MAX_OBJECTS, $ff
 SORTED_COUNT:          .byte 0
+
+OBJECT_PATTERN:        .fill MAX_OBJECTS, 0
+OBJECT_PATH_STEP:      .fill MAX_OBJECTS, 0
+OBJECT_PATH_TIMER:     .fill MAX_OBJECTS, 0
 
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
@@ -1104,3 +1150,11 @@ enemySpriteA:
     .byte $06,$00,$60
     .byte $00,$00,$00
     .byte $00
+
+    // duration, delta X, delta Y
+enemyPatternTest:
+    .byte 40,  1,  1
+    .byte 40,  0,  1
+    .byte 40, $ff, 1
+    .byte 40,  0,  1
+    .byte 0
