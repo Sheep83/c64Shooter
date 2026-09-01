@@ -10,6 +10,23 @@
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
+.const PATTERN_DIVE_LEFT  = 0
+.const PATTERN_DIVE_RIGHT = 1
+.const PATTERN_ZIGZAG     = 2
+.const PATTERN_SWEEP      = 3
+
+.const FORMATION_COUNT = 4
+.const PATTERN_COUNT   = 4
+.const CIA1_TIMER_A_LO = $dc04
+.const WAVE_GAP        = 75                 // Frames between completed spawn formations.
+.const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
+
+.const WAVE_COUNT          = 0
+.const WAVE_INTERVAL       = 1
+.const WAVE_START_X        = 2
+.const WAVE_START_Y        = 3
+.const WAVE_ADD_X          = 4
+.const WAVE_ADD_Y          = 5
 
 // ============================================================================
 // ENGINE SHAPE
@@ -51,6 +68,7 @@ init:
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
+    jsr startRandomWave                      // Choose the first formation/pattern combination.
 
     //lda #1                                  // Load A from #1.
     //sta MOB_X_VEL                           // Enemy horizontal speed
@@ -65,23 +83,23 @@ init:
     sta OBJECT_COLOUR                       // Store A in OBJECT_COLOUR.
 
     ldx #1                                  // Load X from #1.
-!enemyInit:
-    lda #1                                  // Load A from #1.
-    sta OBJECT_ACTIVE,x                     // Store A in OBJECT_ACTIVE,x.
-    lda #TYPE_ENEMY                         // Load A from #TYPE_ENEMY.
-    sta OBJECT_TYPE,x                       // Store A in OBJECT_TYPE,x.
-    lda spritePointers,x                    // Load A from spritePointers,x.
-    sta OBJECT_SPRITE,x                     // Store A in OBJECT_SPRITE,x.
-    lda #3                                  // Load A from #3.
-    sta OBJECT_COLOUR,x                     // Store A in OBJECT_COLOUR,x.
-    lda #0
-    sta OBJECT_PATTERN,x
-    sta OBJECT_PATH_STEP,x
-    sta OBJECT_PATH_TIMER,x
-    inx                                     // Increment X by one.
-    cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
-    //cpx #02
-    bne !enemyInit-                         // Branch to !enemyInit- if the previous result was non-zero/not equal.
+//!enemyInit:
+    //lda #1                                  // Load A from #1.
+    //sta OBJECT_ACTIVE,x                     // Store A in OBJECT_ACTIVE,x.
+    //lda #TYPE_ENEMY                         // Load A from #TYPE_ENEMY.
+    //sta OBJECT_TYPE,x                       // Store A in OBJECT_TYPE,x.
+    //lda spritePointers,x                    // Load A from spritePointers,x.
+    //sta OBJECT_SPRITE,x                     // Store A in OBJECT_SPRITE,x.
+    //lda #3                                  // Load A from #3.
+    //sta OBJECT_COLOUR,x                     // Store A in OBJECT_COLOUR,x.
+    //lda #0
+    //sta OBJECT_PATTERN,x
+    //sta OBJECT_PATH_STEP,x
+    //sta OBJECT_PATH_TIMER,x
+    //inx                                     // Increment X by one.
+    //cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
+    ////cpx #02
+    //bne !enemyInit-                         // Branch to !enemyInit- if the previous result was non-zero/not equal.
 
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
@@ -99,6 +117,7 @@ mainLoop:
 
 !frameLoop:
     jsr updateObjects                       // Call updateObjects; return here when it executes RTS.
+    jsr updateSpawner                       // Periodically create a new enemy.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
@@ -241,70 +260,91 @@ updatePlayer:
 // Advance one enemy through its table-driven movement pattern.
 // Entry: X = logical object index.
 moveEnemyPath:
-    lda OBJECT_PATH_TIMER,x                // Load frames remaining in the current path segment.
-    bne !move+                             // If non-zero, continue the current segment.
+    lda OBJECT_PATH_TIMER,x                 // Load frames remaining in the current path segment.
+    bne !move+                              // If non-zero, continue the current segment.
 
-    ldy OBJECT_PATH_STEP,x                 // Y = byte offset of the current path segment.
-    lda enemyPatternTest,y                 // Read this segment's duration.
-    beq !finished+                         // Duration zero marks the end of the path.
-
-    sta OBJECT_PATH_TIMER,x                // Start this segment's frame countdown.
+    ldy OBJECT_PATH_STEP,x                  // Y = byte offset of the current path segment.
+    lda enemyPatterns,y                     // Read this segment's duration from the selected pattern.
+    bne !loadSegment+                       // Non-zero means this is a valid movement segment.
+    jmp !finished+                          // Duration zero explicitly ends and deactivates this object.
+!loadSegment:
+    sta OBJECT_PATH_TIMER,x                 // $ff means this segment continues indefinitely.
 
 !move:
-    ldy OBJECT_PATH_STEP,x                 // Y = byte offset of the current path segment.
+    ldy OBJECT_PATH_STEP,x                  // Y = byte offset of the current path segment.
 
-    lda enemyPatternTest+1,y               // Read signed horizontal delta for this frame.
-    beq !moveY+                            // Zero means no horizontal movement.
-    bmi !moveXLeft+                        // Bit 7 set means a negative horizontal delta.
+    lda enemyPatterns+1,y                   // Read signed horizontal delta for this frame.
+    beq !moveY+                             // Zero means no horizontal movement.
+    bmi !moveXLeft+                         // Bit 7 set means a negative horizontal delta.
 
 !moveXRight:
-    clc                                    // Clear carry before adding the positive X delta.
-    adc OBJECT_X,x                         // Add delta to the low byte of the 9-bit X coordinate.
-    sta OBJECT_X,x                         // Store the new low byte.
-    bcc !moveY+                            // No carry means we stayed within this 256-pixel half.
-    inc OBJECT_X_MSB,x                     // Carry means low byte crossed $ff -> $00.
-    jmp !moveY+                            // Continue with vertical movement.
+    clc                                     // Clear carry before adding the positive X delta.
+    adc OBJECT_X,x                          // Add delta to the low byte of the 9-bit X coordinate.
+    sta OBJECT_X,x                          // Store the new low byte.
+    bcc !checkRightEdge+                    // No carry means the ninth X bit is unchanged.
+    inc OBJECT_X_MSB,x                      // Carry means low byte crossed $ff -> $00.
+
+!checkRightEdge:
+    lda OBJECT_X_MSB,x                      // Inspect the ninth X-coordinate bit/state.
+    cmp #2                                  // Values 2+ are beyond the valid 9-bit display region.
+    bcc !rightHighValid+                    // Values below two can still represent a visible X position.
+    jmp !finished+                          // Deactivate rather than allowing X to wrap around.
+!rightHighValid:
+    cmp #1                                  // High byte zero means the object is still left of X=256.
+    bne !moveY+                             // Only high byte one can have crossed the right exit point.
+    lda OBJECT_X,x                          // Read low byte of the 9-bit X position.
+    cmp #ENEMY_EXIT_RIGHT_LO                // X >= $0158 (344) is beyond the right-hand edge.
+    bcc !moveY+                             // Values below the exit point are still on-screen.
+    jmp !finished+                          // Return the object slot once it has naturally exited.
 
 !moveXLeft:
-    clc                                    // Clear carry before adding the two's-complement delta.
-    adc OBJECT_X,x                         // Add negative delta to the low byte.
-    sta OBJECT_X,x                         // Store the new low byte.
-    bcs !moveY+                            // Carry set means no borrow across the 256-pixel boundary.
-    dec OBJECT_X_MSB,x                     // No carry means low byte crossed $00 -> $ff.
+    clc                                     // Clear carry before adding the two's-complement delta.
+    adc OBJECT_X,x                          // Add negative delta to the low byte.
+    sta OBJECT_X,x                          // Store the new low byte.
+    bcs !moveY+                             // Carry set means no borrow across the 256-pixel boundary.
+    lda OBJECT_X_MSB,x                      // A borrow while high byte zero means we crossed left of X=0.
+    bne !leftHighValid+                     // High byte one can legitimately borrow back into the lower half.
+    jmp !finished+                          // Deactivate instead of wrapping from X=0 to X=511.
+!leftHighValid:
+    dec OBJECT_X_MSB,x                     // Move normally from the upper X half into the lower half.
 
 !moveY:
-    lda enemyPatternTest+2,y               // Read signed vertical delta for this frame.
-    beq !tick+                             // Zero means no vertical movement.
-    bmi !moveYUp+                          // Negative delta means movement towards the top.
+    lda enemyPatterns+2,y                   // Read signed vertical delta for this frame.
+    beq !tick+                              // Zero means no vertical movement.
+    bmi !moveYUp+                           // Negative delta means movement towards the top.
 
 !moveYDown:
-    clc                                    // Clear carry before adding the positive Y delta.
-    adc OBJECT_Y,x                         // Add the downward movement to the current Y position.
-    bcs !finished+                         // Carry means Y crossed $ff; deactivate instead of wrapping to $00.
-    sta OBJECT_Y,x                         // Store the valid new Y position.
-    jmp !tick+                             // Continue the path timer update.
+    clc                                     // Clear carry before adding the positive Y delta.
+    adc OBJECT_Y,x                          // Add the downward movement to the current Y position.
+    bcs !finished+                          // Carry means Y crossed $ff; deactivate instead of wrapping to $00.
+    sta OBJECT_Y,x                          // Store the valid new Y position.
+    jmp !tick+                              // Continue the path timer update.
 
 !moveYUp:
-    clc                                    // Clear carry before adding the negative two's-complement delta.
-    adc OBJECT_Y,x                         // Add the upward movement to the current Y position.
-    bcc !finished+                         // No carry means Y crossed below $00; deactivate instead of wrapping to $ff.
-    sta OBJECT_Y,x                         // Store the valid new Y position.
+    clc                                     // Clear carry before adding the negative two's-complement delta.
+    adc OBJECT_Y,x                          // Add the upward movement to the current Y position.
+    bcc !finished+                          // No carry means Y crossed below $00; deactivate instead of wrapping to $ff.
+    sta OBJECT_Y,x                          // Store the valid new Y position.
 
 !tick:
-    dec OBJECT_PATH_TIMER,x                // Consume one frame from the current path segment.
-    bne !done+                             // If frames remain, stay on this segment.
+    lda OBJECT_PATH_TIMER,x                 // Read the active segment duration marker.
+    cmp #$ff                                // $ff means retain this final vector indefinitely.
+    beq !done+                              // Lifecycle bounds, not path duration, will remove the enemy.
 
-    lda OBJECT_PATH_STEP,x                 // Load current byte offset in the path table.
-    clc                                    // Clear carry before adding the segment size.
-    adc #3                                 // Advance past duration, dx and dy.
-    sta OBJECT_PATH_STEP,x                 // Save offset of the next segment.
+    dec OBJECT_PATH_TIMER,x                 // Consume one frame from a finite path segment.
+    bne !done+                              // If frames remain, stay on this segment.
+
+    lda OBJECT_PATH_STEP,x                  // Load current byte offset in the path table.
+    clc                                     // Clear carry before adding the segment size.
+    adc #3                                  // Advance past duration, dx and dy.
+    sta OBJECT_PATH_STEP,x                  // Save offset of the next segment.
 
 !done:
-    rts                                    // Current enemy update is complete.
+    rts                                     // Current enemy update is complete.
 
 !finished:
-    lda #0                                 // Zero represents inactive.
-    sta OBJECT_ACTIVE,x                    // Return this logical object to the free pool.
+    lda #0                                  // Zero represents inactive.
+    sta OBJECT_ACTIVE,x                     // Return this logical object to the free pool.
     rts
 
 // --- Routine: buildSortedObjectList ----------------------------------------
@@ -976,6 +1016,163 @@ multiplexIRQ:
     sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
     jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
 
+// --- Routine: startRandomWave ------------------------------------------------
+// Choose one spawn formation and one movement pattern independently.
+// CIA1 timer bits provide a lightweight changing seed; gameplay does not need
+// deterministic cryptographic-quality randomness here.
+startRandomWave:
+    lda CIA1_TIMER_A_LO                     // Sample the continuously changing CIA timer.
+    pha                                     // Preserve the sample while loading formation state.
+    and #%00000011                          // Bottom two bits select one of four formations.
+    tay                                     // Y = formation index 0-3.
+
+    lda formationEnemyCount,y               // Read number of enemies in this formation.
+    sta WAVE_ENEMY_COUNT                    // Store target number of successful spawns.
+
+    lda formationInterval,y                 // Read frames between formation members.
+    sta WAVE_SPAWN_INTERVAL                 // Preserve interval for each timer reload.
+
+    lda formationStartX,y                   // Read first enemy's starting X coordinate.
+    sta WAVE_SPAWN_X                        // Seed cumulative horizontal spawn position.
+
+    lda formationStartY,y                   // Read first enemy's starting Y coordinate.
+    sta WAVE_SPAWN_Y                        // Seed cumulative vertical spawn position.
+
+    lda formationAddX,y                     // Read horizontal offset between successive members.
+    sta WAVE_ADD_X_VALUE                    // Preserve horizontal formation offset.
+
+    lda formationAddY,y                     // Read vertical offset between successive members.
+    sta WAVE_ADD_Y_VALUE                    // Preserve vertical formation offset.
+
+    pla                                     // Recover the original timer sample.
+    lsr                                     // Move a different pair of timer bits down.
+    lsr                                     // Bits 2-3 now occupy bits 0-1.
+    and #%00000011                          // Select one of four movement patterns independently.
+    sta WAVE_PATTERN_ID                     // Save pattern number for each spawned object.
+
+    lda #0                                  // A new wave has not spawned any members yet.
+    sta WAVE_SPAWNED                        // Reset successful member count.
+    sta SPAWN_TIMER                         // Zero makes the first member spawn immediately.
+    rts
+
+// --- Routine: findFreeObject ------------------------------------------------
+// Find the first inactive logical object slot.
+// Returns: X = free object index, carry clear.
+//          Carry set if no free slot exists.
+findFreeObject:
+    ldx #1                                  // Object 0 is permanently reserved for the player.
+
+!scan:
+    lda OBJECT_ACTIVE,x                     // Check whether this logical object is currently in use.
+    beq !found+                             // Zero means this slot is free.
+
+    inx                                     // Try the next logical object.
+    cpx #MAX_OBJECTS                        // Have we reached the end of the object pool?
+    bne !scan-                              // No: continue scanning.
+
+    sec                                     // Carry set means allocation failed.
+    rts                                     // No free logical object slots remain.
+
+!found:
+    clc                                     // Carry clear means X contains a valid free slot.
+    rts
+
+// --- Routine: spawnEnemy ----------------------------------------------------
+// Allocate and initialise one enemy from the current wave state.
+// Returns: carry clear if spawned, carry set if the object pool was full.
+spawnEnemy:
+    jsr findFreeObject                      // Find an unused logical object slot.
+    bcs !failed+                            // Abort if all logical object slots are occupied.
+
+    lda WAVE_SPAWN_X                        // Read this wave member's current X position.
+    sta OBJECT_X,x                          // Store low byte of enemy X position.
+    lda #0                                  // Current wave format uses the low 256-pixel X region.
+    sta OBJECT_X_MSB,x                      // Clear ninth X-coordinate bit.
+
+    lda WAVE_SPAWN_Y                        // Read this wave member's current Y position.
+    sta OBJECT_Y,x                          // Store initial enemy Y position.
+
+    lda #TYPE_ENEMY                         // This logical object behaves as an enemy.
+    sta OBJECT_TYPE,x                       // Store enemy object type.
+
+    lda #enemySpriteA / 64                  // Use existing enemy sprite pointer.
+    sta OBJECT_SPRITE,x                     // Store sprite bitmap index.
+
+    lda #3                                  // Use existing enemy individual colour.
+    sta OBJECT_COLOUR,x                     // Store enemy colour.
+
+    lda WAVE_PATTERN_ID                     // Read the movement pattern selected for this wave.
+    sta OBJECT_PATTERN,x                    // Retain the pattern number for gameplay/debugging.
+    tay                                     // Y = pattern number while X remains the allocated object slot.
+    lda patternStartOffset,y                // Convert pattern number to its master-table byte offset.
+    sta OBJECT_PATH_STEP,x                  // Begin this object at the selected pattern's first segment.
+    lda #0                                  // Zero forces the first segment duration to load next update.
+    sta OBJECT_PATH_TIMER,x                 // Reset movement path timer.
+
+    lda #1                                  // Mark object active only after every field is initialised.
+    sta OBJECT_ACTIVE,x                     // Object now participates in update/render processing.
+
+    clc                                     // Signal successful spawn.
+    rts
+
+!failed:
+    sec                                     // Preserve allocation-failed result.
+    rts
+
+// --- Routine: updateSpawner -------------------------------------------------
+// Spawn the current formation, then leave a short gap before choosing another.
+updateSpawner:
+    lda WAVE_SPAWNED                        // Read how many members of this formation have spawned.
+    cmp WAVE_ENEMY_COUNT                    // Compare against the current formation's requested count.
+    bcc !waveActive+                        // Carry clear means this formation still has members to spawn.
+
+    lda WAVE_GAP_TIMER                      // Formation is complete: read inter-formation delay.
+    beq !startNext+                         // Zero means the director may choose another attack now.
+    dec WAVE_GAP_TIMER                      // Consume one frame of breathing room between formations.
+    bne !done+                              // Keep waiting while any gap remains.
+
+!startNext:
+    jsr startRandomWave                     // Choose a fresh formation + movement pattern combination.
+
+!waveActive:
+    lda SPAWN_TIMER                         // Read frames remaining until the next formation member.
+    beq !spawn+                             // Zero means this member is ready to spawn.
+
+    dec SPAWN_TIMER                         // Consume one frame of the inter-enemy delay.
+    bne !done+                              // Non-zero means the delay is still running.
+
+!spawn:
+    jsr spawnEnemy                          // Try to allocate and initialise the next formation member.
+    bcs !done+                              // Pool full: keep this position and retry next frame.
+
+    inc WAVE_SPAWNED                        // Record one successfully created formation member.
+
+    clc                                     // Clear carry before adding the horizontal formation offset.
+    lda WAVE_SPAWN_X                        // Read the position used by the enemy just spawned.
+    adc WAVE_ADD_X_VALUE                    // Add this formation's per-enemy horizontal offset.
+    sta WAVE_SPAWN_X                        // Save the next member's starting X position.
+
+    clc                                     // Clear carry before adding the vertical formation offset.
+    lda WAVE_SPAWN_Y                        // Read the position used by the enemy just spawned.
+    adc WAVE_ADD_Y_VALUE                    // Add this formation's per-enemy vertical offset.
+    sta WAVE_SPAWN_Y                        // Save the next member's starting Y position.
+
+    lda WAVE_SPAWNED                        // Re-check count before a possible same-frame spawn.
+    cmp WAVE_ENEMY_COUNT                    // Has this formation now spawned every requested member?
+    bcc !moreMembers+                       // No: prepare the interval before the next member.
+
+    lda #WAVE_GAP                           // Final member launched: start the inter-formation gap.
+    sta WAVE_GAP_TIMER                      // Director will remain idle until this expires.
+    rts                                     // Do not begin another formation in this frame.
+
+!moreMembers:
+    lda WAVE_SPAWN_INTERVAL                 // Read this formation's delay between successful spawns.
+    sta SPAWN_TIMER                         // Start the delay before the next member.
+    beq !spawn-                             // Interval zero: spawn another member in this same frame.
+
+!done:
+    rts
+
 // --- Sprite pointer lookup --------------------------------------------------
 spritePointers:
     .byte playerSprite / 64             // Object 0
@@ -1031,6 +1228,17 @@ SORTED_COUNT:          .byte 0
 OBJECT_PATTERN:        .fill MAX_OBJECTS, 0
 OBJECT_PATH_STEP:      .fill MAX_OBJECTS, 0
 OBJECT_PATH_TIMER:     .fill MAX_OBJECTS, 0
+
+SPAWN_TIMER:           .byte 0
+WAVE_GAP_TIMER:        .byte 0
+WAVE_ENEMY_COUNT:      .byte 0
+WAVE_SPAWN_INTERVAL:   .byte 0
+WAVE_SPAWNED:          .byte 0
+WAVE_SPAWN_X:          .byte 0
+WAVE_SPAWN_Y:          .byte 0
+WAVE_ADD_X_VALUE:      .byte 0
+WAVE_ADD_Y_VALUE:      .byte 0
+WAVE_PATTERN_ID:       .byte 0
 
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
@@ -1162,10 +1370,69 @@ enemySpriteA:
     .byte $00,$00,$00
     .byte $00
 
-    // duration, delta X, delta Y
-enemyPatternTest:
-    .byte 40,  1,  1
-    .byte 40,  0,  1
-    .byte 40, $ff, 1
-    .byte 40,  0,  1
-    .byte 0
+// --- Spawn formations -------------------------------------------------------
+// Formation data is stored as parallel tables indexed 0-3.  Movement is not
+// encoded here: startRandomWave chooses a movement pattern independently.
+//
+// 0: tight stream from one entry point.
+// 1: staggered diagonal entry.
+// 2: simultaneous horizontal line.
+// 3: descending diagonal stream moving left between successive spawns.
+formationEnemyCount:
+    .byte 8, 6, 7, 8
+formationInterval:
+    .byte 50, 24, 0, 18
+formationStartX:
+    .byte 120, 80, 65, 180
+formationStartY:
+    .byte 40, 35, 45, 25
+formationAddX:
+    .byte 0, 14, 28, $f8                   // $f8 = -8 for formation 3.
+formationAddY:
+    .byte 0, 5, 0, 4
+
+// --- Movement pattern offsets ----------------------------------------------
+// Each object stores a byte offset into enemyPatterns as OBJECT_PATH_STEP.
+// This lets the existing path interpreter read any pattern without pointers.
+patternStartOffset:
+    .byte patternDiveLeft-enemyPatterns
+    .byte patternDiveRight-enemyPatterns
+    .byte patternZigzag-enemyPatterns
+    .byte patternSweep-enemyPatterns
+
+// --- Enemy movement patterns ------------------------------------------------
+// Segments: duration, signed dx, signed dy.  Duration $ff means keep applying
+// that final vector until normal off-screen lifecycle logic removes the enemy.
+// Duration 0 remains an explicit terminator if a future pattern needs one.
+enemyPatterns:
+
+patternDiveLeft:
+    .byte 80,  0,  2                       // Dive vertically.
+    .byte  6,  0,  2                       // Hold downward direction into the turn.
+    .byte  6, $ff, 2                       // Begin bending left.
+    .byte  6, $ff, 1                       // Diagonal down-left.
+    .byte  6, $fe, 1                       // Turn more strongly left.
+    .byte  6, $fe, 0                       // Complete the turn.
+    .byte $ff,$fe, 0                       // Keep flying left until X lifecycle removes it.
+
+patternDiveRight:
+    .byte 60,  0,  2                       // Dive before beginning the mirrored turn.
+    .byte  6,  0,  2                       // Hold downward direction.
+    .byte  6,  1,  2                       // Begin bending right.
+    .byte  6,  1,  1                       // Diagonal down-right.
+    .byte  6,  2,  1                       // Turn more strongly right.
+    .byte  6,  2,  0                       // Complete the turn.
+    .byte $ff, 2,  0                       // Keep flying right until X lifecycle removes it.
+
+patternZigzag:
+    .byte 36,  1,  2                       // Sweep down-right.
+    .byte 36, $ff, 2                       // Reverse into a down-left sweep.
+    .byte 36,  1,  2                       // Sweep right again.
+    .byte $ff,$ff, 2                       // Continue final down-left vector until naturally off-screen.
+
+patternSweep:
+    .byte 28, $ff, 1                       // Shallow down-left opening sweep.
+    .byte 28,  1,  1                       // Cross back down-right.
+    .byte 28,  1,  2                       // Steepen the rightward dive.
+    .byte $ff,$ff, 2                       // Continue final steep down-left vector until off-screen.
+
