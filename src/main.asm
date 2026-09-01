@@ -275,9 +275,20 @@ moveEnemyPath:
 !moveY:
     lda enemyPatternTest+2,y               // Read signed vertical delta for this frame.
     beq !tick+                             // Zero means no vertical movement.
-    clc                                    // Clear carry before adding the signed delta.
-    adc OBJECT_Y,x                         // Two's-complement addition handles positive and negative Y.
-    sta OBJECT_Y,x                         // Store the new vertical position.
+    bmi !moveYUp+                          // Negative delta means movement towards the top.
+
+!moveYDown:
+    clc                                    // Clear carry before adding the positive Y delta.
+    adc OBJECT_Y,x                         // Add the downward movement to the current Y position.
+    bcs !finished+                         // Carry means Y crossed $ff; deactivate instead of wrapping to $00.
+    sta OBJECT_Y,x                         // Store the valid new Y position.
+    jmp !tick+                             // Continue the path timer update.
+
+!moveYUp:
+    clc                                    // Clear carry before adding the negative two's-complement delta.
+    adc OBJECT_Y,x                         // Add the upward movement to the current Y position.
+    bcc !finished+                         // No carry means Y crossed below $00; deactivate instead of wrapping to $ff.
+    sta OBJECT_Y,x                         // Store the valid new Y position.
 
 !tick:
     dec OBJECT_PATH_TIMER,x                // Consume one frame from the current path segment.
