@@ -30,6 +30,15 @@
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
 .const PLAYER_RESPAWN_TIME     = 100            // Invulnerable blinking frames after repositioning.
 
+.const PLAYER_FIRE_COOLDOWN    = 8              // Frames between held-fire volleys.
+.const PLAYER_MUZZLE_TIME      = 3              // Frames the muzzle-flash sprite remains visible.
+.const PLAYER_LEFT_CANNON_X    = 4              // Horizontal ray offset from player sprite X.
+.const PLAYER_RIGHT_CANNON_X   = 19             // Horizontal ray offset from player sprite X.
+.const ENEMY_START_HEALTH      = 6              // Three centred dual-cannon volleys before future death handling.
+.const ENEMY_HIT_FLASH_TIME    = 4              // Short white/yellow impact flash.
+.const ENEMY_HIT_KNOCK_Y       = 2              // Render-only downward recoil per cannon impact.
+.const ENEMY_HIT_KNOCK_X       = 2              // Render-only sideways recoil for a single-cannon impact.
+
 .const WAVE_COUNT          = 0
 .const WAVE_INTERVAL       = 1
 .const WAVE_START_X        = 2
@@ -96,6 +105,8 @@ init:
     sta PLAYER_STATE_TIMER
     sta PLAYER_EXPLOSION_FRAME
     sta PLAYER_BLINK_TIMER
+    sta PLAYER_FIRE_COOLDOWN_TIMER
+    sta PLAYER_MUZZLE_TIMER
 
     lda #1                                  // Load A from #1.
     sta OBJECT_ACTIVE                       // Object 0 = player
@@ -140,7 +151,9 @@ mainLoop:
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
 
 !frameLoop:
-    jsr updateObjects                       // Call updateObjects; return here when it executes RTS.
+    jsr updateEnemyHitEffects               // Decay prior-frame enemy colour flash and render-only recoil.
+    jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
+    jsr updateObjects                       // Update movement and allow the player to fire this frame.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
     jsr updateSpawner                       // Periodically create a new enemy.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
@@ -224,11 +237,13 @@ updateObjects:
 // --- Routine: updatePlayer --------------------------------------------------
 // Read joystick port 2 once and move object X within the playfield bounds.
 updatePlayer:
-    lda PLAYER_STATE                        // Check whether the player is currently exploding.
+    lda PLAYER_STATE                        // Explosion freezes the ship; respawn invulnerability still permits movement.
     cmp #PLAYER_STATE_EXPLODING
-    beq !done+                              // Explosion freezes movement; respawning still allows control.
+    bne !readJoystick+
+    rts
 
-    lda STICK_2
+!readJoystick:
+    lda STICK_2                             // Load A from STICK_2.
     sta JOY_STATE                           // Store A in JOY_STATE.
 
     lda JOY_STATE                           // Load A from JOY_STATE.
@@ -283,7 +298,244 @@ updatePlayer:
     sta OBJECT_X_MSB,x                      // 255 -> 256
 
 !done:
+    jsr updatePlayerFire                    // Fire after movement so both cannon rays use this frame's player X.
     rts                                     // Return to the calling routine.
+
+// --- Routine: updatePlayerFire ---------------------------------------------
+// Hold joystick fire to emit a dual-cannon hitscan volley whenever cooldown is
+// zero. Each cannon resolves independently, so alignment can deal 0, 1 or 2 HP.
+updatePlayerFire:
+    lda PLAYER_STATE                        // Keep the recovery window about movement/survival for this first pass.
+    cmp #PLAYER_STATE_ALIVE
+    beq !stateOkay+
+    rts
+
+!stateOkay:
+    lda PLAYER_FIRE_COOLDOWN_TIMER          // A previous volley still owns the fire cadence.
+    beq !checkButton+
+    rts
+
+!checkButton:
+    lda JOY_STATE                           // Joystick port 2 fire is active-low bit 4.
+    and #%00010000
+    beq !fire+
+    rts
+
+!fire:
+    lda #PLAYER_FIRE_COOLDOWN               // Arm cadence before resolving either cannon.
+    sta PLAYER_FIRE_COOLDOWN_TIMER
+    lda #PLAYER_MUZZLE_TIME                 // Hold the firing bitmap for a few frames.
+    sta PLAYER_MUZZLE_TIMER
+    lda #playerFireSprite / 64
+    sta OBJECT_SPRITE                       // Object 0 remains the player; only its presentation changes.
+
+    lda OBJECT_X                            // Build the left-cannon 9-bit world X coordinate.
+    clc
+    adc #PLAYER_LEFT_CANNON_X
+    sta HITSCAN_X_LO
+    lda OBJECT_X_MSB
+    adc #0
+    sta HITSCAN_X_MSB
+    jsr tracePlayerCannon                   // X = nearest intersected enemy when carry is clear.
+    bcs !rightCannon+
+    jsr hitEnemyFromLeft                    // Left-side impact kicks the enemy slightly right/down.
+
+!rightCannon:
+    lda OBJECT_X                            // Build the right-cannon 9-bit world X coordinate.
+    clc
+    adc #PLAYER_RIGHT_CANNON_X
+    sta HITSCAN_X_LO
+    lda OBJECT_X_MSB
+    adc #0
+    sta HITSCAN_X_MSB
+    jsr tracePlayerCannon
+    bcs !done+
+    jsr hitEnemyFromRight                   // Right-side impact kicks the enemy slightly left/down.
+
+!done:
+    rts
+
+// --- Routine: tracePlayerCannon --------------------------------------------
+// Find the nearest active enemy above the player whose 24-pixel sprite width
+// intersects HITSCAN_X. Returns X = logical enemy index and C clear on hit.
+tracePlayerCannon:
+    lda #$ff
+    sta HITSCAN_TARGET                      // $ff means no target has intersected this ray yet.
+    lda #0
+    sta HITSCAN_TARGET_Y                    // Greatest qualifying Y wins: nearest enemy above player.
+
+    ldx #1                                  // Slot 0 is permanently the player.
+!scan:
+    lda OBJECT_ACTIVE,x
+    beq !next+
+    lda OBJECT_TYPE,x
+    cmp #TYPE_ENEMY
+    bne !next+
+
+    lda OBJECT_Y,x                          // Hitscan only travels upward from the player's current position.
+    cmp OBJECT_Y
+    bcs !next+
+
+    lda HITSCAN_X_LO                        // Compute rayX - enemyX as a 9-bit subtraction.
+    sec
+    sbc OBJECT_X,x
+    sta HITSCAN_DELTA_LO
+    lda HITSCAN_X_MSB
+    sbc OBJECT_X_MSB,x
+    bne !next+                              // Negative or >=256 cannot lie within a 24-pixel sprite width.
+
+    lda HITSCAN_DELTA_LO
+    cmp #24
+    bcs !next+                              // Valid horizontal intersection is enemyX .. enemyX+23.
+
+    lda OBJECT_Y,x
+    cmp HITSCAN_TARGET_Y
+    bcc !next+                              // Smaller Y is farther away; keep the nearer target.
+    sta HITSCAN_TARGET_Y
+    stx HITSCAN_TARGET
+
+!next:
+    inx
+    cpx #MAX_OBJECTS
+    bne !scan-
+
+    ldx HITSCAN_TARGET
+    cpx #$ff
+    beq !miss+
+    clc
+    rts
+
+!miss:
+    sec
+    rts
+
+// --- Routine: hitEnemyFromLeft ---------------------------------------------
+// Apply one HP of ballistic damage plus a short right/down render-only recoil.
+hitEnemyFromLeft:
+    jsr damageEnemy
+    lda OBJECT_KNOCK_X,x
+    clc
+    adc #ENEMY_HIT_KNOCK_X
+    sta OBJECT_KNOCK_X,x
+    jsr addEnemyVerticalKnock
+    rts
+
+// --- Routine: hitEnemyFromRight --------------------------------------------
+// Apply one HP of ballistic damage plus a short left/down render-only recoil.
+// If both cannons hit the same enemy, the horizontal impulses cancel while the
+// vertical impulses stack, producing a stronger straight-back flinch.
+hitEnemyFromRight:
+    jsr damageEnemy
+    lda OBJECT_KNOCK_X,x
+    sec
+    sbc #ENEMY_HIT_KNOCK_X
+    sta OBJECT_KNOCK_X,x
+    jsr addEnemyVerticalKnock
+    rts
+
+// --- Routine: damageEnemy ---------------------------------------------------
+// X = logical enemy. Health reaching zero is deliberately retained for now;
+// later enemy-destruction code can consume that state instead of despawning here.
+damageEnemy:
+    lda OBJECT_HEALTH,x
+    beq !flash+                             // Already depleted: do not underflow the byte.
+    dec OBJECT_HEALTH,x
+
+!flash:
+    lda #ENEMY_HIT_FLASH_TIME
+    sta OBJECT_HIT_TIMER,x
+    lda #1                                  // VIC colour 1 = white initial ballistic impact flash.
+    sta OBJECT_COLOUR,x
+    rts
+
+// --- Routine: addEnemyVerticalKnock ----------------------------------------
+// Stack the downward recoil from independent cannon impacts in the same volley.
+addEnemyVerticalKnock:
+    lda OBJECT_KNOCK_Y,x
+    clc
+    adc #ENEMY_HIT_KNOCK_Y
+    cmp #7                                  // Keep render-only displacement small and scheduler-safe.
+    bcc !store+
+    lda #6
+!store:
+    sta OBJECT_KNOCK_Y,x
+    rts
+
+// --- Routine: updatePlayerCombatEffects ------------------------------------
+// Decay fire cadence and restore the normal player bitmap after muzzle flash.
+updatePlayerCombatEffects:
+    lda PLAYER_FIRE_COOLDOWN_TIMER
+    beq !muzzle+
+    dec PLAYER_FIRE_COOLDOWN_TIMER
+
+!muzzle:
+    lda PLAYER_MUZZLE_TIMER
+    beq !done+
+    dec PLAYER_MUZZLE_TIMER
+    bne !done+
+
+    lda PLAYER_STATE                        // Explosion/respawn presentation owns OBJECT_SPRITE in other states.
+    cmp #PLAYER_STATE_ALIVE
+    bne !done+
+    lda #playerSprite / 64
+    sta OBJECT_SPRITE
+
+!done:
+    rts
+
+// --- Routine: updateEnemyHitEffects ----------------------------------------
+// Restore base colours after the hit flash and decay render-only recoil toward
+// zero without disturbing the enemy's actual table-driven path coordinates.
+updateEnemyHitEffects:
+    ldx #1
+!loop:
+    lda OBJECT_ACTIVE,x
+    beq !next+
+    lda OBJECT_TYPE,x
+    cmp #TYPE_ENEMY
+    bne !next+
+
+    lda OBJECT_HIT_TIMER,x
+    beq !knockX+
+    dec OBJECT_HIT_TIMER,x
+    lda OBJECT_HIT_TIMER,x
+    cmp #2
+    bcs !white+
+    cmp #1
+    beq !yellow+
+
+    lda OBJECT_BASE_COLOUR,x                // Timer reached zero: restore formation colour.
+    sta OBJECT_COLOUR,x
+    jmp !knockX+
+
+!white:
+    lda #1
+    sta OBJECT_COLOUR,x
+    jmp !knockX+
+
+!yellow:
+    lda #7
+    sta OBJECT_COLOUR,x
+
+!knockX:
+    lda OBJECT_KNOCK_X,x
+    beq !knockY+
+    bmi !negativeX+
+    dec OBJECT_KNOCK_X,x
+    jmp !knockY+
+!negativeX:
+    inc OBJECT_KNOCK_X,x
+
+!knockY:
+    lda OBJECT_KNOCK_Y,x
+    beq !next+
+    dec OBJECT_KNOCK_Y,x
+
+!next:
+    inx
+    cpx #MAX_OBJECTS
+    bne !loop-
+    rts
 
 // --- Routine: moveEnemyPath -------------------------------------------------
 // Advance one enemy through its table-driven movement pattern.
@@ -465,12 +717,29 @@ buildInitialSpriteSnapshot:
     tay                                     // Copy A into Y.
 
     ldx TEMP_OBJECT                         // Load X from TEMP_OBJECT.
-    lda OBJECT_X,x                          // Load A from OBJECT_X,x.
-    sta INITIAL_X,y                         // Store A in INITIAL_X,y.
-    lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
-    sta INITIAL_Y,y                         // Store A in INITIAL_Y,y.
-    lda OBJECT_X_MSB,x                      // Load A from OBJECT_X_MSB,x.
-    sta INITIAL_X_MSB,y                     // Store A in INITIAL_X_MSB,y.
+
+    lda OBJECT_X,x                          // Start with the path-owned 9-bit X coordinate.
+    clc
+    adc OBJECT_KNOCK_X,x                    // Add signed render-only horizontal recoil.
+    sta INITIAL_X,y
+    lda OBJECT_X_MSB,x
+    adc #0                                  // Carry from positive low-byte overflow.
+    sta INITIAL_X_MSB,y
+    lda OBJECT_KNOCK_X,x
+    bpl !initialXReady+
+    lda INITIAL_X,y                         // Negative offsets that borrowed across $00 need the high byte reduced.
+    cmp OBJECT_X,x
+    bcc !initialXReady+                     // Low result wrapped upward only when subtraction crossed $00.
+    lda INITIAL_X_MSB,y                     // NMOS 6502 has no DEC absolute,Y addressing mode.
+    sec
+    sbc #1                                  // Reduce the ninth X byte after a negative-offset borrow.
+    sta INITIAL_X_MSB,y
+!initialXReady:
+
+    lda OBJECT_Y,x
+    sec
+    sbc OBJECT_KNOCK_Y,x
+    sta INITIAL_Y,y
     lda OBJECT_SPRITE,x                     // Load A from OBJECT_SPRITE,x.
     sta INITIAL_SPRITE,y                    // Store A in INITIAL_SPRITE,y.
     lda OBJECT_COLOUR,x                     // Load A from OBJECT_COLOUR,x.
@@ -603,7 +872,8 @@ buildBatchSpriteSchedule:
     bne !slotFound+                         // Branch to !slotFound+ if the previous result was non-zero/not equal.
 
     lda SCHED_BATCH_SIZE                    // Load A from SCHED_BATCH_SIZE.
-    bne !finishBatch+                       // Branch to !finishBatch+ if the previous result was non-zero/not equal.
+    beq !cannotSchedule+                    // Empty batch: skip this unschedulable object.
+    jmp !finishBatch+                       // Non-empty batch: finish it with an absolute jump.
 
 !cannotSchedule:
     inc SCHED_OBJECT_INDEX                  // Increment SCHED_OBJECT_INDEX by one.
@@ -625,12 +895,26 @@ buildBatchSpriteSchedule:
     sta ASSIGN_SLOT,x                       // Store A in ASSIGN_SLOT,x.
 
     ldy TEMP_OBJECT                         // Load Y from TEMP_OBJECT.
-    lda OBJECT_X,y                          // Load A from OBJECT_X,y.
-    sta ASSIGN_X,x                          // Store A in ASSIGN_X,x.
-    lda OBJECT_Y,y                          // Load A from OBJECT_Y,y.
-    sta ASSIGN_Y,x                          // Store A in ASSIGN_Y,x.
-    lda OBJECT_X_MSB,y                      // Load A from OBJECT_X_MSB,y.
-    sta ASSIGN_X_MSB,x                      // Store A in ASSIGN_X_MSB,x.
+
+    lda OBJECT_X,y                          // Start with the path-owned 9-bit X coordinate.
+    clc
+    adc OBJECT_KNOCK_X,y                    // Add signed render-only horizontal recoil.
+    sta ASSIGN_X,x
+    lda OBJECT_X_MSB,y
+    adc #0
+    sta ASSIGN_X_MSB,x
+    lda OBJECT_KNOCK_X,y
+    bpl !assignXReady+
+    lda ASSIGN_X,x
+    cmp OBJECT_X,y
+    bcc !assignXReady+
+    dec ASSIGN_X_MSB,x
+!assignXReady:
+
+    lda OBJECT_Y,y
+    sec
+    sbc OBJECT_KNOCK_Y,y
+    sta ASSIGN_Y,x
     lda OBJECT_SPRITE,y                     // Load A from OBJECT_SPRITE,y.
     sta ASSIGN_SPRITE,x                     // Store A in ASSIGN_SPRITE,x.
     lda OBJECT_COLOUR,y                     // Load A from OBJECT_COLOUR,y.
@@ -1194,22 +1478,20 @@ updatePlayerState:
     and #%00000100
     beq !showPlayer+
 
-    lda #blankSprite / 64                   // Keep player active but render an empty sprite.
+    lda #blankSprite / 64                   // Keep object 0 active; only its presentation blinks off.
     sta OBJECT_SPRITE
     rts
 
 !showPlayer:
-    lda #playerSprite / 64                  // Restore visible player sprite for this blink phase.
+    lda #playerSprite / 64                  // Restore the visible ship for this blink phase.
     sta OBJECT_SPRITE
     rts
 
 !finishRespawn:
-    lda #playerSprite / 64                  // Ensure normal ship sprite is restored.
+    lda #playerSprite / 64                  // Guarantee the normal ship bitmap when vulnerability returns.
     sta OBJECT_SPRITE
-
     lda #0
     sta PLAYER_HIT                          // Discard any stale hit state.
-
     lda #PLAYER_STATE_ALIVE
     sta PLAYER_STATE
     rts
@@ -1304,7 +1586,15 @@ spawnEnemy:
     sta OBJECT_SPRITE,x                     // Store sprite bitmap index.
 
     lda enemyColourSequence,y               // Read this member's individual multicolour value.
-    sta OBJECT_COLOUR,x                     // Store enemy colour.
+    sta OBJECT_COLOUR,x                     // Store currently rendered enemy colour.
+    sta OBJECT_BASE_COLOUR,x                // Preserve it so impact flashes can restore the formation colour.
+
+    lda #ENEMY_START_HEALTH
+    sta OBJECT_HEALTH,x                     // Every current enemy begins with the same provisional health.
+    lda #0
+    sta OBJECT_HIT_TIMER,x
+    sta OBJECT_KNOCK_X,x
+    sta OBJECT_KNOCK_Y,x
 
     inc WAVE_SPRITE_INDEX                   // Advance only after a successful allocation/spawn.
 
@@ -1429,6 +1719,11 @@ OBJECT_TYPE:           .fill MAX_OBJECTS, 0
 HW_SPRITE_OFFSET:      .byte 0,2,4,6,8,10,12,14
 OBJECT_SPRITE:         .fill MAX_OBJECTS, 0
 OBJECT_COLOUR:         .fill MAX_OBJECTS, 0
+OBJECT_BASE_COLOUR:    .fill MAX_OBJECTS, 0     // Formation colour restored after impact flashing.
+OBJECT_HEALTH:         .fill MAX_OBJECTS, 0     // Current enemy HP; player slot is presently unused.
+OBJECT_HIT_TIMER:      .fill MAX_OBJECTS, 0     // Remaining colour-flash frames after ballistic impact.
+OBJECT_KNOCK_X:        .fill MAX_OBJECTS, 0     // Signed render-only horizontal recoil.
+OBJECT_KNOCK_Y:        .fill MAX_OBJECTS, 0     // Positive render-only downward recoil.
 SORTED_OBJECTS:        .fill MAX_OBJECTS, $ff
 SORTED_COUNT:          .byte 0
 
@@ -1480,6 +1775,14 @@ PLAYER_STATE:          .byte 0         // Alive, exploding, or respawning.
 PLAYER_STATE_TIMER:    .byte 0         // Explosion-frame hold or respawn-invulnerability countdown.
 PLAYER_EXPLOSION_FRAME:.byte 0         // Current explosion bitmap index 0-3.
 PLAYER_BLINK_TIMER:    .byte 0         // Free-running respawn visibility phase.
+PLAYER_FIRE_COOLDOWN_TIMER: .byte 0     // Held-fire cadence.
+PLAYER_MUZZLE_TIMER:   .byte 0         // Remaining player muzzle-flash frames.
+
+HITSCAN_X_LO:          .byte 0         // Current cannon ray 9-bit X low byte.
+HITSCAN_X_MSB:         .byte 0         // Current cannon ray ninth X bit.
+HITSCAN_DELTA_LO:      .byte 0         // Low byte of rayX - enemyX during intersection test.
+HITSCAN_TARGET:        .byte $ff       // Logical object selected by the current ray.
+HITSCAN_TARGET_Y:      .byte 0         // Y of nearest qualifying target.
 
 SCHED_OBJECT_INDEX:    .byte 0
 SCHED_ASSIGN_INDEX:    .byte 0
@@ -1538,6 +1841,33 @@ playerSprite:
     .byte $02,$82,$80
     .byte $02,$82,$80
     .byte $00            // 64th padding byte
+
+playerFireSprite:
+    .byte $0c,$3c,$30
+    .byte $03,$3c,$c0
+    .byte $0c,$ff,$30
+    .byte $00,$eb,$00
+    .byte $03,$eb,$c0
+    .byte $03,$eb,$c0
+    .byte $0f,$eb,$f0
+    .byte $0f,$d7,$f0
+    .byte $3f,$d7,$fc
+    .byte $3f,$d7,$fc
+    .byte $ff,$d7,$ff
+    .byte $ff,$d7,$ff
+    .byte $3f,$d7,$fc
+    .byte $3f,$ff,$fc
+    .byte $0f,$d7,$f0
+    .byte $0f,$d7,$f0
+    .byte $0f,$c3,$f0
+    .byte $03,$c3,$c0
+    .byte $03,$c3,$c0
+    .byte $02,$82,$80
+    .byte $02,$82,$80
+    .byte $00                              // 64th padding byte
+
+blankSprite:
+    .fill 64, $00                          // Invisible respawn blink while object 0 remains active.
 
 playerExplosion1:
     .byte $00,$00,$00
@@ -1730,9 +2060,6 @@ enemySpriteD:
     .byte $00,$00,$00
     .byte $00,$00,$00
     .byte $00                              // 64th padding byte
-
-blankSprite:
-    .fill 64, $00
 
 // --- Spawn formations -------------------------------------------------------
 // Formation data is stored as parallel tables indexed 0-3.  Movement is not
