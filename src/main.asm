@@ -15,6 +15,17 @@
 .const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
 .const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
+
+.const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
+.const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
+.const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
+.const STAR_GLYPH_BYTES = 96
+
+// Sanxion (Rob Hubbard) PSID player entry points.
+.const MUSIC_LOAD = $B000
+.const MUSIC_INIT = $BE00
+.const MUSIC_PLAY = $BE20
+.const CPU_MEMORY_PORT = $01                       // 6510 memory-map control register.
 .const PATTERN_DIVE_LEFT  = 0
 .const PATTERN_DIVE_RIGHT = 1
 .const PATTERN_ZIGZAG     = 2
@@ -78,21 +89,33 @@ init:
     ora #%00000011                          // OR A with #%00000011.
     sta VIC_BANK                            // VIC bank 0 ($0000-$3fff)
 
-    lda VIC_MEMORY_SETUP                    // Load A from VIC_MEMORY_SETUP.
-    and #%11110000                          // AND A with #%11110000.
-    ora #%00000100                          // OR A with #%00000100.
-    sta VIC_MEMORY_SETUP                    // Existing screen/character layout
+    jsr setupStarfieldCharset              // Copy ROM charset and install animated star glyphs.
+
+    lda VIC_MEMORY_SETUP
+    and #%11110000                          // Preserve screen RAM selection ($0400).
+    ora #%00001110                          // Character set at $3800 within VIC bank 0.
+    sta VIC_MEMORY_SETUP
 
     lda #147                                // Load A from #147.
     jsr $ffd2                               // Clear screen
 
-    lda #0                                  // Load A from #0.
-    sta BORDER_COLOUR                       // Debug border off
+    lda #0
+    sta BORDER_COLOUR                       // Black border.
+    sta BACKGROUND_COLOUR                   // Black playfield.
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
+    jsr setupStarfield                      // Draw initial stars below the HUD row.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
     jsr startRandomWave                      // Choose the first formation/pattern combination.
+
+    lda #$36                                // Bank BASIC ROM out; expose RAM at $a000-$bfff while keeping KERNAL + I/O visible.
+    sta CPU_MEMORY_PORT                     // Sanxion's init/play code lives in RAM underneath BASIC ROM at $be00/$be20.
+
+    lda #0                                  // PSID subtunes are zero-based: 0 selects Sanxion's default first tune.
+    tax                                     // Give the player clean X/Y on entry as a conservative courtesy.
+    tay
+    jsr MUSIC_INIT                          // Initialise the embedded SID player once.
 
     //lda #1                                  // Load A from #1.
     //sta MOB_X_VEL                           // Enemy horizontal speed
@@ -162,17 +185,304 @@ mainLoop:
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
     jsr updateSpawner                       // Periodically create a new enemy.
+    jsr updateStarfield                     // Scroll and twinkle the character background.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
-    jsr updateCycleDebug                    // Record remaining frame budget; refresh the display every 50 frames.
+    jsr MUSIC_PLAY                          // Advance Sanxion by one PAL video frame (50 Hz).
+    jsr updateCycleDebug                    // Record remaining budget including the SID player's CPU cost.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
+
+// --- Routine: setupStarfieldCharset ---------------------------------------
+// Copy the standard upper-case/graphics character ROM to $3800, then replace
+// chars 240-251 with animated star glyphs.
+setupStarfieldCharset:
+    sei                                     // Keep IRQs out while VIC I/O is banked away.
+    lda $01
+    pha
+    and #%11111011                          // CHAREN=0 exposes character ROM at $d000.
+    sta $01
+
+    ldx #0
+!copyCharset:
+    lda $d000,x
+    sta STAR_CHARSET + $000,x
+    lda $d100,x
+    sta STAR_CHARSET + $100,x
+    lda $d200,x
+    sta STAR_CHARSET + $200,x
+    lda $d300,x
+    sta STAR_CHARSET + $300,x
+    lda $d400,x
+    sta STAR_CHARSET + $400,x
+    lda $d500,x
+    sta STAR_CHARSET + $500,x
+    lda $d600,x
+    sta STAR_CHARSET + $600,x
+    lda $d700,x
+    sta STAR_CHARSET + $700,x
+    inx
+    bne !copyCharset-
+
+    pla
+    sta $01                                 // Restore normal I/O mapping.
+    cli
+
+    ldx #0
+!copyStarGlyphs:
+    lda starGlyphData,x
+    sta STAR_CHARSET + (STAR_CHAR_BASE * 8),x
+    inx
+    cpx #STAR_GLYPH_BYTES
+    bne !copyStarGlyphs-
+    rts
+
+// --- Routine: setupStarfield ------------------------------------------------
+setupStarfield:
+    lda #0
+    sta STAR_FRAME
+
+    ldx #0
+!phaseLoop:
+    txa                                     // Stagger initial sub-cell phases.
+    and #%00000011
+    sta STAR_PHASE,x
+    inx
+    cpx #STAR_COUNT
+    bne !phaseLoop-
+
+    jsr drawStarfield
+    rts
+
+// --- Routine: updateStarfield ----------------------------------------------
+// Optimised version: each star is only erased/redrawn when it actually moves.
+// Far stars therefore cost almost nothing on three frames out of four, medium
+// stars on alternate frames, while near stars retain full-speed movement.
+updateStarfield:
+    inc STAR_FRAME
+
+    ldx #0
+!updateLoop:
+    lda STAR_STYLE,x
+    and #%00000001                          // 0=far, 1=middle. Near/large layer removed.
+    beq !small+
+    jmp !medium+
+
+!small:
+    lda STAR_FRAME                          // Far stars move every fourth frame.
+    and #%00000011
+    bne !twinkleOnly+
+    jmp !moveStar+
+
+!medium:
+    lda STAR_FRAME                          // Middle stars move every second frame.
+    and #%00000001
+    bne !twinkleOnly+
+
+!moveStar:
+    jsr eraseOneStar                        // Remove only this star's old character cell.
+
+    inc STAR_PHASE,x                        // Advance by two pixels inside its current character cell.
+    lda STAR_PHASE,x
+    cmp #4
+    bcc !redraw+
+
+    lda #0
+    sta STAR_PHASE,x
+    inc STAR_Y,x                            // Four phases completed: enter the next character row.
+    lda STAR_Y,x
+    cmp #25
+    bcc !redraw+
+
+    lda #1                                  // Wrap below row 0 HUD.
+    sta STAR_Y,x
+
+    lda CIA1_TIMER_A_LO                     // Vary X at wrap to break obvious vertical lanes.
+    eor STAR_FRAME
+    clc
+    adc STAR_STYLE,x
+    and #%00111111
+    cmp #40
+    bcc !storeX+
+    sbc #40
+!storeX:
+    sta STAR_X,x
+
+!redraw:
+    jsr drawOneStar                         // Draw only the star that changed.
+    jmp !next+
+
+!twinkleOnly:
+    lda STAR_STYLE,x
+    bpl !next+                              // Non-twinkling stationary stars need no work at all.
+
+    txa
+    clc
+    adc STAR_FRAME
+    and #%00011111
+    beq !twinkleOn+
+
+    cmp #1                                  // One frame after sparkle, restore normal colour.
+    bne !next+
+    jsr setOneStarNormalColour
+    jmp !next+
+
+!twinkleOn:
+    jsr setOneStarTwinkleColour
+
+!next:
+    inx
+    cpx #STAR_COUNT
+    beq !done+
+    jmp !updateLoop-
+!done:
+    rts
+
+// --- Routine: eraseOneStar --------------------------------------------------
+// X = logical star index. Erase just that star's current screen cell.
+eraseOneStar:
+    ldy STAR_Y,x
+    lda starRowLo,y
+    clc
+    adc STAR_X,x
+    sta starEraseStore + 1
+    lda starRowHi,y
+    adc #0
+    sta starEraseStore + 2
+
+    lda #32                                 // Screen code for space.
+starEraseStore:
+    sta $ffff
+    rts
+
+// --- Routine: drawOneStar ---------------------------------------------------
+// X = logical star index. Draw its current glyph and normal/twinkle colour.
+drawOneStar:
+    ldy STAR_Y,x
+    lda starRowLo,y
+    clc
+    adc STAR_X,x
+    sta starDrawScreen + 1
+    sta starDrawColour + 1
+
+    lda starRowHi,y
+    adc #0
+    sta starDrawScreen + 2
+    clc
+    adc #$d4                                // Matching colour RAM page.
+    sta starDrawColour + 2
+
+    lda STAR_STYLE,x
+    and #%00000011
+    tay
+    lda starBaseColour,y
+    sta STAR_DRAW_COLOUR
+
+    tya
+    asl
+    asl                                     // Four glyph phases per size.
+    clc
+    adc STAR_PHASE,x
+    adc #STAR_CHAR_BASE
+starDrawScreen:
+    sta $ffff
+
+    lda STAR_STYLE,x
+    bpl !normalColour+
+    txa
+    clc
+    adc STAR_FRAME
+    and #%00011111
+    bne !normalColour+
+    lda #7                                  // Brief yellow-white sparkle.
+    sta STAR_DRAW_COLOUR
+
+!normalColour:
+    lda STAR_DRAW_COLOUR
+starDrawColour:
+    sta $ffff
+    rts
+
+// --- Routine: drawStarfield -------------------------------------------------
+// Used only during setup: render every star once.
+drawStarfield:
+    ldx #0
+!drawLoop:
+    jsr drawOneStar
+    inx
+    cpx #STAR_COUNT
+    bne !drawLoop-
+    rts
+
+// --- Routine: setOneStarTwinkleColour --------------------------------------
+// X = logical star index. Change colour RAM only; glyph/screen RAM is untouched.
+setOneStarTwinkleColour:
+    ldy STAR_Y,x
+    lda starRowLo,y
+    clc
+    adc STAR_X,x
+    sta starTwinkleStore + 1
+    lda starRowHi,y
+    adc #0
+    clc
+    adc #$d4
+    sta starTwinkleStore + 2
+
+    lda #7
+starTwinkleStore:
+    sta $ffff
+    rts
+
+// --- Routine: setOneStarNormalColour ---------------------------------------
+// X = logical star index. Restore the colour appropriate to this depth layer.
+setOneStarNormalColour:
+    ldy STAR_Y,x
+    lda starRowLo,y
+    clc
+    adc STAR_X,x
+    sta starNormalColourStore + 1
+    lda starRowHi,y
+    adc #0
+    clc
+    adc #$d4
+    sta starNormalColourStore + 2
+
+    lda STAR_STYLE,x
+    and #%00000011
+    tay
+    lda starBaseColour,y
+starNormalColourStore:
+    sta $ffff
+    rts
+
+// Three sizes, each with four vertical phases spaced two pixels apart.
+starGlyphData:
+    // Small/far.
+    .byte $10,$00,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$10,$00,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$10,$00,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$10,$00
+
+    // Medium.
+    .byte $18,$18,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$18,$18,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$18,$18,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$18,$18
+
+    // Large/near.
+    .byte $38,$10,$00,$00,$00,$00,$00,$00
+    .byte $00,$00,$38,$10,$00,$00,$00,$00
+    .byte $00,$00,$00,$00,$38,$10,$00,$00
+    .byte $00,$00,$00,$00,$00,$00,$38,$10
+
+starBaseColour:
+    .byte 12,15,1                           // Grey far, light-grey middle; white near entry retained but unused.
 
 // --- Routine: setupSprites --------------------------------------------------
 // Enable VIC sprites and seed logical object positions.
@@ -517,9 +827,9 @@ healthCopyDest:
     tax                                     // X = 1..5 after a normal non-lethal hit.
 
     lda healthBarByte0,x                    // Left third of the six-segment bar.
-    ldy #0                                // Sprite row 19, byte 0.
+    ldy #0                                  // Sprite row 0, byte 0.
     jsr storeHealthBarByte
-    ldy #3                                 // Duplicate on row 20 for a two-pixel-high bar.
+    ldy #3                                  // Duplicate on row 1 for a two-pixel-high bar.
     jsr storeHealthBarByte
 
     lda healthBarByte1,x                    // Middle third.
@@ -1888,6 +2198,11 @@ SPRITE_ENABLE_MASK:
     .byte %00000000,%00000001,%00000011,%00000111,%00001111
     .byte %00011111,%00111111,%01111111,%11111111
 
+starRowLo:
+    .byte $00,$28,$50,$78,$a0,$c8,$f0,$18,$40,$68,$90,$b8,$e0,$08,$30,$58,$80,$a8,$d0,$f8,$20,$48,$70,$98,$c0
+starRowHi:
+    .byte $04,$04,$04,$04,$04,$04,$04,$05,$05,$05,$05,$05,$05,$06,$06,$06,$06,$06,$06,$06,$07,$07,$07,$07,$07
+
 LOOKUP_TABLES_END:
 .if (LOOKUP_TABLES_END > $2000) {
     .error "Lookup tables overlap engine runtime state"
@@ -2002,6 +2317,19 @@ DEBUG_MIN_LO:          .byte $ff
 DEBUG_MIN_HI:          .byte $ff
 DEBUG_VALUE_LO:        .byte 0
 DEBUG_VALUE_HI:        .byte 0
+
+STAR_FRAME:             .byte 0
+STAR_DRAW_COLOUR:       .byte 0
+STAR_X:
+    .byte 2,7,12,18,25,31,37,4,10,15,22,28,34,39,6,14
+STAR_Y:
+    .byte 2,5,8,11,14,17,20,23,4,7,10,13,16,19,22,3
+STAR_PHASE:
+    .fill STAR_COUNT,0
+STAR_STYLE:
+    // 0=small/far, 1=medium; bit 7 enables twinkle.
+    .byte $00,$81,$00,$01,$80,$01,$00,$81
+    .byte $00,$01,$80,$01,$00,$81,$00,$01
 
 ENGINE_STATE_END:
 .if (ENGINE_STATE_END > $2400) {
@@ -2362,4 +2690,18 @@ healthSpritePool:
 HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
+}
+
+
+// --- Embedded SID music -----------------------------------------------------
+// Raw C64 payload extracted from Sanxion.sid. The PSID container itself is not
+// assembled; only the native player/data bytes are placed at the address the
+// tune requests. MUSIC_INIT is called once, MUSIC_PLAY once per PAL frame.
+* = MUSIC_LOAD
+sanxionMusic:
+    .import binary "Sanxion.bin"
+SANXION_MUSIC_END:
+
+.if (SANXION_MUSIC_END > $CD40) {
+    .error "Sanxion payload assembled beyond its expected end address"
 }

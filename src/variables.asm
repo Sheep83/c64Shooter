@@ -35,3 +35,4 @@
 .var TEMP_OBJECT_Y            = $0034
 .var TEMP_EVENT_INDEX         = $0035
 .var TEMP_FREE_RASTER         = $0036
+.const BACKGROUND_COLOUR      = $D021
