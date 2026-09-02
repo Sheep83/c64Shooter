@@ -10,6 +10,11 @@
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
+.const SCORE_SCREEN = $0400 + 29              // Top row, right-aligned: "SCORE 00000".
+.const SCORE_COLOUR = $d800 + 29
+.const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
+.const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
+.const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
 .const PATTERN_DIVE_LEFT  = 0
 .const PATTERN_DIVE_RIGHT = 1
 .const PATTERN_ZIGZAG     = 2
@@ -36,8 +41,8 @@
 .const PLAYER_RIGHT_CANNON_X   = 19             // Horizontal ray offset from player sprite X.
 .const ENEMY_START_HEALTH      = 6              // Three centred dual-cannon volleys before future death handling.
 .const ENEMY_HIT_FLASH_TIME    = 4              // Short white/yellow impact flash.
-.const ENEMY_HIT_KNOCK_Y       = 2              // Render-only downward recoil per cannon impact.
-.const ENEMY_HIT_KNOCK_X       = 2              // Render-only sideways recoil for a single-cannon impact.
+.const ENEMY_DEATH_TIME         = 12             // Total frames before the logical enemy slot is released.
+.const ENEMY_DEATH_FRAME_TIME   = 4              // Four frames per explosion bitmap.
 
 .const WAVE_COUNT          = 0
 .const WAVE_INTERVAL       = 1
@@ -85,6 +90,7 @@ init:
     sta BORDER_COLOUR                       // Debug border off
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
+    jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
     jsr startRandomWave                      // Choose the first formation/pattern combination.
 
@@ -151,7 +157,7 @@ mainLoop:
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
 
 !frameLoop:
-    jsr updateEnemyHitEffects               // Decay prior-frame enemy colour flash and render-only recoil.
+    jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
     jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
@@ -226,7 +232,8 @@ updateObjects:
 !enemy:
     cmp #TYPE_ENEMY                         // Compare A with #TYPE_ENEMY; set flags, leaving A unchanged.
     bne !next+                              // Branch to !next+ if the previous result was non-zero/not equal.
-    //jsr moveEnemy                           // Call moveEnemy; return here when it executes RTS.
+    lda OBJECT_DEATH_TIMER,x                // A dying enemy remains renderable but no longer follows its path.
+    bne !next+
     jsr moveEnemyPath
 !next:
     inx                                     // Increment X by one.
@@ -298,8 +305,9 @@ updatePlayer:
     sta OBJECT_X_MSB,x                      // 255 -> 256
 
 !done:
-    jsr updatePlayerFire                    // Fire after movement so both cannon rays use this frame's player X.
-    rts                                     // Return to the calling routine.
+    jsr updatePlayerFire
+    ldx #0                                  // updatePlayer belongs to reserved object 0; restore object-loop index.
+    rts
 
 // --- Routine: updatePlayerFire ---------------------------------------------
 // Hold joystick fire to emit a dual-cannon hitscan volley whenever cooldown is
@@ -410,56 +418,142 @@ tracePlayerCannon:
     rts
 
 // --- Routine: hitEnemyFromLeft ---------------------------------------------
-// Apply one HP of ballistic damage plus a short right/down render-only recoil.
+// Apply one HP of ballistic damage from the left cannon.
 hitEnemyFromLeft:
     jsr damageEnemy
-    lda OBJECT_KNOCK_X,x
-    clc
-    adc #ENEMY_HIT_KNOCK_X
-    sta OBJECT_KNOCK_X,x
-    jsr addEnemyVerticalKnock
     rts
 
 // --- Routine: hitEnemyFromRight --------------------------------------------
-// Apply one HP of ballistic damage plus a short left/down render-only recoil.
-// If both cannons hit the same enemy, the horizontal impulses cancel while the
-// vertical impulses stack, producing a stronger straight-back flinch.
+// Apply one HP of ballistic damage from the right cannon.
 hitEnemyFromRight:
     jsr damageEnemy
-    lda OBJECT_KNOCK_X,x
-    sec
-    sbc #ENEMY_HIT_KNOCK_X
-    sta OBJECT_KNOCK_X,x
-    jsr addEnemyVerticalKnock
     rts
 
 // --- Routine: damageEnemy ---------------------------------------------------
-// X = logical enemy. Health reaching zero is deliberately retained for now;
-// later enemy-destruction code can consume that state instead of despawning here.
+// X = logical enemy. A hit removes one HP; reaching zero starts a short death
+// state. OBJECT_ACTIVE remains set until the animation finishes, preserving the
+// normal renderer/allocator ownership rules.
 damageEnemy:
     lda OBJECT_HEALTH,x
-    beq !flash+                             // Already depleted: do not underflow the byte.
+    beq !done+                              // Already dead/dying: never underflow health.
     dec OBJECT_HEALTH,x
+    beq !beginDeath+                        // Final HP consumed: switch immediately to death presentation.
 
-!flash:
+    jsr updateEnemyHealthSprite             // Reveal/update this enemy's private in-sprite health bar.
     lda #ENEMY_HIT_FLASH_TIME
     sta OBJECT_HIT_TIMER,x
     lda #1                                  // VIC colour 1 = white initial ballistic impact flash.
     sta OBJECT_COLOUR,x
+!done:
     rts
 
-// --- Routine: addEnemyVerticalKnock ----------------------------------------
-// Stack the downward recoil from independent cannon impacts in the same volley.
-addEnemyVerticalKnock:
-    lda OBJECT_KNOCK_Y,x
-    clc
-    adc #ENEMY_HIT_KNOCK_Y
-    cmp #7                                  // Keep render-only displacement small and scheduler-safe.
-    bcc !store+
-    lda #6
-!store:
-    sta OBJECT_KNOCK_Y,x
+!beginDeath:
+    lda #0
+    sta OBJECT_HIT_TIMER,x                  // Death animation now owns sprite colour/presentation.
+
+    lda #ENEMY_DEATH_TIME
+    sta OBJECT_DEATH_TIMER,x                // Keep the logical slot active until the animation completes.
+    lda #playerExplosion1 / 64              // Reuse existing explosion art for the first functional death pass.
+    sta OBJECT_SPRITE,x
+    lda #7                                  // Yellow initial blast.
+    sta OBJECT_COLOUR,x
     rts
+
+// --- Routine: updateEnemyHealthSprite --------------------------------------
+// X = logical enemy. Copy its original 64-byte bitmap into a private sprite slot
+// and overwrite the two blank bottom rows with a six-segment health bar.
+// Each HP is two multicolour pixels wide; no extra VIC sprite is consumed.
+updateEnemyHealthSprite:
+    stx HEALTH_OBJECT_INDEX                 // Preserve caller's logical enemy index.
+
+    lda OBJECT_BASE_SPRITE,x                // Convert source sprite pointer back into a bank-0 RAM address.
+    sta HEALTH_SOURCE_SPRITE
+    and #%00000011                          // Pointer bits 0-1 become address bits 6-7.
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta healthCopySource + 1                // Patch low byte of LDA absolute,Y source operand.
+    lda HEALTH_SOURCE_SPRITE
+    lsr
+    lsr                                     // Pointer / 4 is the source address high byte.
+    sta healthCopySource + 2                // Patch high byte of LDA absolute,Y source operand.
+
+    txa
+    clc
+    adc #HEALTH_SPRITE_BASE_PTR             // Give this logical slot its own 64-byte sprite bitmap.
+    sta HEALTH_DEST_SPRITE
+    sta OBJECT_SPRITE,x                     // Renderer now uses the private health-bar copy.
+    and #%00000011
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta healthCopyDest + 1                  // Patch low byte of STA absolute,Y destination operand.
+    lda HEALTH_DEST_SPRITE
+    lsr
+    lsr
+    sta healthCopyDest + 2                  // Patch high byte of STA absolute,Y destination operand.
+    sta healthBarStore + 2                  // Health-bar writes target the same private sprite.
+    lda healthCopyDest + 1
+    sta healthBarStore + 1
+
+    ldy #0                                  // Clone all 64 bytes of the formation's original sprite art.
+!copyLoop:
+healthCopySource:
+    lda $ffff,y                             // Self-modified source address.
+healthCopyDest:
+    sta $ffff,y                             // Self-modified private destination address.
+    iny
+    cpy #64
+    bne !copyLoop-
+
+    ldx HEALTH_OBJECT_INDEX                 // Recover logical enemy to read its remaining HP.
+    lda OBJECT_HEALTH,x
+    tax                                     // X = 1..5 after a normal non-lethal hit.
+
+    lda healthBarByte0,x                    // Left third of the six-segment bar.
+    ldy #0                                // Sprite row 19, byte 0.
+    jsr storeHealthBarByte
+    ldy #3                                 // Duplicate on row 20 for a two-pixel-high bar.
+    jsr storeHealthBarByte
+
+    lda healthBarByte1,x                    // Middle third.
+    ldy #1
+    jsr storeHealthBarByte
+    ldy #4
+    jsr storeHealthBarByte
+
+    lda healthBarByte2,x                    // Right third.
+    ldy #2
+    jsr storeHealthBarByte
+    ldy #5
+    jsr storeHealthBarByte
+
+    ldx HEALTH_OBJECT_INDEX                 // Preserve damageEnemy's register contract.
+    rts
+
+// --- Routine: storeHealthBarByte -------------------------------------------
+// A = bar byte, Y = byte offset inside the already-patched private sprite.
+// Reuse the destination operand patched by updateEnemyHealthSprite.
+storeHealthBarByte:
+healthBarStore:
+    sta $ffff,y                             // Self-modified private sprite destination.
+    rts
+
+// Six HP occupy six equal two-multicolour-pixel chunks across the 24-pixel sprite.
+// Value %11 uses the sprite's individual VIC colour; zero remains transparent.
+// Index 0 is retained for completeness although zero HP immediately explodes.
+healthBarByte0:
+    .byte $00,$f0,$ff,$ff,$ff,$ff,$ff
+healthBarByte1:
+    .byte $00,$00,$00,$f0,$ff,$ff,$ff
+healthBarByte2:
+    .byte $00,$00,$00,$00,$00,$f0,$ff
 
 // --- Routine: updatePlayerCombatEffects ------------------------------------
 // Decay fire cadence and restore the normal player bitmap after muzzle flash.
@@ -484,19 +578,65 @@ updatePlayerCombatEffects:
     rts
 
 // --- Routine: updateEnemyHitEffects ----------------------------------------
-// Restore base colours after the hit flash and decay render-only recoil toward
-// zero without disturbing the enemy's actual table-driven path coordinates.
+// Advance enemy death presentation first. Living enemies then restore their hit
+// flash colour back to the formation's base colour.
 updateEnemyHitEffects:
-    ldx #1
+    ldx #1                                  // Logical object 0 is permanently the player.
 !loop:
     lda OBJECT_ACTIVE,x
-    beq !next+
+    bne !active+
+    jmp !next+                              // Routine is too large to branch directly to !next.
+!active:
     lda OBJECT_TYPE,x
     cmp #TYPE_ENEMY
-    bne !next+
+    beq !enemy+
+    jmp !next+
+!enemy:
 
+    lda OBJECT_DEATH_TIMER,x                // Non-zero means this enemy has exhausted its health.
+    beq !living+
+    dec OBJECT_DEATH_TIMER,x
+    beq !removeEnemy+                       // Animation finished: release the logical object slot.
+
+    lda OBJECT_DEATH_TIMER,x
+    cmp #8
+    bcs !deathFrame1+
+    cmp #4
+    bcs !deathFrame2+
+
+!deathFrame3:
+    lda #playerExplosion3 / 64
+    sta OBJECT_SPRITE,x
+    lda #2                                  // Red final breakup.
+    sta OBJECT_COLOUR,x
+    jmp !next+
+
+!deathFrame2:
+    lda #playerExplosion2 / 64
+    sta OBJECT_SPRITE,x
+    lda #8                                  // Orange middle blast.
+    sta OBJECT_COLOUR,x
+    jmp !next+
+
+!deathFrame1:
+    lda #playerExplosion1 / 64
+    sta OBJECT_SPRITE,x
+    lda #7                                  // Yellow initial blast.
+    sta OBJECT_COLOUR,x
+    jmp !next+
+
+!removeEnemy:
+    jsr awardKillScore                      // Death completed: award this enemy exactly once before releasing its slot.
+    lda #0
+    sta OBJECT_ACTIVE,x                     // Generic allocator can reuse this slot from the next spawn onward.
+    sta OBJECT_DEATH_TIMER,x
+    sta OBJECT_HIT_TIMER,x
+    sta OBJECT_HEALTH,x
+    jmp !next+
+
+!living:
     lda OBJECT_HIT_TIMER,x
-    beq !knockX+
+    beq !next+
     dec OBJECT_HIT_TIMER,x
     lda OBJECT_HIT_TIMER,x
     cmp #2
@@ -506,35 +646,23 @@ updateEnemyHitEffects:
 
     lda OBJECT_BASE_COLOUR,x                // Timer reached zero: restore formation colour.
     sta OBJECT_COLOUR,x
-    jmp !knockX+
+    jmp !next+
 
 !white:
     lda #1
     sta OBJECT_COLOUR,x
-    jmp !knockX+
+    jmp !next+
 
 !yellow:
     lda #7
     sta OBJECT_COLOUR,x
 
-!knockX:
-    lda OBJECT_KNOCK_X,x
-    beq !knockY+
-    bmi !negativeX+
-    dec OBJECT_KNOCK_X,x
-    jmp !knockY+
-!negativeX:
-    inc OBJECT_KNOCK_X,x
-
-!knockY:
-    lda OBJECT_KNOCK_Y,x
-    beq !next+
-    dec OBJECT_KNOCK_Y,x
-
 !next:
     inx
     cpx #MAX_OBJECTS
-    bne !loop-
+    beq !done+
+    jmp !loop-                              // Absolute jump avoids the 6502's ±128-byte branch limit.
+!done:
     rts
 
 // --- Routine: moveEnemyPath -------------------------------------------------
@@ -718,27 +846,12 @@ buildInitialSpriteSnapshot:
 
     ldx TEMP_OBJECT                         // Load X from TEMP_OBJECT.
 
-    lda OBJECT_X,x                          // Start with the path-owned 9-bit X coordinate.
-    clc
-    adc OBJECT_KNOCK_X,x                    // Add signed render-only horizontal recoil.
+    lda OBJECT_X,x                          // Snapshot the path-owned 9-bit X coordinate directly.
     sta INITIAL_X,y
     lda OBJECT_X_MSB,x
-    adc #0                                  // Carry from positive low-byte overflow.
     sta INITIAL_X_MSB,y
-    lda OBJECT_KNOCK_X,x
-    bpl !initialXReady+
-    lda INITIAL_X,y                         // Negative offsets that borrowed across $00 need the high byte reduced.
-    cmp OBJECT_X,x
-    bcc !initialXReady+                     // Low result wrapped upward only when subtraction crossed $00.
-    lda INITIAL_X_MSB,y                     // NMOS 6502 has no DEC absolute,Y addressing mode.
-    sec
-    sbc #1                                  // Reduce the ninth X byte after a negative-offset borrow.
-    sta INITIAL_X_MSB,y
-!initialXReady:
 
-    lda OBJECT_Y,x
-    sec
-    sbc OBJECT_KNOCK_Y,x
+    lda OBJECT_Y,x                          // Snapshot the path-owned Y coordinate directly.
     sta INITIAL_Y,y
     lda OBJECT_SPRITE,x                     // Load A from OBJECT_SPRITE,x.
     sta INITIAL_SPRITE,y                    // Store A in INITIAL_SPRITE,y.
@@ -896,24 +1009,12 @@ buildBatchSpriteSchedule:
 
     ldy TEMP_OBJECT                         // Load Y from TEMP_OBJECT.
 
-    lda OBJECT_X,y                          // Start with the path-owned 9-bit X coordinate.
-    clc
-    adc OBJECT_KNOCK_X,y                    // Add signed render-only horizontal recoil.
+    lda OBJECT_X,y                          // Snapshot the path-owned 9-bit X coordinate directly.
     sta ASSIGN_X,x
     lda OBJECT_X_MSB,y
-    adc #0
     sta ASSIGN_X_MSB,x
-    lda OBJECT_KNOCK_X,y
-    bpl !assignXReady+
-    lda ASSIGN_X,x
-    cmp OBJECT_X,y
-    bcc !assignXReady+
-    dec ASSIGN_X_MSB,x
-!assignXReady:
 
-    lda OBJECT_Y,y
-    sec
-    sbc OBJECT_KNOCK_Y,y
+    lda OBJECT_Y,y                          // Snapshot the path-owned Y coordinate directly.
     sta ASSIGN_Y,x
     lda OBJECT_SPRITE,y                     // Load A from OBJECT_SPRITE,y.
     sta ASSIGN_SPRITE,x                     // Store A in ASSIGN_SPRITE,x.
@@ -969,6 +1070,90 @@ buildBatchSpriteSchedule:
     jmp !startBatch-                        // Long loop transfer
 !done:
     rts                                     // Return to the calling routine.
+
+// --- Routine: setupScoreDisplay --------------------------------------------
+// Clear the 16-bit score and draw "SCORE 00000" at the top-right of screen RAM.
+setupScoreDisplay:
+    lda #0
+    sta SCORE_LO                            // Score begins at zero, low byte.
+    sta SCORE_HI                            // Score begins at zero, high byte.
+
+    ldx #0                                  // Copy the fixed label plus five decimal digits.
+!labelLoop:
+    lda scoreLabel,x
+    sta SCORE_SCREEN,x
+    lda #1                                  // C64 colour 1 = white.
+    sta SCORE_COLOUR,x
+    inx
+    cpx #11                                 // "SCORE " plus five digits.
+    bne !labelLoop-
+    rts
+
+// --- Routine: awardKillScore -----------------------------------------------
+// Add the fixed kill reward to the 16-bit binary score and refresh the HUD.
+// X is the logical enemy index in the caller, so preserve it across conversion.
+awardKillScore:
+    txa
+    pha                                     // Preserve updateEnemyHitEffects' object-loop X index.
+
+    lda SCORE_LO
+    clc
+    adc #<SCORE_PER_KILL
+    sta SCORE_LO
+    lda SCORE_HI
+    adc #>SCORE_PER_KILL
+    sta SCORE_HI
+
+    jsr displayScore
+
+    pla
+    tax                                     // Restore the dying enemy's logical object index.
+    rts
+
+// --- Routine: displayScore --------------------------------------------------
+// Convert the 16-bit binary score to five decimal digits at SCORE_SCREEN+6.
+// The existing decimal divisor table is shared with the FREE-cycle display.
+displayScore:
+    lda SCORE_LO
+    sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
+    lda SCORE_HI
+    sta SCORE_VALUE_HI
+
+    ldx #0                                  // Start at the 10000s decimal place.
+!digitLoop:
+    ldy #0                                  // Y counts how many times this divisor fits.
+!subtractLoop:
+    lda SCORE_VALUE_HI
+    cmp debugDivisorHi,x
+    bcc !emitDigit+
+    bne !subtract+
+    lda SCORE_VALUE_LO
+    cmp debugDivisorLo,x
+    bcc !emitDigit+
+
+!subtract:
+    lda SCORE_VALUE_LO
+    sec
+    sbc debugDivisorLo,x
+    sta SCORE_VALUE_LO
+    lda SCORE_VALUE_HI
+    sbc debugDivisorHi,x
+    sta SCORE_VALUE_HI
+    iny
+    bne !subtractLoop-
+
+!emitDigit:
+    tya
+    clc
+    adc #48                                 // Screen codes 48-57 display digits 0-9.
+    sta SCORE_SCREEN + 6,x
+    inx
+    cpx #5
+    bne !digitLoop-
+    rts
+
+scoreLabel:
+    .byte 19,3,15,18,5,32,48,48,48,48,48  // Screen codes for "SCORE 00000".
 
 // --- Routine: setupDebugDisplay --------------------------------------------
 // Draw "FREE 00000", colour it white, and initialise the rolling cycle minimum.
@@ -1583,7 +1768,8 @@ spawnEnemy:
 
     ldy WAVE_SPRITE_INDEX                  // Y selects this formation member's visual variant.
     lda enemySpriteSequence,y               // Read the sprite pointer chosen for this member.
-    sta OBJECT_SPRITE,x                     // Store sprite bitmap index.
+    sta OBJECT_SPRITE,x                     // Store currently rendered sprite bitmap index.
+    sta OBJECT_BASE_SPRITE,x                // Preserve original art for private health-bar sprite copies.
 
     lda enemyColourSequence,y               // Read this member's individual multicolour value.
     sta OBJECT_COLOUR,x                     // Store currently rendered enemy colour.
@@ -1593,8 +1779,7 @@ spawnEnemy:
     sta OBJECT_HEALTH,x                     // Every current enemy begins with the same provisional health.
     lda #0
     sta OBJECT_HIT_TIMER,x
-    sta OBJECT_KNOCK_X,x
-    sta OBJECT_KNOCK_Y,x
+    sta OBJECT_DEATH_TIMER,x                // Freshly spawned objects are alive, not inheriting a reused slot's death state.
 
     inc WAVE_SPRITE_INDEX                   // Advance only after a successful allocation/spawn.
 
@@ -1720,10 +1905,10 @@ HW_SPRITE_OFFSET:      .byte 0,2,4,6,8,10,12,14
 OBJECT_SPRITE:         .fill MAX_OBJECTS, 0
 OBJECT_COLOUR:         .fill MAX_OBJECTS, 0
 OBJECT_BASE_COLOUR:    .fill MAX_OBJECTS, 0     // Formation colour restored after impact flashing.
+OBJECT_BASE_SPRITE:    .fill MAX_OBJECTS, 0     // Immutable formation bitmap used to rebuild private health sprites.
 OBJECT_HEALTH:         .fill MAX_OBJECTS, 0     // Current enemy HP; player slot is presently unused.
 OBJECT_HIT_TIMER:      .fill MAX_OBJECTS, 0     // Remaining colour-flash frames after ballistic impact.
-OBJECT_KNOCK_X:        .fill MAX_OBJECTS, 0     // Signed render-only horizontal recoil.
-OBJECT_KNOCK_Y:        .fill MAX_OBJECTS, 0     // Positive render-only downward recoil.
+OBJECT_DEATH_TIMER:    .fill MAX_OBJECTS, 0     // Non-zero while an enemy death animation owns the active slot.
 SORTED_OBJECTS:        .fill MAX_OBJECTS, $ff
 SORTED_COUNT:          .byte 0
 
@@ -1784,6 +1969,10 @@ HITSCAN_DELTA_LO:      .byte 0         // Low byte of rayX - enemyX during inter
 HITSCAN_TARGET:        .byte $ff       // Logical object selected by the current ray.
 HITSCAN_TARGET_Y:      .byte 0         // Y of nearest qualifying target.
 
+HEALTH_OBJECT_INDEX:    .byte 0         // Logical enemy currently receiving a private health sprite.
+HEALTH_SOURCE_SPRITE:   .byte 0         // Original sprite pointer being copied.
+HEALTH_DEST_SPRITE:     .byte 0         // Private sprite pointer assigned to that logical slot.
+
 SCHED_OBJECT_INDEX:    .byte 0
 SCHED_ASSIGN_INDEX:    .byte 0
 SCHED_BATCH_SIZE:      .byte 0
@@ -1796,6 +1985,11 @@ RENDER_COUNT:          .fill 16, 0      // Initial hardware-sprite count per pla
 IRQ_ASSIGN_INDEX:      .byte 0
 IRQ_ASSIGN_END:        .byte 0
 IRQ_SELECTED_SLOT:     .byte $ff
+
+SCORE_LO:              .byte 0            // 16-bit binary score, low byte.
+SCORE_HI:              .byte 0            // 16-bit binary score, high byte.
+SCORE_VALUE_LO:        .byte 0            // Scratch copy used by decimal HUD conversion.
+SCORE_VALUE_HI:        .byte 0            // Scratch copy used by decimal HUD conversion.
 
 DEBUG_FRAME_COUNT:     .byte 0
 DEBUG_RASTER_LO:       .byte 0
@@ -2157,3 +2351,15 @@ patternSweep:
     .byte 28,  1,  1                       // Cross back down-right.
     .byte 28,  1,  2                       // Steepen the rightward dive.
     .byte $ff,$ff, 2                       // Continue final steep down-left vector until off-screen.
+
+
+// --- Private per-object health-bar sprite RAM -------------------------------
+// Object 0 is the player and does not use its slot, but reserving all 16 keeps
+// pointer calculation trivial: private pointer = HEALTH_SPRITE_BASE_PTR + objectID.
+* = HEALTH_SPRITE_BASE
+healthSpritePool:
+    .fill MAX_OBJECTS * 64, $00
+HEALTH_SPRITE_POOL_END:
+.if (HEALTH_SPRITE_POOL_END > $4000) {
+    .error "Health sprite pool exceeds VIC bank 0"
+}
