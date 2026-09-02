@@ -18,8 +18,17 @@
 .const FORMATION_COUNT = 4
 .const PATTERN_COUNT   = 4
 .const CIA1_TIMER_A_LO = $dc04
-.const WAVE_GAP        = 90                 // Frames between completed spawn formations.
+.const WAVE_GAP        = 150                 // Frames between completed spawn formations.
 .const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
+.const VIC_SPRITE_COLLISION = $d01e            // Reading clears the latched sprite/sprite collision bits.
+
+.const PLAYER_STATE_ALIVE      = 0
+.const PLAYER_STATE_EXPLODING  = 1
+.const PLAYER_STATE_RESPAWNING = 2
+.const PLAYER_START_X          = 160
+.const PLAYER_START_Y          = 220
+.const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
+.const PLAYER_RESPAWN_TIME     = 100            // Invulnerable blinking frames after repositioning.
 
 .const WAVE_COUNT          = 0
 .const WAVE_INTERVAL       = 1
@@ -73,6 +82,21 @@ init:
     //lda #1                                  // Load A from #1.
     //sta MOB_X_VEL                           // Enemy horizontal speed
 
+    lda #PLAYER_START_X                     // Reset player low X coordinate to its normal start point.
+    sta OBJECT_X                            // Object 0 is permanently player-owned.
+    lda #0                                  // Player start X is within the low 256-pixel range.
+    sta OBJECT_X_MSB
+    lda #PLAYER_START_Y                     // Reset player Y coordinate near the bottom of the playfield.
+    sta OBJECT_Y
+
+    lda #PLAYER_STATE_ALIVE                 // Begin in the normal controllable/collidable state.
+    sta PLAYER_STATE
+    lda #0
+    sta PLAYER_HIT
+    sta PLAYER_STATE_TIMER
+    sta PLAYER_EXPLOSION_FRAME
+    sta PLAYER_BLINK_TIMER
+
     lda #1                                  // Load A from #1.
     sta OBJECT_ACTIVE                       // Object 0 = player
     lda #TYPE_PLAYER                        // Load A from #TYPE_PLAYER.
@@ -117,6 +141,7 @@ mainLoop:
 
 !frameLoop:
     jsr updateObjects                       // Call updateObjects; return here when it executes RTS.
+    jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
     jsr updateSpawner                       // Periodically create a new enemy.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
@@ -199,7 +224,11 @@ updateObjects:
 // --- Routine: updatePlayer --------------------------------------------------
 // Read joystick port 2 once and move object X within the playfield bounds.
 updatePlayer:
-    lda STICK_2                             // Load A from STICK_2.
+    lda PLAYER_STATE                        // Check whether the player is currently exploding.
+    cmp #PLAYER_STATE_EXPLODING
+    beq !done+                              // Explosion freezes movement; respawning still allows control.
+
+    lda STICK_2
     sta JOY_STATE                           // Store A in JOY_STATE.
 
     lda JOY_STATE                           // Load A from JOY_STATE.
@@ -446,6 +475,8 @@ buildInitialSpriteSnapshot:
     sta INITIAL_SPRITE,y                    // Store A in INITIAL_SPRITE,y.
     lda OBJECT_COLOUR,x                     // Load A from OBJECT_COLOUR,x.
     sta INITIAL_COLOUR,y                    // Store A in INITIAL_COLOUR,y.
+    txa                                     // Copy the logical object index into A.
+    sta INITIAL_OBJECT,y                    // Remember which logical object owns this hardware snapshot entry.
 
     lda SNAPSHOT_INDEX                      // Load A from SNAPSHOT_INDEX.
     sec                                     // Set carry before subtraction or a carry-dependent operation.
@@ -604,6 +635,8 @@ buildBatchSpriteSchedule:
     sta ASSIGN_SPRITE,x                     // Store A in ASSIGN_SPRITE,x.
     lda OBJECT_COLOUR,y                     // Load A from OBJECT_COLOUR,y.
     sta ASSIGN_COLOUR,x                     // Store A in ASSIGN_COLOUR,x.
+    tya                                     // Copy the logical object index into A.
+    sta ASSIGN_OBJECT,x                     // Remember which object will own the recycled hardware slot.
 
     inc SCHED_ASSIGN_INDEX                  // Increment SCHED_ASSIGN_INDEX by one.
     inc SCHED_BATCH_SIZE                    // Increment SCHED_BATCH_SIZE by one.
@@ -826,7 +859,10 @@ waitForFrameStart:
 // --- Routine: renderSprites -------------------------------------------------
 // Write LIVE_PLAN's initial hardware-sprite snapshot to VIC-II.
 renderSprites:
+    jsr capturePlayerCollision              // Consume collisions using the hardware ownership from the previous raster interval.
+
     lda #0                                  // Load A from #0.
+    sta PLAYER_HW_MASK                      // Rebuild the player's current hardware-slot mask from this LIVE snapshot.
     sta TEMP_MSB                            // Store A in TEMP_MSB.
 
     ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
@@ -850,6 +886,12 @@ renderSprites:
     sta HW_SPRITE_POINTER,x                 // Store A in HW_SPRITE_POINTER,x.
     lda INITIAL_COLOUR,y                    // Load A from INITIAL_COLOUR,y.
     sta HW_SPRITE_COLOUR,x                  // Store A in HW_SPRITE_COLOUR,x.
+
+    lda INITIAL_OBJECT,y                    // Which logical object owns this snapshot entry?
+    bne !notPlayer+                         // Object 0 is permanently reserved for the player.
+    lda HW_BIT_MASK,x                       // Convert the hardware sprite slot into its collision bit.
+    sta PLAYER_HW_MASK                      // Remember where the player currently lives in VIC hardware.
+!notPlayer:
 
     lda INITIAL_X,y                         // Load A from INITIAL_X,y.
     sta TEMP_OBJECT_Y                       // Store A in TEMP_OBJECT_Y.
@@ -938,6 +980,8 @@ multiplexIRQ:
     jmp $ea31                               // Let the normal KERNAL IRQ handler deal with it.
 
 !raster:
+    jsr capturePlayerCollision              // Consume $D01E before this batch changes hardware-sprite ownership.
+
     lda BATCH_INDEX                         // Load A from BATCH_INDEX.
     clc                                     // Clear carry before an addition or shift-dependent operation.
     adc LIVE_PLAN                           // Add LIVE_PLAN to A, including carry.
@@ -959,6 +1003,17 @@ multiplexIRQ:
     lda ASSIGN_SLOT,y                       // Load A from ASSIGN_SLOT,y.
     sta IRQ_SELECTED_SLOT                   // Store A in IRQ_SELECTED_SLOT.
     ldx IRQ_SELECTED_SLOT                   // Load X from IRQ_SELECTED_SLOT.
+
+    lda HW_BIT_MASK,x                       // Get the bit belonging to the hardware slot being recycled.
+    eor #$ff                                // Invert it into a clear-mask.
+    and PLAYER_HW_MASK                      // Remove this slot from the player mask if the player previously owned it.
+    sta PLAYER_HW_MASK                      // Ownership is about to change.
+
+    lda ASSIGN_OBJECT,y                     // Read the logical object taking ownership of this slot.
+    bne !assignmentNotPlayer+               // Non-zero means an enemy/other object.
+    lda HW_BIT_MASK,x                       // Object 0 is the player, so capture its new hardware slot.
+    sta PLAYER_HW_MASK
+!assignmentNotPlayer:
 
     lda ASSIGN_SPRITE,y                     // Load A from ASSIGN_SPRITE,y.
     sta HW_SPRITE_POINTER,x                 // Store A in HW_SPRITE_POINTER,x.
@@ -1015,6 +1070,152 @@ multiplexIRQ:
     lda #0                                  // Reset batch position for the next frame.
     sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
     jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
+
+// --- Routine: capturePlayerCollision ---------------------------------------
+// Read VIC-II's latched sprite/sprite collision register while PLAYER_HW_MASK
+// still describes the current hardware ownership. A collision involving the
+// player's slot sets PLAYER_HIT; the identity of the other sprite is irrelevant.
+capturePlayerCollision:
+    lda VIC_SPRITE_COLLISION                // Always read/clear the VIC latch, even while invulnerable.
+    ldy PLAYER_STATE                        // Is the player currently vulnerable?
+    bne !done+                              // No: ignore collisions during explosion/respawn.
+    and PLAYER_HW_MASK                      // Did the player's current hardware slot participate?
+    beq !done+                              // No: nothing for gameplay to record.
+
+    lda #1                                  // Record a logical player-hit event.
+    sta PLAYER_HIT                          // Main-loop gameplay code consumes this later.
+
+!done:
+    rts                                     // Return without modifying object ownership.
+
+// --- Routine: updatePlayerState --------------------------------------------
+// Consume PLAYER_HIT and run the player death presentation. Object 0 is never
+// freed: it changes sprite/state, then returns to the fixed player start point.
+updatePlayerState:
+    lda PLAYER_STATE                        // Dispatch the player's current gameplay state.
+    cmp #PLAYER_STATE_ALIVE
+    beq !alive+
+    cmp #PLAYER_STATE_EXPLODING
+    beq !exploding+
+    jmp !respawning+
+
+!alive:
+    lda PLAYER_HIT                          // Has collision capture reported a vulnerable-player impact?
+    bne !beginExplosion+                    // Yes: start the death presentation.
+    rts                                     // No: normal play continues.
+
+!beginExplosion:
+
+    lda #0                                  // Consume the latched collision event.
+    sta PLAYER_HIT
+
+    lda #PLAYER_STATE_EXPLODING             // Freeze controls and begin the explosion animation.
+    sta PLAYER_STATE
+    lda #0
+    sta PLAYER_EXPLOSION_FRAME
+    lda #PLAYER_EXPLOSION_HOLD
+    sta PLAYER_STATE_TIMER
+
+    lda #playerExplosion1 / 64              // First explosion frame replaces the ship in object 0.
+    sta OBJECT_SPRITE
+    lda #7                                  // Yellow flash for the initial blast.
+    sta OBJECT_COLOUR
+    rts
+
+!exploding:
+    dec PLAYER_STATE_TIMER                  // Hold the current explosion frame for a few video frames.
+    beq !advanceExplosion+                  // Timer expired: select the next bitmap.
+    rts                                     // Otherwise keep showing the current frame.
+
+!advanceExplosion:
+
+    inc PLAYER_EXPLOSION_FRAME              // Advance to the next explosion bitmap.
+    lda PLAYER_EXPLOSION_FRAME
+    cmp #1
+    beq !explosion2+
+    cmp #2
+    beq !explosion3+
+    cmp #3
+    beq !explosion4+
+    jmp !startRespawn+                      // Four frames shown: reposition and enter invulnerability.
+
+!explosion2:
+    lda #playerExplosion2 / 64
+    sta OBJECT_SPRITE
+    lda #8                                  // Orange.
+    sta OBJECT_COLOUR
+    jmp !reloadExplosion+
+
+!explosion3:
+    lda #playerExplosion3 / 64
+    sta OBJECT_SPRITE
+    lda #2                                  // Red.
+    sta OBJECT_COLOUR
+    jmp !reloadExplosion+
+
+!explosion4:
+    lda #playerExplosion4 / 64
+    sta OBJECT_SPRITE
+    lda #9                                  // Brown/dark blast fringe.
+    sta OBJECT_COLOUR
+
+!reloadExplosion:
+    lda #PLAYER_EXPLOSION_HOLD
+    sta PLAYER_STATE_TIMER
+    rts
+
+!startRespawn:
+    lda #PLAYER_START_X                     // Move the permanently-owned player object back to start.
+    sta OBJECT_X
+    lda #0
+    sta OBJECT_X_MSB
+    lda #PLAYER_START_Y
+    sta OBJECT_Y
+
+    lda #playerSprite / 64                  // Restore the normal player ship bitmap.
+    sta OBJECT_SPRITE
+    lda #2                                  // Restore the normal player individual colour.
+    sta OBJECT_COLOUR
+
+    lda #PLAYER_RESPAWN_TIME                // Start the invulnerable blinking period.
+    sta PLAYER_STATE_TIMER
+    lda #0
+    sta PLAYER_BLINK_TIMER
+    lda #PLAYER_STATE_RESPAWNING
+    sta PLAYER_STATE
+    rts
+
+!respawning:
+    dec PLAYER_STATE_TIMER                  // Count down invulnerability.
+    beq !finishRespawn+
+
+    inc PLAYER_BLINK_TIMER                  // Toggle visibility every four frames.
+    lda PLAYER_BLINK_TIMER
+    and #%00000100
+    beq !showPlayer+
+
+    lda #blankSprite / 64                   // Keep player active but render an empty sprite.
+    sta OBJECT_SPRITE
+    rts
+
+!showPlayer:
+    lda #playerSprite / 64                  // Restore visible player sprite for this blink phase.
+    sta OBJECT_SPRITE
+    rts
+
+!finishRespawn:
+    lda #playerSprite / 64                  // Ensure normal ship sprite is restored.
+    sta OBJECT_SPRITE
+
+    lda #0
+    sta PLAYER_HIT                          // Discard any stale hit state.
+
+    lda #PLAYER_STATE_ALIVE
+    sta PLAYER_STATE
+    rts
+
+!done:
+    rts
 
 // --- Routine: startRandomWave ------------------------------------------------
 // Choose one spawn formation and one movement pattern independently.
@@ -1264,12 +1465,21 @@ INITIAL_Y:             .fill 16, 0
 INITIAL_X_MSB:         .fill 16, 0
 INITIAL_SPRITE:        .fill 16, 0
 INITIAL_COLOUR:        .fill 16, 0
+INITIAL_OBJECT:        .fill 16, $ff    // Logical owner for each initial LIVE/BUILD hardware snapshot entry.
 
 ASSIGN_X:              .fill 16, 0
 ASSIGN_Y:              .fill 16, 0
 ASSIGN_X_MSB:          .fill 16, 0
 ASSIGN_SPRITE:         .fill 16, 0
 ASSIGN_COLOUR:         .fill 16, 0
+ASSIGN_OBJECT:         .fill 16, $ff    // Logical owner installed by each raster assignment.
+
+PLAYER_HW_MASK:        .byte 0         // Current VIC hardware bit occupied by logical object 0.
+PLAYER_HIT:            .byte 0         // Latched vulnerable-player collision event.
+PLAYER_STATE:          .byte 0         // Alive, exploding, or respawning.
+PLAYER_STATE_TIMER:    .byte 0         // Explosion-frame hold or respawn-invulnerability countdown.
+PLAYER_EXPLOSION_FRAME:.byte 0         // Current explosion bitmap index 0-3.
+PLAYER_BLINK_TIMER:    .byte 0         // Free-running respawn visibility phase.
 
 SCHED_OBJECT_INDEX:    .byte 0
 SCHED_ASSIGN_INDEX:    .byte 0
@@ -1328,6 +1538,102 @@ playerSprite:
     .byte $02,$82,$80
     .byte $02,$82,$80
     .byte $00            // 64th padding byte
+
+playerExplosion1:
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00,$10,$00
+    .byte $00,$b8,$00
+    .byte $02,$fe,$00
+    .byte $03,$ef,$00
+    .byte $0b,$ab,$80
+    .byte $1e,$ba,$d0
+    .byte $0b,$ff,$80
+    .byte $02,$ee,$00
+    .byte $03,$bb,$00
+    .byte $0b,$ef,$80
+    .byte $1e,$fe,$d0
+    .byte $0b,$ab,$80
+    .byte $03,$ef,$00
+    .byte $02,$fe,$00
+    .byte $00,$b8,$00
+    .byte $00,$10,$00
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
+
+playerExplosion2:
+    .byte $00,$41,$00
+    .byte $04,$00,$10
+    .byte $00,$82,$00
+    .byte $12,$eb,$84
+    .byte $0b,$82,$e0
+    .byte $0e,$3c,$b0
+    .byte $68,$eb,$29
+    .byte $33,$82,$cc
+    .byte $22,$3c,$88
+    .byte $0c,$eb,$30
+    .byte $48,$be,$21
+    .byte $0c,$eb,$30
+    .byte $22,$3c,$88
+    .byte $33,$82,$cc
+    .byte $68,$eb,$29
+    .byte $0e,$3c,$b0
+    .byte $0b,$82,$e0
+    .byte $12,$eb,$84
+    .byte $00,$82,$00
+    .byte $04,$00,$10
+    .byte $00,$41,$00
+    .byte $00                              // 64th padding byte
+
+playerExplosion3:
+    .byte $40,$00,$01
+    .byte $02,$00,$80
+    .byte $10,$3c,$04
+    .byte $08,$c3,$20
+    .byte $03,$28,$c0
+    .byte $20,$82,$08
+    .byte $0e,$00,$b0
+    .byte $40,$3c,$01
+    .byte $30,$c3,$0c
+    .byte $08,$00,$20
+    .byte $08,$00,$20
+    .byte $30,$c3,$0c
+    .byte $40,$3c,$01
+    .byte $0e,$00,$b0
+    .byte $20,$82,$08
+    .byte $03,$28,$c0
+    .byte $08,$c3,$20
+    .byte $10,$3c,$04
+    .byte $02,$00,$80
+    .byte $40,$00,$01
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
+
+playerExplosion4:
+    .byte $04,$00,$10
+    .byte $40,$00,$01
+    .byte $00,$82,$00
+    .byte $20,$00,$08
+    .byte $03,$00,$c0
+    .byte $08,$00,$20
+    .byte $40,$3c,$01
+    .byte $00,$00,$00
+    .byte $30,$00,$0c
+    .byte $02,$00,$80
+    .byte $02,$00,$80
+    .byte $30,$00,$0c
+    .byte $00,$00,$00
+    .byte $40,$3c,$01
+    .byte $08,$00,$20
+    .byte $03,$00,$c0
+    .byte $20,$00,$08
+    .byte $00,$82,$00
+    .byte $40,$00,$01
+    .byte $04,$00,$10
+    .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
 
 enemySpriteA:
     .byte $00,$28,$00
@@ -1424,6 +1730,9 @@ enemySpriteD:
     .byte $00,$00,$00
     .byte $00,$00,$00
     .byte $00                              // 64th padding byte
+
+blankSprite:
+    .fill 64, $00
 
 // --- Spawn formations -------------------------------------------------------
 // Formation data is stored as parallel tables indexed 0-3.  Movement is not
