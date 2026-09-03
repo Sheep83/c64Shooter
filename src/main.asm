@@ -6,6 +6,12 @@
 .const MAX_OBJECTS = 16
 .const TYPE_PLAYER = 1
 .const TYPE_ENEMY  = 2
+.const TYPE_ENEMY_BULLET = 3
+
+.const MAX_ENEMY_BULLETS = 3
+.const ENEMY_FIRE_INTERVAL = 64              // Global frames between successful/attempted enemy shots.
+.const ENEMY_BULLET_SPEED_Y = 3              // Fixed downward speed; X is quantised to a smooth -2..+2 slope.
+.const ENEMY_BULLET_COLOUR = 7               // Yellow individual sprite colour for the first projectile pass.
 
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
@@ -142,6 +148,9 @@ init:
     sta PLAYER_BLINK_TIMER
     sta PLAYER_FIRE_COOLDOWN_TIMER
     sta PLAYER_MUZZLE_TIMER
+    sta ENEMY_BULLET_COUNT                  // No hostile projectiles exist at game start.
+    lda #ENEMY_FIRE_INTERVAL
+    sta ENEMY_FIRE_TIMER                    // Give the opening wave a short grace period before the first shot.
 
     lda #1                                  // Load A from #1.
     sta OBJECT_ACTIVE                       // Object 0 = player
@@ -189,6 +198,7 @@ mainLoop:
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
     jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
+    jsr updateEnemyFire                     // Let at most one eligible enemy launch an aimed projectile.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
     jsr updateSpawner                       // Periodically create a new enemy.
     jsr updateStarfield                     // Scroll and twinkle the character background.
@@ -547,10 +557,16 @@ updateObjects:
 
 !enemy:
     cmp #TYPE_ENEMY                         // Compare A with #TYPE_ENEMY; set flags, leaving A unchanged.
-    bne !next+                              // Branch to !next+ if the previous result was non-zero/not equal.
+    bne !bullet+                            // Other active object types have their own movement rules.
     lda OBJECT_DEATH_TIMER,x                // A dying enemy remains renderable but no longer follows its path.
     bne !next+
     jsr moveEnemyPath
+    jmp !next+
+
+!bullet:
+    cmp #TYPE_ENEMY_BULLET                  // Hostile projectile objects use their stored fixed launch vector.
+    bne !next+
+    jsr moveEnemyBullet
 !next:
     inx                                     // Increment X by one.
     cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
@@ -978,6 +994,241 @@ updateEnemyHitEffects:
     cpx #MAX_OBJECTS
     beq !done+
     jmp !loop-                              // Absolute jump avoids the 6502's ±128-byte branch limit.
+!done:
+    rts
+
+// --- Routine: updateEnemyFire ----------------------------------------------
+// Enemy fire is globally capped at three active bullets.  A shot is aimed once
+// at the player's current X and the bottom of the screen, then follows a fixed,
+// smooth integer vector; it never homes after launch.
+//
+// For v1, only enemies in the useful central playfield window may fire and an
+// enemy already coasting out of its attack is ignored.  The CIA timer chooses
+// the first logical slot inspected so the same formation member does not always
+// get first refusal.
+updateEnemyFire:
+    lda ENEMY_FIRE_TIMER                    // Global cadence prevents every enemy firing independently.
+    beq !tryFire+
+    dec ENEMY_FIRE_TIMER                    // Consume one frame of the current fire delay.
+    rts
+
+!tryFire:
+    lda #ENEMY_FIRE_INTERVAL                // Restart cadence even if no suitable shooter exists this frame.
+    sta ENEMY_FIRE_TIMER
+
+    lda ENEMY_BULLET_COUNT                  // Respect the hard global projectile ceiling.
+    cmp #MAX_ENEMY_BULLETS
+    bcs !done+
+
+    lda CIA1_TIMER_A_LO                     // Cheap changing seed is sufficient for choosing a shooter.
+    and #%00001111                          // Restrict candidate logical index to 0..15.
+    bne !haveStart+
+    lda #1                                  // Object 0 is permanently the player.
+!haveStart:
+    tax
+    lda #15                                 // At most inspect every non-player logical slot once.
+    sta ENEMY_FIRE_SCAN_COUNT
+
+!scan:
+    lda OBJECT_ACTIVE,x                     // Candidate must currently exist.
+    beq !next+
+    lda OBJECT_TYPE,x                       // Only living enemy craft may originate shots.
+    cmp #TYPE_ENEMY
+    bne !next+
+    lda OBJECT_DEATH_TIMER,x                // Dying/exploding enemies cannot fire.
+    bne !next+
+    lda OBJECT_PATH_TIMER,x                 // $ff marks the momentum-only egress phase.
+    cmp #$ff
+    beq !next+
+    lda OBJECT_Y,x                          // Keep firing to the readable middle of an attack.
+    cmp #64
+    bcc !next+
+    cmp #150
+    bcs !next+
+
+    stx ENEMY_FIRE_SOURCE                   // Preserve shooter while the allocator searches for a bullet slot.
+    jsr spawnEnemyBullet
+    rts                                     // One global firing attempt per cadence is enough.
+
+!next:
+    inx                                     // Move to the next logical slot.
+    cpx #MAX_OBJECTS
+    bne !noWrap+
+    ldx #1                                  // Wrap around while continuing to exclude player object 0.
+!noWrap:
+    dec ENEMY_FIRE_SCAN_COUNT
+    bne !scan-
+
+!done:
+    rts
+
+// --- Routine: spawnEnemyBullet ---------------------------------------------
+// Allocate one hostile projectile and choose the nearest clean integer slope
+// toward the player's X at firing time.  Vertical speed is always +3.
+// Horizontal speed is quantised to -2,-1,0,+1,+2 so every bullet moves smoothly
+// every frame instead of using a visibly irregular fractional stepping pattern.
+spawnEnemyBullet:
+    jsr findFreeObject                      // Bullets share the logical pool and renderer with every other sprite.
+    bcc !allocated+                         // Keep the short relative branch local.
+    jmp !failed+                            // Absolute jump handles the longer failure path safely.
+
+!allocated:
+    stx ENEMY_BULLET_OBJECT                 // X now belongs to the newly allocated projectile.
+    ldy ENEMY_FIRE_SOURCE                   // Y addresses the enemy that actually fired.
+
+    lda OBJECT_X,y                          // Launch from the shooter's sprite origin.
+    sta OBJECT_X,x
+    lda OBJECT_X_MSB,y
+    sta OBJECT_X_MSB,x
+    lda OBJECT_Y,y
+    clc
+    adc #12                                 // Start just below the enemy body.
+    sta OBJECT_Y,x
+
+    lda #TYPE_ENEMY_BULLET
+    sta OBJECT_TYPE,x
+    lda #enemyBulletSprite / 64
+    sta OBJECT_SPRITE,x
+    sta OBJECT_BASE_SPRITE,x                // Harmless bookkeeping consistency for the generic object arrays.
+    lda #ENEMY_BULLET_COLOUR
+    sta OBJECT_COLOUR,x
+    sta OBJECT_BASE_COLOUR,x
+
+    lda #0
+    sta OBJECT_HEALTH,x
+    sta OBJECT_HIT_TIMER,x
+    sta OBJECT_DEATH_TIMER,x
+    sta OBJECT_PATH_TIMER,x
+    sta OBJECT_PATH_STEP,x
+    sta OBJECT_ACCEL_TIMER,x
+    sta OBJECT_VEL_X,x                      // Default trajectory is straight down.
+    lda #ENEMY_BULLET_SPEED_Y
+    sta OBJECT_VEL_Y,x
+
+    // Work out whether the player is left or right of the projectile using the
+    // full 9-bit X coordinate.  The magnitude is reduced to a practical byte;
+    // anything beyond 255 pixels is necessarily in the steepest X bucket.
+    lda OBJECT_X                            // playerX low
+    sec
+    sbc OBJECT_X,x                          // playerX - bulletX low
+    sta ENEMY_AIM_DELTA_LO
+    lda OBJECT_X_MSB
+    sbc OBJECT_X_MSB,x                      // signed high byte of the 9-bit difference
+    beq !targetRight+
+    cmp #$ff
+    beq !targetLeft+
+
+    // A larger 9-bit separation: direction is determined by the sign/high byte
+    // and the nearest useful trajectory is necessarily the strongest slope.
+    bmi !farLeft+
+    lda #2
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+!farLeft:
+    lda #$fe                                // -2
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+
+!targetRight:
+    lda ENEMY_AIM_DELTA_LO                  // Positive low-byte separation.
+    jsr chooseEnemyBulletSlope
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+
+!targetLeft:
+    lda ENEMY_AIM_DELTA_LO                  // Convert two's-complement low byte to positive magnitude.
+    eor #$ff
+    clc
+    adc #1
+    jsr chooseEnemyBulletSlope              // A returns positive 0..2 magnitude.
+    beq !activate+
+    eor #$ff                                // Negate the chosen magnitude for a leftward trajectory.
+    clc
+    adc #1
+    sta OBJECT_VEL_X,x
+
+!activate:
+    lda #1
+    sta OBJECT_ACTIVE,x                     // Publish the projectile only after every field is complete.
+    inc ENEMY_BULLET_COUNT
+    clc
+    rts
+
+!failed:
+    sec
+    rts
+
+// --- Routine: chooseEnemyBulletSlope ---------------------------------------
+// Entry: A = absolute horizontal distance to the player's snapshotted X.
+// Exit:  A = clean horizontal velocity magnitude 0, 1 or 2.
+//
+// These thresholds intentionally favour smooth-looking trajectories over exact
+// mathematical interception.  They correspond to nearby "good" aiming points;
+// later difficulty levels can bias the target X before this quantisation to lead
+// a moving player.
+chooseEnemyBulletSlope:
+    cmp #24                                 // Close enough horizontally: a vertical shot is the cleanest trajectory.
+    bcc !straight+
+    cmp #72                                 // Moderate separation: one pixel sideways per frame.
+    bcc !medium+
+    lda #2                                  // Wide separation: two pixels sideways per frame.
+    rts
+!medium:
+    lda #1
+    rts
+!straight:
+    lda #0
+    rts
+
+// --- Routine: moveEnemyBullet ----------------------------------------------
+// Apply the projectile's immutable launch vector.  Bullets disappear when they
+// leave either horizontal side or reach the bottom of the visible playfield.
+moveEnemyBullet:
+    lda OBJECT_VEL_X,x
+    beq !moveY+
+    bmi !left+
+
+    clc                                     // Positive bullet X velocity.
+    adc OBJECT_X,x
+    sta OBJECT_X,x
+    bcc !rightEdge+
+    inc OBJECT_X_MSB,x
+!rightEdge:
+    lda OBJECT_X_MSB,x
+    cmp #2
+    bcs !remove+
+    cmp #1
+    bne !moveY+
+    lda OBJECT_X,x
+    cmp #$59                                // 345+, beyond the useful right edge.
+    bcs !remove+
+    jmp !moveY+
+
+!left:
+    clc                                     // Add signed negative velocity to the low byte.
+    adc OBJECT_X,x
+    sta OBJECT_X,x
+    bcs !moveY+                             // No borrow means high byte remains unchanged.
+    lda OBJECT_X_MSB,x
+    beq !remove+                            // Borrow from X=0 means projectile has left the screen.
+    dec OBJECT_X_MSB,x
+
+!moveY:
+    lda OBJECT_Y,x
+    clc
+    adc #ENEMY_BULLET_SPEED_Y
+    bcs !remove+                            // Byte overflow is definitely below the screen.
+    sta OBJECT_Y,x
+    cmp #250
+    bcs !remove+
+    rts
+
+!remove:
+    lda #0
+    sta OBJECT_ACTIVE,x
+    lda ENEMY_BULLET_COUNT
+    beq !done+                              // Defensive guard against an accidental double release.
+    dec ENEMY_BULLET_COUNT
 !done:
     rts
 
@@ -1943,75 +2194,158 @@ multiplexIRQ:
     jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
 
 // --- Routine: capturePlayerCollision ---------------------------------------
-// Read and clear the VIC sprite/sprite collision latch while PLAYER_HW_MASK
-// still describes the hardware ownership for the raster interval just ended.
-//
-// $d01e tells us only which hardware sprites participated in some collision;
-// it does not tell us which pair touched. A dying enemy is still an enabled
-// VIC sprite, so its explosion can therefore set the player's collision bit.
-// Treat the VIC latch as a cheap broad-phase trigger, then confirm gameplay
-// collision against active, living logical enemies with a 24x21 AABB test.
+// $d01e remains the cheap hardware broad phase.  If the player's current VIC
+// slot participated, scan logical gameplay objects and let compact helper
+// routines confirm the actual overlap.  Keeping the scan itself short also
+// avoids 6502 relative-branch range problems as collision rules grow.
 capturePlayerCollision:
     lda VIC_SPRITE_COLLISION                // Always read/clear the VIC latch, even while invulnerable.
-    ldy PLAYER_STATE                        // Is the player currently vulnerable?
-    bne !done+                              // No: ignore collisions during explosion/respawn.
-    and PLAYER_HW_MASK                      // Did the player's current hardware slot participate?
-    beq !done+                              // No: nothing for gameplay to confirm.
+    ldy PLAYER_STATE
+    beq !playerAlive+
+    rts
 
-    ldx #1                                  // Logical object 0 is permanently the player.
-!scanEnemy:
-    lda OBJECT_ACTIVE,x                     // Ignore free object slots.
-    beq !nextEnemy+
-    lda OBJECT_TYPE,x                       // Only enemies can damage the player here.
+!playerAlive:
+    and PLAYER_HW_MASK
+    bne !playerCollision+
+    rts
+
+!playerCollision:
+    ldx #1
+!scan:
+    lda OBJECT_ACTIVE,x
+    bne !active+
+    jmp !next+
+
+!active:
+    lda OBJECT_TYPE,x
     cmp #TYPE_ENEMY
-    bne !nextEnemy+
-    lda OBJECT_DEATH_TIMER,x                // Explosion sprites are presentation only and cannot hurt the player.
-    bne !nextEnemy+
+    bne !checkBullet+
 
-    lda OBJECT_X,x                          // Compute enemyX - playerX as a 9-bit signed delta.
-    sec
-    sbc OBJECT_X
-    tay                                     // Keep the low byte while A checks the high-byte/sign.
-    lda OBJECT_X_MSB,x
-    sbc OBJECT_X_MSB
-    beq !enemyRightOrEqual+                 // High byte 0 = enemy is on/right of player.
-    cmp #$ff                                // High byte $ff = a small negative delta.
-    bne !nextEnemy+                         // Any other result is much too far away horizontally.
-    tya
-    cmp #$e9                                // $e9..$ff represents -23..-1.
-    bcc !nextEnemy+                         // -24 or farther means the 24-pixel boxes do not overlap.
-    jmp !checkVertical+
+    lda OBJECT_DEATH_TIMER,x                // Explosion sprites are presentation only.
+    bne !next+
+    jsr checkEnemyPlayerOverlap             // Carry set means this living enemy overlaps the player.
+    bcs !hit+
+    jmp !next+
 
-!enemyRightOrEqual:
-    tya
-    cmp #24                                 // 0..23 overlaps the player's 24-pixel width.
-    bcs !nextEnemy+
+!checkBullet:
+    cmp #TYPE_ENEMY_BULLET
+    bne !next+
+    jsr checkBulletPlayerOverlap            // Carry set means the small projectile box overlaps the player.
+    bcc !next+
 
-!checkVertical:
-    lda OBJECT_Y,x                          // Compute enemyY - playerY.
-    sec
-    sbc OBJECT_Y
-    bcs !enemyBelowOrEqual+                 // Carry set means zero or positive.
-    cmp #$ec                                // $ec..$ff represents -20..-1.
-    bcc !nextEnemy+                         // -21 or farther means the 21-pixel boxes do not overlap.
-    jmp !confirmedHit+
+!hit:
+    lda #1
+    sta PLAYER_HIT
+    rts
 
-!enemyBelowOrEqual:
-    cmp #21                                 // 0..20 overlaps the player's 21-pixel height.
-    bcs !nextEnemy+
-
-!confirmedHit:
-    lda #1                                  // A living logical enemy genuinely overlaps the player.
-    sta PLAYER_HIT                          // Main-loop gameplay code consumes this later.
-    rts                                     // One confirmed hit is sufficient.
-
-!nextEnemy:
-    inx                                     // Try the next logical object slot.
+!next:
+    inx
     cpx #MAX_OBJECTS
-    bne !scanEnemy-
+    beq !done+
+    jmp !scan-
 
 !done:
-    rts                                     // No living enemy overlaps the player.
+    rts
+
+// --- Routine: checkEnemyPlayerOverlap --------------------------------------
+// Entry: X = logical enemy object.
+// Exit:  C set if its 24x21 body overlaps the player's 24x21 body.
+checkEnemyPlayerOverlap:
+    lda OBJECT_X,x                          // enemyX - playerX, full 9-bit signed delta.
+    sec
+    sbc OBJECT_X
+    tay
+    lda OBJECT_X_MSB,x
+    sbc OBJECT_X_MSB
+    beq !enemyRight+
+    cmp #$ff
+    beq !enemyLeft+
+    clc
+    rts
+
+!enemyLeft:
+    tya
+    cmp #$e9                                // -23..-1 overlaps a 24-pixel player body.
+    bcs !enemyVertical+
+    clc
+    rts
+
+!enemyRight:
+    tya
+    cmp #24
+    bcc !enemyVertical+
+    clc
+    rts
+
+!enemyVertical:
+    lda OBJECT_Y,x
+    sec
+    sbc OBJECT_Y
+    bcs !enemyBelow+
+    cmp #$ec                                // -20..-1 overlaps a 21-pixel player body.
+    bcs !enemyHit+
+    clc
+    rts
+
+!enemyBelow:
+    cmp #21
+    bcc !enemyHit+
+    clc
+    rts
+
+!enemyHit:
+    sec
+    rts
+
+// --- Routine: checkBulletPlayerOverlap -------------------------------------
+// Entry: X = logical hostile projectile.
+// Exit:  C set if its compact 8x8 lethal area overlaps the 24x21 player body.
+checkBulletPlayerOverlap:
+    lda OBJECT_X,x
+    sec
+    sbc OBJECT_X
+    tay
+    lda OBJECT_X_MSB,x
+    sbc OBJECT_X_MSB
+    beq !bulletRight+
+    cmp #$ff
+    beq !bulletLeft+
+    clc
+    rts
+
+!bulletLeft:
+    tya
+    cmp #$f9                                // -7..-1.
+    bcs !bulletVertical+
+    clc
+    rts
+
+!bulletRight:
+    tya
+    cmp #24
+    bcc !bulletVertical+
+    clc
+    rts
+
+!bulletVertical:
+    lda OBJECT_Y,x
+    sec
+    sbc OBJECT_Y
+    bcs !bulletBelow+
+    cmp #$f9                                // Bullet may begin up to 7 pixels above the player.
+    bcs !bulletHit+
+    clc
+    rts
+
+!bulletBelow:
+    cmp #21
+    bcc !bulletHit+
+    clc
+    rts
+
+!bulletHit:
+    sec
+    rts
 
 // --- Routine: updatePlayerState --------------------------------------------
 // Consume PLAYER_HIT and run the player death presentation. Object 0 is never
@@ -2403,6 +2737,13 @@ OBJECT_VEL_X:          .fill MAX_OBJECTS, 0     // Signed current horizontal pat
 OBJECT_VEL_Y:          .fill MAX_OBJECTS, 0     // Signed current vertical path velocity.
 OBJECT_ACCEL_TIMER:    .fill MAX_OBJECTS, 0     // Frames accumulated while descending before the next speed increase.
 
+ENEMY_FIRE_TIMER:      .byte 0                  // Global cadence until another enemy may attempt to fire.
+ENEMY_BULLET_COUNT:    .byte 0                  // Hard cap is MAX_ENEMY_BULLETS.
+ENEMY_FIRE_SOURCE:     .byte 0                  // Logical enemy index preserved across bullet allocation.
+ENEMY_BULLET_OBJECT:   .byte 0                  // Newly allocated projectile index for debugging/future use.
+ENEMY_FIRE_SCAN_COUNT: .byte 0                  // Bounded candidate search so shooter selection always terminates.
+ENEMY_AIM_DELTA_LO:    .byte 0                  // Scratch low byte of playerX - projectileX.
+
 SPAWN_TIMER:           .byte 0
 WAVE_GAP_TIMER:        .byte 0
 WAVE_ENEMY_COUNT:      .byte 0
@@ -2756,6 +3097,21 @@ enemySpriteD:
     .byte $00,$00,$00
     .byte $00,$00,$00
     .byte $00,$00,$00
+    .byte $00                              // 64th padding byte
+
+// --- Enemy projectile sprite ------------------------------------------------
+// Compact 8x8-ish multicolour bolt kept at the sprite origin so the software
+// collision box can remain small instead of treating the whole 24x21 cell as lethal.
+enemyBulletSprite:
+    .byte $3c,$00,$00
+    .byte $ff,$00,$00
+    .byte $ff,$00,$00
+    .byte $3c,$00,$00
+    .byte $3c,$00,$00
+    .byte $18,$00,$00
+    .byte $18,$00,$00
+    .byte $00,$00,$00
+    .fill 39,$00
     .byte $00                              // 64th padding byte
 
 // --- Curated attack definitions --------------------------------------------
