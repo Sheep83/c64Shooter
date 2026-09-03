@@ -26,13 +26,17 @@
 .const MUSIC_INIT = $BE00
 .const MUSIC_PLAY = $BE20
 .const CPU_MEMORY_PORT = $01                       // 6510 memory-map control register.
-.const PATTERN_DIVE_LEFT  = 0
-.const PATTERN_DIVE_RIGHT = 1
-.const PATTERN_ZIGZAG     = 2
-.const PATTERN_SWEEP      = 3
+.const ATTACK_TOP_TURN_LEFT       = 0
+.const ATTACK_TOP_TURN_RIGHT      = 1
+.const ATTACK_TOP_LOOP_LEFT       = 2
+.const ATTACK_TOP_LOOP_RIGHT      = 3
+.const ATTACK_TOP_LOOP_TOP        = 4
+.const ATTACK_LEFT_CROSS_RIGHT    = 5
+.const ATTACK_RIGHT_CROSS_LEFT    = 6
+.const ATTACK_LEFT_CROSS_TOP      = 7
+.const ATTACK_RIGHT_CROSS_TOP     = 8
 
-.const FORMATION_COUNT = 4
-.const PATTERN_COUNT   = 4
+.const ATTACK_COUNT = 9
 .const CIA1_TIMER_A_LO = $dc04
 .const WAVE_GAP        = 150                 // Frames between completed spawn formations.
 .const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
@@ -1851,21 +1855,75 @@ multiplexIRQ:
     jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
 
 // --- Routine: capturePlayerCollision ---------------------------------------
-// Read VIC-II's latched sprite/sprite collision register while PLAYER_HW_MASK
-// still describes the current hardware ownership. A collision involving the
-// player's slot sets PLAYER_HIT; the identity of the other sprite is irrelevant.
+// Read and clear the VIC sprite/sprite collision latch while PLAYER_HW_MASK
+// still describes the hardware ownership for the raster interval just ended.
+//
+// $d01e tells us only which hardware sprites participated in some collision;
+// it does not tell us which pair touched. A dying enemy is still an enabled
+// VIC sprite, so its explosion can therefore set the player's collision bit.
+// Treat the VIC latch as a cheap broad-phase trigger, then confirm gameplay
+// collision against active, living logical enemies with a 24x21 AABB test.
 capturePlayerCollision:
     lda VIC_SPRITE_COLLISION                // Always read/clear the VIC latch, even while invulnerable.
     ldy PLAYER_STATE                        // Is the player currently vulnerable?
     bne !done+                              // No: ignore collisions during explosion/respawn.
     and PLAYER_HW_MASK                      // Did the player's current hardware slot participate?
-    beq !done+                              // No: nothing for gameplay to record.
+    beq !done+                              // No: nothing for gameplay to confirm.
 
-    lda #1                                  // Record a logical player-hit event.
+    ldx #1                                  // Logical object 0 is permanently the player.
+!scanEnemy:
+    lda OBJECT_ACTIVE,x                     // Ignore free object slots.
+    beq !nextEnemy+
+    lda OBJECT_TYPE,x                       // Only enemies can damage the player here.
+    cmp #TYPE_ENEMY
+    bne !nextEnemy+
+    lda OBJECT_DEATH_TIMER,x                // Explosion sprites are presentation only and cannot hurt the player.
+    bne !nextEnemy+
+
+    lda OBJECT_X,x                          // Compute enemyX - playerX as a 9-bit signed delta.
+    sec
+    sbc OBJECT_X
+    tay                                     // Keep the low byte while A checks the high-byte/sign.
+    lda OBJECT_X_MSB,x
+    sbc OBJECT_X_MSB
+    beq !enemyRightOrEqual+                 // High byte 0 = enemy is on/right of player.
+    cmp #$ff                                // High byte $ff = a small negative delta.
+    bne !nextEnemy+                         // Any other result is much too far away horizontally.
+    tya
+    cmp #$e9                                // $e9..$ff represents -23..-1.
+    bcc !nextEnemy+                         // -24 or farther means the 24-pixel boxes do not overlap.
+    jmp !checkVertical+
+
+!enemyRightOrEqual:
+    tya
+    cmp #24                                 // 0..23 overlaps the player's 24-pixel width.
+    bcs !nextEnemy+
+
+!checkVertical:
+    lda OBJECT_Y,x                          // Compute enemyY - playerY.
+    sec
+    sbc OBJECT_Y
+    bcs !enemyBelowOrEqual+                 // Carry set means zero or positive.
+    cmp #$ec                                // $ec..$ff represents -20..-1.
+    bcc !nextEnemy+                         // -21 or farther means the 21-pixel boxes do not overlap.
+    jmp !confirmedHit+
+
+!enemyBelowOrEqual:
+    cmp #21                                 // 0..20 overlaps the player's 21-pixel height.
+    bcs !nextEnemy+
+
+!confirmedHit:
+    lda #1                                  // A living logical enemy genuinely overlaps the player.
     sta PLAYER_HIT                          // Main-loop gameplay code consumes this later.
+    rts                                     // One confirmed hit is sufficient.
+
+!nextEnemy:
+    inx                                     // Try the next logical object slot.
+    cpx #MAX_OBJECTS
+    bne !scanEnemy-
 
 !done:
-    rts                                     // Return without modifying object ownership.
+    rts                                     // No living enemy overlaps the player.
 
 // --- Routine: updatePlayerState --------------------------------------------
 // Consume PLAYER_HIT and run the player death presentation. Object 0 is never
@@ -1995,43 +2053,48 @@ updatePlayerState:
     rts
 
 // --- Routine: startRandomWave ------------------------------------------------
-// Choose one spawn formation and one movement pattern independently.
-// CIA1 timer bits provide a lightweight changing seed; gameplay does not need
-// deterministic cryptographic-quality randomness here.
+// Choose one complete curated attack.  An attack owns its entry geometry,
+// enemy count, spawn cadence, path and visual sequence; movement and spacing
+// are therefore always combinations we have deliberately approved.
+//
+// CIA1 timer bits still provide cheap variety for the development director.
+// Later, a stage script can simply load a chosen attack ID instead.
 startRandomWave:
     lda CIA1_TIMER_A_LO                     // Sample the continuously changing CIA timer.
-    pha                                     // Preserve the sample while loading formation state.
-    and #%00000011                          // Bottom two bits select one of four formations.
-    tay                                     // Y = formation index 0-3.
+    and #%00001111                          // Reduce it to a compact 0-15 lookup index.
+    tay                                     // Y indexes the cheap random-to-attack mapping table.
+    lda randomAttackMap,y                   // Convert 16 possible values into attack IDs 0-8.
+    sta WAVE_ATTACK_ID                      // Remember the selected attack for debugging/stage logic.
+    tay                                     // Y = curated attack index.
 
-    lda formationSpriteStart,y               // Read this formation's first visual-sequence entry.
-    sta WAVE_SPRITE_INDEX                    // Seed sprite/colour selection for its first member.
+    lda attackSpriteStart,y                 // Read this attack's first visual-sequence entry.
+    sta WAVE_SPRITE_INDEX                   // Seed sprite/colour selection for its first member.
 
-    lda formationEnemyCount,y               // Read number of enemies in this formation.
+    lda attackEnemyCount,y                  // Read number of enemies in this attack.
     sta WAVE_ENEMY_COUNT                    // Store target number of successful spawns.
 
-    lda formationInterval,y                 // Read frames between formation members.
+    lda attackInterval,y                    // Read frames between attack members.
     sta WAVE_SPAWN_INTERVAL                 // Preserve interval for each timer reload.
 
-    lda formationStartX,y                   // Read first enemy's starting X coordinate.
+    lda attackStartXLo,y                    // Read low byte of first enemy's 9-bit X coordinate.
     sta WAVE_SPAWN_X                        // Seed cumulative horizontal spawn position.
 
-    lda formationStartY,y                   // Read first enemy's starting Y coordinate.
+    lda attackStartXMsb,y                   // Read ninth X bit for left/top/right-side entry.
+    sta WAVE_SPAWN_X_MSB                    // Preserve full spawn coordinate for upper-right attacks.
+
+    lda attackStartY,y                      // Read first enemy's starting Y coordinate.
     sta WAVE_SPAWN_Y                        // Seed cumulative vertical spawn position.
 
-    lda formationAddX,y                     // Read horizontal offset between successive members.
-    sta WAVE_ADD_X_VALUE                    // Preserve horizontal formation offset.
+    lda attackAddX,y                        // Read signed horizontal offset between members.
+    sta WAVE_ADD_X_VALUE                    // Top entries may spread in X; side entries currently do not.
 
-    lda formationAddY,y                     // Read vertical offset between successive members.
-    sta WAVE_ADD_Y_VALUE                    // Preserve vertical formation offset.
+    lda attackAddY,y                        // Read signed vertical offset between members.
+    sta WAVE_ADD_Y_VALUE                    // Side entries deliberately stagger Y to avoid raster-line walls.
 
-    pla                                     // Recover the original timer sample.
-    lsr                                     // Move a different pair of timer bits down.
-    lsr                                     // Bits 2-3 now occupy bits 0-1.
-    and #%00000011                          // Select one of four movement patterns independently.
-    sta WAVE_PATTERN_ID                     // Save pattern number for each spawned object.
+    lda attackPathId,y                      // Read the movement path assigned to this curated attack.
+    sta WAVE_PATTERN_ID                     // Each spawned object retains this path ID.
 
-    lda #0                                  // A new wave has not spawned any members yet.
+    lda #0                                  // A new attack has not spawned any members yet.
     sta WAVE_SPAWNED                        // Reset successful member count.
     sta SPAWN_TIMER                         // Zero makes the first member spawn immediately.
     rts
@@ -2065,10 +2128,10 @@ spawnEnemy:
     jsr findFreeObject                      // Find an unused logical object slot.
     bcs !failed+                            // Abort if all logical object slots are occupied.
 
-    lda WAVE_SPAWN_X                        // Read this wave member's current X position.
+    lda WAVE_SPAWN_X                        // Read low byte of this attack member's 9-bit X position.
     sta OBJECT_X,x                          // Store low byte of enemy X position.
-    lda #0                                  // Current wave format uses the low 256-pixel X region.
-    sta OBJECT_X_MSB,x                      // Clear ninth X-coordinate bit.
+    lda WAVE_SPAWN_X_MSB                    // Read ninth bit of the spawn position.
+    sta OBJECT_X_MSB,x                      // Preserve right-side/off-screen entry coordinates correctly.
 
     lda WAVE_SPAWN_Y                        // Read this wave member's current Y position.
     sta OBJECT_Y,x                          // Store initial enemy Y position.
@@ -2112,19 +2175,19 @@ spawnEnemy:
     rts
 
 // --- Routine: updateSpawner -------------------------------------------------
-// Spawn the current formation, then leave a short gap before choosing another.
+// Spawn the current curated attack, then leave a short gap before choosing another.
 updateSpawner:
     lda WAVE_SPAWNED                        // Read how many members of this formation have spawned.
-    cmp WAVE_ENEMY_COUNT                    // Compare against the current formation's requested count.
-    bcc !waveActive+                        // Carry clear means this formation still has members to spawn.
+    cmp WAVE_ENEMY_COUNT                    // Compare against the current attack's requested count.
+    bcc !waveActive+                        // Carry clear means this attack still has members to spawn.
 
-    lda WAVE_GAP_TIMER                      // Formation is complete: read inter-formation delay.
+    lda WAVE_GAP_TIMER                      // Attack is complete: read inter-attack delay.
     beq !startNext+                         // Zero means the director may choose another attack now.
-    dec WAVE_GAP_TIMER                      // Consume one frame of breathing room between formations.
+    dec WAVE_GAP_TIMER                      // Consume one frame of breathing room between attacks.
     bne !done+                              // Keep waiting while any gap remains.
 
 !startNext:
-    jsr startRandomWave                     // Choose a fresh formation + movement pattern combination.
+    jsr startRandomWave                     // Choose a fresh curated attack.
 
 !waveActive:
     lda SPAWN_TIMER                         // Read frames remaining until the next formation member.
@@ -2134,31 +2197,46 @@ updateSpawner:
     bne !done+                              // Non-zero means the delay is still running.
 
 !spawn:
-    jsr spawnEnemy                          // Try to allocate and initialise the next formation member.
+    jsr spawnEnemy                          // Try to allocate and initialise the next attack member.
     bcs !done+                              // Pool full: keep this position and retry next frame.
 
-    inc WAVE_SPAWNED                        // Record one successfully created formation member.
+    inc WAVE_SPAWNED                        // Record one successfully created attack member.
 
-    clc                                     // Clear carry before adding the horizontal formation offset.
-    lda WAVE_SPAWN_X                        // Read the position used by the enemy just spawned.
-    adc WAVE_ADD_X_VALUE                    // Add this formation's per-enemy horizontal offset.
-    sta WAVE_SPAWN_X                        // Save the next member's starting X position.
+    lda WAVE_ADD_X_VALUE                    // Read signed horizontal offset for the next attack member.
+    beq !xOffsetDone+                       // Zero is common for side-entry streams; avoid needless 9-bit work.
+    bmi !xOffsetLeft+                       // Negative two's-complement offsets require borrow handling.
 
-    clc                                     // Clear carry before adding the vertical formation offset.
+!xOffsetRight:
+    clc                                     // Clear carry before adding a positive horizontal offset.
+    adc WAVE_SPAWN_X                        // Add to the low byte of the 9-bit spawn coordinate.
+    sta WAVE_SPAWN_X                        // Save the next member's low X byte.
+    bcc !xOffsetDone+                       // No carry means the ninth bit is unchanged.
+    inc WAVE_SPAWN_X_MSB                    // Carry crosses X=255 into the upper half.
+    jmp !xOffsetDone+
+
+!xOffsetLeft:
+    clc                                     // Clear carry before adding the signed negative offset.
+    adc WAVE_SPAWN_X                        // Two's-complement addition updates the low X byte.
+    sta WAVE_SPAWN_X                        // Save the next member's low X byte.
+    bcs !xOffsetDone+                       // Carry set means no borrow from the ninth bit.
+    dec WAVE_SPAWN_X_MSB                    // Borrow crosses from the upper half into the lower half.
+
+!xOffsetDone:
+    clc                                     // Clear carry before adding the vertical attack offset.
     lda WAVE_SPAWN_Y                        // Read the position used by the enemy just spawned.
-    adc WAVE_ADD_Y_VALUE                    // Add this formation's per-enemy vertical offset.
+    adc WAVE_ADD_Y_VALUE                    // Add this attack's per-enemy vertical offset.
     sta WAVE_SPAWN_Y                        // Save the next member's starting Y position.
 
     lda WAVE_SPAWNED                        // Re-check count before a possible same-frame spawn.
-    cmp WAVE_ENEMY_COUNT                    // Has this formation now spawned every requested member?
+    cmp WAVE_ENEMY_COUNT                    // Has this attack now spawned every requested member?
     bcc !moreMembers+                       // No: prepare the interval before the next member.
 
-    lda #WAVE_GAP                           // Final member launched: start the inter-formation gap.
+    lda #WAVE_GAP                           // Final member launched: start the inter-attack gap.
     sta WAVE_GAP_TIMER                      // Director will remain idle until this expires.
     rts                                     // Do not begin another formation in this frame.
 
 !moreMembers:
-    lda WAVE_SPAWN_INTERVAL                 // Read this formation's delay between successful spawns.
+    lda WAVE_SPAWN_INTERVAL                 // Read this attack's delay between successful spawns.
     sta SPAWN_TIMER                         // Start the delay before the next member.
     beq !spawn-                             // Interval zero: spawn another member in this same frame.
 
@@ -2237,11 +2315,13 @@ WAVE_ENEMY_COUNT:      .byte 0
 WAVE_SPAWN_INTERVAL:   .byte 0
 WAVE_SPAWNED:          .byte 0
 WAVE_SPAWN_X:          .byte 0
+WAVE_SPAWN_X_MSB:      .byte 0              // Ninth bit permits genuine upper-right/off-screen attack entry.
 WAVE_SPAWN_Y:          .byte 0
 WAVE_ADD_X_VALUE:      .byte 0
 WAVE_ADD_Y_VALUE:      .byte 0
-WAVE_PATTERN_ID:       .byte 0
-WAVE_SPRITE_INDEX:      .byte 0              // Current entry in the formation's visual sequence.
+WAVE_ATTACK_ID:        .byte 0              // Curated attack currently being emitted.
+WAVE_PATTERN_ID:       .byte 0              // Path ID copied into each spawned enemy.
+WAVE_SPRITE_INDEX:     .byte 0              // Current entry in the attack's visual sequence.
 
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
@@ -2583,103 +2663,196 @@ enemySpriteD:
     .byte $00,$00,$00
     .byte $00                              // 64th padding byte
 
-// --- Spawn formations -------------------------------------------------------
-// Formation data is stored as parallel tables indexed 0-3.  Movement is not
-// encoded here: startRandomWave chooses a movement pattern independently.
+// --- Curated attack definitions --------------------------------------------
+// Parallel tables indexed by ATTACK_* ID.  These are deliberately kept as
+// plain bytes so balancing remains as easy as the old formation system.
 //
-// 0: tight stream from one entry point.
-// 1: staggered diagonal entry.
-// 2: simultaneous horizontal line.
-// 3: descending diagonal stream moving left between successive spawns.
-formationEnemyCount:
-    .byte 8, 6, 7, 5
-formationInterval:
-    .byte 50, 24, 0, 18
-formationStartX:
-    .byte 120, 80, 65, 180
-formationStartY:
-    .byte 40, 35, 45, 25
-formationAddX:
-    .byte 0, 14, 28, $f8                   // $f8 = -8 for formation 3.
-formationAddY:
-    .byte 0, 5, 0, 4
+// Rules:
+//   * Top-entry attacks always have addY = 0.  Members may share X or fan in X.
+//   * Side-entry attacks use addY > 0 so several enemies never form a long
+//     horizontal raster band while entering.
+//   * Side-entry attacks currently use addX = 0, but the runtime supports a
+//     signed 9-bit X offset if we want it later.
+//   * Path geometry remains duration/dx/dy data below, so turn rates and speed
+//     can be tuned independently without rewriting movement code.
+//
+// IDs:
+// 0 top -> dive -> turn -> exit left
+// 1 top -> dive -> turn -> exit right
+// 2 top -> dive -> loop -> exit left
+// 3 top -> dive -> loop -> exit right
+// 4 top -> dive -> loop -> exit top
+// 5 upper-left  -> bottom-centre -> exit right
+// 6 upper-right -> bottom-centre -> exit left
+// 7 upper-left  -> bottom-centre -> exit top
+// 8 upper-right -> bottom-centre -> exit top
 
-// --- Formation visual sequences --------------------------------------------
-// Each formation has eight visual entries. Shorter formations simply consume
-// the prefix they need. Sprite shape and individual colour are independent of
-// movement pattern, so the same attack geometry can still look varied.
-formationSpriteStart:
-    .byte 0, 8, 16, 24
+attackEnemyCount:
+    .byte 6, 6, 5, 5, 6, 6, 6, 5, 5
+
+attackInterval:
+    .byte 18,18,16,16,18,15,15,17,17
+
+attackStartXLo:
+    .byte 150,150,164,136,150,12,$4a,12,$4a // $014a = 330 for right-side entry.
+
+attackStartXMsb:
+    .byte 0,0,0,0,0,0,1,0,1
+
+attackStartY:
+    .byte 38,38,38,38,38,58,58,58,58
+
+attackAddX:
+    .byte 0,0,$04,$fc,0,0,0,0,0            // Top loop pair fans by +/-4; $fc = -4.
+
+attackAddY:
+    .byte 0,0,0,0,0,7,7,9,9                // NEVER stagger top entry in Y.
+
+attackPathId:
+    .byte 0,1,2,3,4,5,6,7,8
+
+// Four reusable visual palettes.  Attack geometry and visuals remain separate
+// so stage data can later swap either independently.
+attackSpriteStart:
+    .byte 0,8,16,24,0,8,16,24,0
 
 enemySpriteSequence:
-    // Formation 0: alternating spear/scout with heavier ships in the middle.
+    // Visual set 0.
     .byte enemySpriteA/64, enemySpriteB/64, enemySpriteA/64, enemySpriteC/64
     .byte enemySpriteC/64, enemySpriteA/64, enemySpriteB/64, enemySpriteA/64
 
-    // Formation 1: four visibly different ships cycling through the stagger.
+    // Visual set 1.
     .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
     .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
 
-    // Formation 2: symmetric-looking instant line.
+    // Visual set 2.
     .byte enemySpriteD/64, enemySpriteC/64, enemySpriteB/64, enemySpriteA/64
     .byte enemySpriteB/64, enemySpriteC/64, enemySpriteD/64, enemySpriteA/64
 
-    // Formation 3: heavier-looking descending group.
+    // Visual set 3.
     .byte enemySpriteC/64, enemySpriteD/64, enemySpriteC/64, enemySpriteB/64
     .byte enemySpriteD/64, enemySpriteC/64, enemySpriteB/64, enemySpriteA/64
 
 enemyColourSequence:
-    // Individual VIC colour for each matching sprite-sequence entry.
-    .byte 2, 6, 10, 7, 7, 10, 6, 2
-    .byte 6, 13, 7, 10, 6, 13, 7, 10
-    .byte 14, 13, 7, 2, 7, 13, 14, 2
-    .byte 7, 14, 7, 10, 14, 7, 10, 2
+    .byte 2, 6,10, 7, 7,10, 6, 2
+    .byte 6,13, 7,10, 6,13, 7,10
+    .byte 14,13,7, 2, 7,13,14, 2
+    .byte 7,14, 7,10,14, 7,10, 2
+
+// Cheap mapping from a four-bit CIA timer sample to nine attack IDs.
+// Uneven distribution is intentional/irrelevant for the temporary chaos
+// director; real stages will choose attacks explicitly.
+randomAttackMap:
+    .byte 0,1,2,3,4,5,6,7,8,0,2,4,6,8,1,5
 
 // --- Movement pattern offsets ----------------------------------------------
 // Each object stores a byte offset into enemyPatterns as OBJECT_PATH_STEP.
-// This lets the existing path interpreter read any pattern without pointers.
+// Nine complete paths fit comfortably inside one 256-byte indexed table.
 patternStartOffset:
-    .byte patternDiveLeft-enemyPatterns
-    .byte patternDiveRight-enemyPatterns
-    .byte patternZigzag-enemyPatterns
-    .byte patternSweep-enemyPatterns
+    .byte patternTopTurnLeft-enemyPatterns
+    .byte patternTopTurnRight-enemyPatterns
+    .byte patternTopLoopLeft-enemyPatterns
+    .byte patternTopLoopRight-enemyPatterns
+    .byte patternTopLoopTop-enemyPatterns
+    .byte patternLeftCrossRight-enemyPatterns
+    .byte patternRightCrossLeft-enemyPatterns
+    .byte patternLeftCrossTop-enemyPatterns
+    .byte patternRightCrossTop-enemyPatterns
 
 // --- Enemy movement patterns ------------------------------------------------
-// Segments: duration, signed dx, signed dy.  Duration $ff means keep applying
-// that final vector until normal off-screen lifecycle logic removes the enemy.
-// Duration 0 remains an explicit terminator if a future pattern needs one.
+// Segment format: duration, signed dx, signed dy.
+// $ff duration means retain the final vector until off-screen lifecycle removes
+// the enemy.  Every number here is intentionally exposed for easy tuning.
+//
+// These are first-pass geometries rather than sacred values: the purpose of
+// this build is to watch each family, then adjust durations/deltas by feel.
 enemyPatterns:
 
-patternDiveLeft:
-    .byte 80,  0,  2                       // Dive vertically.
-    .byte  6,  0,  2                       // Hold downward direction into the turn.
-    .byte  6, $ff, 2                       // Begin bending left.
-    .byte  6, $ff, 1                       // Diagonal down-left.
-    .byte  6, $fe, 1                       // Turn more strongly left.
-    .byte  6, $fe, 0                       // Complete the turn.
-    .byte $ff,$fe, 0                       // Keep flying left until X lifecycle removes it.
+patternTopTurnLeft:
+    .byte 48,  0,  2                       // Straight dive from common top entry Y.
+    .byte  7,$ff,  2                       // Begin curving down-left.
+    .byte  7,$fe,  1                       // Increase horizontal component.
+    .byte  7,$fe,  0                       // Level out.
+    .byte  5,$fe,$ff                       // Slight upward hook through the turn.
+    .byte $ff,$fe,  0                       // Exit left.
 
-patternDiveRight:
-    .byte 60,  0,  2                       // Dive before beginning the mirrored turn.
-    .byte  6,  0,  2                       // Hold downward direction.
-    .byte  6,  1,  2                       // Begin bending right.
-    .byte  6,  1,  1                       // Diagonal down-right.
-    .byte  6,  2,  1                       // Turn more strongly right.
-    .byte  6,  2,  0                       // Complete the turn.
-    .byte $ff, 2,  0                       // Keep flying right until X lifecycle removes it.
+patternTopTurnRight:
+    .byte 48,  0,  2                       // Straight dive from common top entry Y.
+    .byte  7,  1,  2                       // Begin curving down-right.
+    .byte  7,  2,  1                       // Increase horizontal component.
+    .byte  7,  2,  0                       // Level out.
+    .byte  5,  2,$ff                       // Slight upward hook through the turn.
+    .byte $ff, 2,  0                       // Exit right.
 
-patternZigzag:
-    .byte 36,  1,  2                       // Sweep down-right.
-    .byte 36, $ff, 2                       // Reverse into a down-left sweep.
-    .byte 36,  1,  2                       // Sweep right again.
-    .byte $ff,$ff, 2                       // Continue final down-left vector until naturally off-screen.
+patternTopLoopLeft:
+    .byte 42,  0,  2                       // Dive to the loop entry point.
+    .byte  5,  2,  1                       // Arc down-right.
+    .byte  5,  2,  0                       // Right.
+    .byte  5,  1,$fe                       // Arc up-right.
+    .byte  5,$ff,$fe                       // Arc up-left.
+    .byte  5,$fe,  0                       // Left.
+    .byte  5,$fe,  1                       // Arc down-left.
+    .byte  5,$ff,  2                       // Continue around bottom-left.
+    .byte  5,  1,  2                       // Close the loop near its entry.
+    .byte $ff,$fe,  0                       // Break out and exit left.
 
-patternSweep:
-    .byte 28, $ff, 1                       // Shallow down-left opening sweep.
-    .byte 28,  1,  1                       // Cross back down-right.
-    .byte 28,  1,  2                       // Steepen the rightward dive.
-    .byte $ff,$ff, 2                       // Continue final steep down-left vector until off-screen.
+patternTopLoopRight:
+    .byte 42,  0,  2                       // Dive to the mirrored loop entry point.
+    .byte  5,$fe,  1                       // Arc down-left.
+    .byte  5,$fe,  0                       // Left.
+    .byte  5,$ff,$fe                       // Arc up-left.
+    .byte  5,  1,$fe                       // Arc up-right.
+    .byte  5,  2,  0                       // Right.
+    .byte  5,  2,  1                       // Arc down-right.
+    .byte  5,  1,  2                       // Continue around bottom-right.
+    .byte  5,$ff,  2                       // Close the loop near its entry.
+    .byte $ff, 2,  0                       // Break out and exit right.
 
+patternTopLoopTop:
+    .byte 38,  0,  2                       // Dive before beginning the vertical-return loop.
+    .byte  5,  2,  1                       // Down-right.
+    .byte  5,  2,  0                       // Right.
+    .byte  5,  1,$fe                       // Up-right.
+    .byte  5,$ff,$fe                       // Up-left.
+    .byte  5,$fe,  0                       // Left.
+    .byte  5,$fe,  1                       // Down-left.
+    .byte  5,$ff,  2                       // Bottom-left arc.
+    .byte  5,  1,  2                       // Close loop.
+    .byte $ff, 0,$fe                       // Exit vertically through the top.
+
+patternLeftCrossRight:
+    .byte 32,  2,  1                       // Enter from upper-left toward centre.
+    .byte 30,  2,  2                       // Steepen toward lower centre.
+    .byte 24,  2,  1                       // Flatten after crossing centre.
+    .byte 12,  2,  0                       // Commit to the right-side exit.
+    .byte $ff, 2,  0                       // Exit right.
+
+patternRightCrossLeft:
+    .byte 32,$fe,  1                       // Enter from upper-right toward centre.
+    .byte 30,$fe,  2                       // Steepen toward lower centre.
+    .byte 24,$fe,  1                       // Flatten after crossing centre.
+    .byte 12,$fe,  0                       // Commit to the left-side exit.
+    .byte $ff,$fe,  0                       // Exit left.
+
+patternLeftCrossTop:
+    .byte 34,  2,  2                       // Enter upper-left and dive toward lower centre.
+    .byte 26,  2,  1                       // Continue across while flattening.
+    .byte 14,  1,  0                       // Brief lateral sweep through the centre.
+    .byte 12,  1,$ff                       // Turn upward.
+    .byte $ff, 0,$fe                       // Exit through the top.
+
+patternRightCrossTop:
+    .byte 34,$fe,  2                       // Enter upper-right and dive toward lower centre.
+    .byte 26,$fe,  1                       // Continue across while flattening.
+    .byte 14,$ff,  0                       // Brief mirrored lateral sweep.
+    .byte 12,$ff,$ff                       // Turn upward.
+    .byte $ff, 0,$fe                       // Exit through the top.
+
+
+ENEMY_PATTERNS_END:
+.if ((ENEMY_PATTERNS_END - enemyPatterns) > 256) {
+    .error "Enemy movement pattern table exceeds one-byte OBJECT_PATH_STEP range"
+}
 
 // --- Private per-object health-bar sprite RAM -------------------------------
 // Object 0 is the player and does not use its slot, but reserving all 16 keeps
