@@ -31,15 +31,17 @@
 .const ATTACK_TOP_LOOP_LEFT       = 2
 .const ATTACK_TOP_LOOP_RIGHT      = 3
 .const ATTACK_TOP_LOOP_TOP        = 4
-.const ATTACK_LEFT_CROSS_RIGHT    = 5
-.const ATTACK_RIGHT_CROSS_LEFT    = 6
-.const ATTACK_LEFT_CROSS_TOP      = 7
-.const ATTACK_RIGHT_CROSS_TOP     = 8
+.const ATTACK_LEFT_U_TURN_UP      = 5
+.const ATTACK_RIGHT_U_TURN_UP     = 6
+.const ATTACK_LEFT_U_TURN_DOWN    = 7
+.const ATTACK_RIGHT_U_TURN_DOWN   = 8
 
 .const ATTACK_COUNT = 9
 .const CIA1_TIMER_A_LO = $dc04
 .const WAVE_GAP        = 150                 // Frames between completed spawn formations.
 .const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
+.const ENEMY_ACCEL_INTERVAL = 12             // Descending enemies gain one pixel/frame of speed every 12 frames.
+.const ENEMY_MAX_PATH_SPEED = 3              // Cap integer path velocity so acceleration cannot run away.
 .const VIC_SPRITE_COLLISION = $d01e            // Reading clears the latched sprite/sprite collision bits.
 
 .const PLAYER_STATE_ALIVE      = 0
@@ -194,7 +196,7 @@ mainLoop:
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
-    jsr MUSIC_PLAY                          // Advance Sanxion by one PAL video frame (50 Hz).
+    //jsr MUSIC_PLAY                        // Temporarily muted during attack-pattern testing.
     jsr updateCycleDebug                    // Record remaining budget including the SID player's CPU cost.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
@@ -981,6 +983,10 @@ updateEnemyHitEffects:
 
 // --- Routine: moveEnemyPath -------------------------------------------------
 // Advance one enemy through its table-driven movement pattern.
+// Finite segments load a new signed velocity.  A final $ff segment is a coast:
+// it deliberately keeps the velocity produced by the preceding manoeuvre so an
+// enemy leaves the playfield carrying its existing momentum rather than snapping
+// to an unrelated canned exit vector.
 // Entry: X = logical object index.
 moveEnemyPath:
     lda OBJECT_PATH_TIMER,x                 // Load frames remaining in the current path segment.
@@ -990,19 +996,25 @@ moveEnemyPath:
     lda enemyPatterns,y                     // Read this segment's duration from the selected pattern.
     bne !loadSegment+                       // Non-zero means this is a valid movement segment.
     jmp !finished+                          // Duration zero explicitly ends and deactivates this object.
+
 !loadSegment:
-    sta OBJECT_PATH_TIMER,x                 // $ff means this segment continues indefinitely.
+    sta OBJECT_PATH_TIMER,x                 // Save duration; $ff is the momentum-preserving coast marker.
+    cmp #$ff                                // Final coast segments do not replace the current velocity.
+    beq !move+
+
+    lda enemyPatterns+1,y                   // Read signed horizontal velocity for this manoeuvre segment.
+    sta OBJECT_VEL_X,x                      // Velocity is persistent object state rather than a direct table add.
+    lda enemyPatterns+2,y                   // Read signed vertical velocity for this manoeuvre segment.
+    sta OBJECT_VEL_Y,x                      // Subsequent acceleration may increase this base vector.
 
 !move:
-    ldy OBJECT_PATH_STEP,x                  // Y = byte offset of the current path segment.
-
-    lda enemyPatterns+1,y                   // Read signed horizontal delta for this frame.
-    beq !moveY+                             // Zero means no horizontal movement.
-    bmi !moveXLeft+                         // Bit 7 set means a negative horizontal delta.
+    lda OBJECT_VEL_X,x                      // Read the enemy's current signed horizontal velocity.
+    beq !moveY+                             // Zero means no horizontal movement this frame.
+    bmi !moveXLeft+                         // Bit 7 set means a negative horizontal velocity.
 
 !moveXRight:
-    clc                                     // Clear carry before adding the positive X delta.
-    adc OBJECT_X,x                          // Add delta to the low byte of the 9-bit X coordinate.
+    clc                                     // Clear carry before adding the positive X velocity.
+    adc OBJECT_X,x                          // Add velocity to the low byte of the 9-bit X coordinate.
     sta OBJECT_X,x                          // Store the new low byte.
     bcc !checkRightEdge+                    // No carry means the ninth X bit is unchanged.
     inc OBJECT_X_MSB,x                      // Carry means low byte crossed $ff -> $00.
@@ -1021,37 +1033,40 @@ moveEnemyPath:
     jmp !finished+                          // Return the object slot once it has naturally exited.
 
 !moveXLeft:
-    clc                                     // Clear carry before adding the two's-complement delta.
-    adc OBJECT_X,x                          // Add negative delta to the low byte.
+    clc                                     // Clear carry before adding the two's-complement velocity.
+    adc OBJECT_X,x                          // Add negative velocity to the low byte.
     sta OBJECT_X,x                          // Store the new low byte.
     bcs !moveY+                             // Carry set means no borrow across the 256-pixel boundary.
     lda OBJECT_X_MSB,x                      // A borrow while high byte zero means we crossed left of X=0.
     bne !leftHighValid+                     // High byte one can legitimately borrow back into the lower half.
     jmp !finished+                          // Deactivate instead of wrapping from X=0 to X=511.
 !leftHighValid:
-    dec OBJECT_X_MSB,x                     // Move normally from the upper X half into the lower half.
+    dec OBJECT_X_MSB,x                      // Move normally from the upper X half into the lower half.
 
 !moveY:
-    lda enemyPatterns+2,y                   // Read signed vertical delta for this frame.
-    beq !tick+                              // Zero means no vertical movement.
-    bmi !moveYUp+                           // Negative delta means movement towards the top.
+    lda OBJECT_VEL_Y,x                      // Read the enemy's current signed vertical velocity.
+    beq !accelerate+                        // Zero means no vertical movement this frame.
+    bmi !moveYUp+                           // Negative velocity means movement towards the top.
 
 !moveYDown:
-    clc                                     // Clear carry before adding the positive Y delta.
-    adc OBJECT_Y,x                          // Add the downward movement to the current Y position.
+    clc                                     // Clear carry before adding the positive Y velocity.
+    adc OBJECT_Y,x                          // Add downward velocity to the current Y position.
     bcs !finished+                          // Carry means Y crossed $ff; deactivate instead of wrapping to $00.
     sta OBJECT_Y,x                          // Store the valid new Y position.
-    jmp !tick+                              // Continue the path timer update.
+    jmp !accelerate+                        // Descending movement may gradually gain speed.
 
 !moveYUp:
-    clc                                     // Clear carry before adding the negative two's-complement delta.
-    adc OBJECT_Y,x                          // Add the upward movement to the current Y position.
+    clc                                     // Clear carry before adding the negative two's-complement velocity.
+    adc OBJECT_Y,x                          // Add upward velocity to the current Y position.
     bcc !finished+                          // No carry means Y crossed below $00; deactivate instead of wrapping to $ff.
     sta OBJECT_Y,x                          // Store the valid new Y position.
 
+!accelerate:
+    jsr accelerateEnemyDive                 // Only positive-Y motion can build additional speed.
+
 !tick:
     lda OBJECT_PATH_TIMER,x                 // Read the active segment duration marker.
-    cmp #$ff                                // $ff means retain this final vector indefinitely.
+    cmp #$ff                                // $ff means coast on the velocity inherited from the last manoeuvre.
     beq !done+                              // Lifecycle bounds, not path duration, will remove the enemy.
 
     dec OBJECT_PATH_TIMER,x                 // Consume one frame from a finite path segment.
@@ -1059,7 +1074,7 @@ moveEnemyPath:
 
     lda OBJECT_PATH_STEP,x                  // Load current byte offset in the path table.
     clc                                     // Clear carry before adding the segment size.
-    adc #3                                  // Advance past duration, dx and dy.
+    adc #3                                  // Advance past duration, vx and vy.
     sta OBJECT_PATH_STEP,x                  // Save offset of the next segment.
 
 !done:
@@ -1068,6 +1083,79 @@ moveEnemyPath:
 !finished:
     lda #0                                  // Zero represents inactive.
     sta OBJECT_ACTIVE,x                     // Return this logical object to the free pool.
+    rts
+
+// --- Routine: accelerateEnemyDive ------------------------------------------
+// Give descending enemies a small integer acceleration in roughly the direction
+// they are already travelling.  Every ENEMY_ACCEL_INTERVAL descending frames we
+// increase the dominant component of the vector; a 45-degree vector grows both.
+// This deliberately uses cheap compares/increments rather than multiplication or
+// fixed-point maths.  Upward/level flight resets the cadence and does not speed up.
+// Entry/exit: X = logical object index, preserved.
+accelerateEnemyDive:
+    lda OBJECT_VEL_Y,x                      // Only positive Y velocity represents a descent.
+    beq !reset+
+    bmi !reset+
+
+    inc OBJECT_ACCEL_TIMER,x                // Count frames spent travelling downward.
+    lda OBJECT_ACCEL_TIMER,x
+    cmp #ENEMY_ACCEL_INTERVAL               // Wait until the small acceleration interval has elapsed.
+    bcc !done+
+    lda #0
+    sta OBJECT_ACCEL_TIMER,x                // Restart the cadence before adjusting either component.
+
+    lda OBJECT_VEL_X,x                      // Determine the absolute horizontal speed for angle comparison.
+    bpl !xPositive+
+    eor #$ff                                // Two's-complement absolute value: invert then add one.
+    clc
+    adc #1
+!xPositive:
+    sta PATH_ABS_X                          // Scratch byte is safe because movement runs only in the main thread.
+
+    cmp OBJECT_VEL_Y,x                      // Compare |vx| with positive vy to approximate the descent angle.
+    beq !accelerateBoth+                    // Equal components represent an approximately 45-degree dive.
+    bcc !accelerateY+                       // Steeper dive: add speed mainly to the vertical component.
+
+!accelerateX:
+    lda PATH_ABS_X                          // Shallower dive: increase horizontal magnitude instead.
+    cmp #ENEMY_MAX_PATH_SPEED
+    bcs !done+                              // Component already sits at the safety cap.
+    lda OBJECT_VEL_X,x
+    bmi !accelerateXLeft+
+    inc OBJECT_VEL_X,x                      // Positive horizontal velocity becomes more positive.
+    rts
+!accelerateXLeft:
+    dec OBJECT_VEL_X,x                      // Negative horizontal velocity becomes more negative.
+    rts
+
+!accelerateY:
+    lda OBJECT_VEL_Y,x
+    cmp #ENEMY_MAX_PATH_SPEED
+    bcs !done+
+    inc OBJECT_VEL_Y,x                      // Steep dive gains one pixel/frame vertically.
+    rts
+
+!accelerateBoth:
+    lda OBJECT_VEL_Y,x                      // Grow vertical speed first when both components are equal.
+    cmp #ENEMY_MAX_PATH_SPEED
+    bcs !done+
+    inc OBJECT_VEL_Y,x
+
+    lda PATH_ABS_X                          // A purely vertical vector has |vx|=0 and was handled by BCC above.
+    cmp #ENEMY_MAX_PATH_SPEED
+    bcs !done+
+    lda OBJECT_VEL_X,x
+    bmi !accelerateBothLeft+
+    inc OBJECT_VEL_X,x
+    rts
+!accelerateBothLeft:
+    dec OBJECT_VEL_X,x
+    rts
+
+!reset:
+    lda #0                                  // Breaking the descent also breaks the accumulated acceleration cadence.
+    sta OBJECT_ACCEL_TIMER,x
+!done:
     rts
 
 // --- Routine: buildSortedObjectList ----------------------------------------
@@ -2163,6 +2251,9 @@ spawnEnemy:
     sta OBJECT_PATH_STEP,x                  // Begin this object at the selected pattern's first segment.
     lda #0                                  // Zero forces the first segment duration to load next update.
     sta OBJECT_PATH_TIMER,x                 // Reset movement path timer.
+    sta OBJECT_VEL_X,x                      // Reused slots must not inherit velocity from a previous enemy.
+    sta OBJECT_VEL_Y,x                      // Start stationary until the first path segment loads its vector.
+    sta OBJECT_ACCEL_TIMER,x                // Fresh enemy begins a new acceleration cadence.
 
     lda #1                                  // Mark object active only after every field is initialised.
     sta OBJECT_ACTIVE,x                     // Object now participates in update/render processing.
@@ -2308,6 +2399,9 @@ SORTED_COUNT:          .byte 0
 OBJECT_PATTERN:        .fill MAX_OBJECTS, 0
 OBJECT_PATH_STEP:      .fill MAX_OBJECTS, 0
 OBJECT_PATH_TIMER:     .fill MAX_OBJECTS, 0
+OBJECT_VEL_X:          .fill MAX_OBJECTS, 0     // Signed current horizontal path velocity.
+OBJECT_VEL_Y:          .fill MAX_OBJECTS, 0     // Signed current vertical path velocity.
+OBJECT_ACCEL_TIMER:    .fill MAX_OBJECTS, 0     // Frames accumulated while descending before the next speed increase.
 
 SPAWN_TIMER:           .byte 0
 WAVE_GAP_TIMER:        .byte 0
@@ -2322,6 +2416,7 @@ WAVE_ADD_Y_VALUE:      .byte 0
 WAVE_ATTACK_ID:        .byte 0              // Curated attack currently being emitted.
 WAVE_PATTERN_ID:       .byte 0              // Path ID copied into each spawned enemy.
 WAVE_SPRITE_INDEX:     .byte 0              // Current entry in the attack's visual sequence.
+PATH_ABS_X:           .byte 0              // Main-thread scratch used by directional enemy acceleration.
 
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
@@ -2682,10 +2777,10 @@ enemySpriteD:
 // 2 top -> dive -> loop -> exit left
 // 3 top -> dive -> loop -> exit right
 // 4 top -> dive -> loop -> exit top
-// 5 upper-left  -> bottom-centre -> exit right
-// 6 upper-right -> bottom-centre -> exit left
-// 7 upper-left  -> bottom-centre -> exit top
-// 8 upper-right -> bottom-centre -> exit top
+// 5 upper-left  -> cross screen -> smooth U-turn -> exit upper-left
+// 6 upper-right -> cross screen -> smooth U-turn -> exit upper-right
+// 7 upper-left  -> cross screen -> smooth U-turn -> exit lower-left
+// 8 upper-right -> cross screen -> smooth U-turn -> exit lower-right
 
 attackEnemyCount:
     .byte 6, 6, 5, 5, 6, 6, 6, 5, 5
@@ -2754,15 +2849,17 @@ patternStartOffset:
     .byte patternTopLoopLeft-enemyPatterns
     .byte patternTopLoopRight-enemyPatterns
     .byte patternTopLoopTop-enemyPatterns
-    .byte patternLeftCrossRight-enemyPatterns
-    .byte patternRightCrossLeft-enemyPatterns
-    .byte patternLeftCrossTop-enemyPatterns
-    .byte patternRightCrossTop-enemyPatterns
+    .byte patternLeftUTurnUp-enemyPatterns
+    .byte patternRightUTurnUp-enemyPatterns
+    .byte patternLeftUTurnDown-enemyPatterns
+    .byte patternRightUTurnDown-enemyPatterns
 
 // --- Enemy movement patterns ------------------------------------------------
-// Segment format: duration, signed dx, signed dy.
-// $ff duration means retain the final vector until off-screen lifecycle removes
-// the enemy.  Every number here is intentionally exposed for easy tuning.
+// Segment format: duration, signed base vx, signed base vy.
+// Finite segments load a new velocity; descending motion can accelerate it.
+// $ff duration is a momentum coast: its following two bytes are placeholders and
+// the enemy retains the velocity reached during the preceding manoeuvre.
+// Every number here is intentionally exposed for easy tuning.
 //
 // These are first-pass geometries rather than sacred values: the purpose of
 // this build is to watch each family, then adjust durations/deltas by feel.
@@ -2773,80 +2870,102 @@ patternTopTurnLeft:
     .byte  7,$ff,  2                       // Begin curving down-left.
     .byte  7,$fe,  1                       // Increase horizontal component.
     .byte  7,$fe,  0                       // Level out.
-    .byte  5,$fe,$ff                       // Slight upward hook through the turn.
-    .byte $ff,$fe,  0                       // Exit left.
+    .byte  5,$fe,$ff                       // Hook upward through the turn.
+    .byte  6,$fe,$ff                       // Leave on a shallow up-left tangent rather than a flat row.
+    .byte $ff, 0,  0                       // Coast on that inherited up-left exit vector.
 
 patternTopTurnRight:
     .byte 48,  0,  2                       // Straight dive from common top entry Y.
     .byte  7,  1,  2                       // Begin curving down-right.
     .byte  7,  2,  1                       // Increase horizontal component.
     .byte  7,  2,  0                       // Level out.
-    .byte  5,  2,$ff                       // Slight upward hook through the turn.
-    .byte $ff, 2,  0                       // Exit right.
+    .byte  5,  2,$ff                       // Hook upward through the turn.
+    .byte  6,  2,$ff                       // Leave on a shallow up-right tangent rather than a flat row.
+    .byte $ff, 0,  0                       // Coast on that inherited up-right exit vector.
 
 patternTopLoopLeft:
-    .byte 42,  0,  2                       // Dive to the loop entry point.
-    .byte  5,  2,  1                       // Arc down-right.
-    .byte  5,  2,  0                       // Right.
-    .byte  5,  1,$fe                       // Arc up-right.
-    .byte  5,$ff,$fe                       // Arc up-left.
-    .byte  5,$fe,  0                       // Left.
-    .byte  5,$fe,  1                       // Arc down-left.
-    .byte  5,$ff,  2                       // Continue around bottom-left.
-    .byte  5,  1,  2                       // Close the loop near its entry.
-    .byte $ff,$fe,  0                       // Break out and exit left.
+    .byte 30,  0,  2                       // Enter the loop higher so its larger lower arc stays clear of respawn Y.
+    .byte  9,  2,  1                       // First loop: arc down-right.
+    .byte  9,  2,  0                       // First loop: right.
+    .byte  9,  1,$fe                       // First loop: arc up-right.
+    .byte  9,$ff,$fe                       // First loop: arc up-left.
+    .byte  9,$fe,  0                       // First loop: left.
+    .byte  9,$fe,  1                       // First loop: arc down-left.
+    .byte  9,$ff,  2                       // First loop: bottom-left arc.
+    .byte  9,  1,  2                       // Complete one full loop still moving down-right.
+    .byte  9,  2,  1                       // Continue into the second loop instead of reversing.
+    .byte  9,  2,  0                       // Carry around the right-hand side.
+    .byte  9,  1,$fe                       // Climb through the upper-right quadrant.
+    .byte  9,$ff,$fe                       // Finish roughly 1.5 loops later on a natural up-left tangent.
+    .byte $ff, 0,  0                       // Coast up-left using the velocity already established by the loop.
 
 patternTopLoopRight:
-    .byte 42,  0,  2                       // Dive to the mirrored loop entry point.
-    .byte  5,$fe,  1                       // Arc down-left.
-    .byte  5,$fe,  0                       // Left.
-    .byte  5,$ff,$fe                       // Arc up-left.
-    .byte  5,  1,$fe                       // Arc up-right.
-    .byte  5,  2,  0                       // Right.
-    .byte  5,  2,  1                       // Arc down-right.
-    .byte  5,  1,  2                       // Continue around bottom-right.
-    .byte  5,$ff,  2                       // Close the loop near its entry.
-    .byte $ff, 2,  0                       // Break out and exit right.
+    .byte 30,  0,  2                       // Enter the mirrored loop higher so the larger lower arc stays clear.
+    .byte  9,$fe,  1                       // First loop: arc down-left.
+    .byte  9,$fe,  0                       // First loop: left.
+    .byte  9,$ff,$fe                       // First loop: arc up-left.
+    .byte  9,  1,$fe                       // First loop: arc up-right.
+    .byte  9,  2,  0                       // First loop: right.
+    .byte  9,  2,  1                       // First loop: arc down-right.
+    .byte  9,  1,  2                       // First loop: bottom-right arc.
+    .byte  9,$ff,  2                       // Complete one full loop still moving down-left.
+    .byte  9,$fe,  1                       // Continue into the second loop instead of reversing.
+    .byte  9,$fe,  0                       // Carry around the left-hand side.
+    .byte  9,$ff,$fe                       // Climb through the upper-left quadrant.
+    .byte  9,  1,$fe                       // Finish roughly 1.5 loops later on a natural up-right tangent.
+    .byte $ff, 0,  0                       // Coast up-right using the velocity already established by the loop.
 
 patternTopLoopTop:
-    .byte 38,  0,  2                       // Dive before beginning the vertical-return loop.
-    .byte  5,  2,  1                       // Down-right.
-    .byte  5,  2,  0                       // Right.
-    .byte  5,  1,$fe                       // Up-right.
-    .byte  5,$ff,$fe                       // Up-left.
-    .byte  5,$fe,  0                       // Left.
-    .byte  5,$fe,  1                       // Down-left.
-    .byte  5,$ff,  2                       // Bottom-left arc.
-    .byte  5,  1,  2                       // Close loop.
-    .byte $ff, 0,$fe                       // Exit vertically through the top.
+    .byte 30,  0,  2                       // Enter the loop higher so the extended arc stays clear of respawn Y.
+    .byte  9,  2,  1                       // First loop: arc down-right.
+    .byte  9,  2,  0                       // First loop: right.
+    .byte  9,  1,$fe                       // First loop: arc up-right.
+    .byte  9,$ff,$fe                       // First loop: arc up-left.
+    .byte  9,$fe,  0                       // First loop: left.
+    .byte  9,$fe,  1                       // First loop: arc down-left.
+    .byte  9,$ff,  2                       // First loop: bottom-left arc.
+    .byte  9,  1,  2                       // Complete one full loop still moving down-right.
+    .byte  9,  2,  1                       // Continue naturally into the second loop.
+    .byte  9,  2,  0                       // Carry around the right-hand side.
+    .byte  9,  1,$fe                       // Climb through the upper-right quadrant.
+    .byte  9,  0,$fe                       // Ease onto a vertical upward tangent rather than snapping to it.
+    .byte $ff, 0,  0                       // Coast straight up on the velocity established by the final arc.
 
-patternLeftCrossRight:
-    .byte 32,  2,  1                       // Enter from upper-left toward centre.
-    .byte 30,  2,  2                       // Steepen toward lower centre.
-    .byte 24,  2,  1                       // Flatten after crossing centre.
-    .byte 12,  2,  0                       // Commit to the right-side exit.
-    .byte $ff, 2,  0                       // Exit right.
+patternLeftUTurnUp:
+    .byte 30,  2,  1                       // Enter from upper-left and cross toward the right half.
+    .byte 24,  2,  2                       // Dive through centre, giving the player a useful firing window.
+    .byte 18,  2,  1                       // Flatten as the formation approaches its turn point.
+    .byte  8,  2,  0                       // Begin the near-180 turn while still travelling right.
+    .byte  8,  1,$ff                       // Arc upward and bleed off horizontal speed.
+    .byte 10,$ff,$ff                       // Complete the reversal onto a shallow up-left tangent.
+    .byte $ff, 0,  0                       // Coast back off the left side with inherited momentum.
 
-patternRightCrossLeft:
-    .byte 32,$fe,  1                       // Enter from upper-right toward centre.
-    .byte 30,$fe,  2                       // Steepen toward lower centre.
-    .byte 24,$fe,  1                       // Flatten after crossing centre.
-    .byte 12,$fe,  0                       // Commit to the left-side exit.
-    .byte $ff,$fe,  0                       // Exit left.
+patternRightUTurnUp:
+    .byte 30,$fe,  1                       // Enter from upper-right and cross toward the left half.
+    .byte 24,$fe,  2                       // Dive through centre, mirroring the left-entry attack.
+    .byte 18,$fe,  1                       // Flatten as the formation approaches its turn point.
+    .byte  8,$fe,  0                       // Begin the near-180 turn while still travelling left.
+    .byte  8,$ff,$ff                       // Arc upward and bleed off horizontal speed.
+    .byte 10,  1,$ff                       // Complete the reversal onto a shallow up-right tangent.
+    .byte $ff, 0,  0                       // Coast back off the right side with inherited momentum.
 
-patternLeftCrossTop:
-    .byte 34,  2,  2                       // Enter upper-left and dive toward lower centre.
-    .byte 26,  2,  1                       // Continue across while flattening.
-    .byte 14,  1,  0                       // Brief lateral sweep through the centre.
-    .byte 12,  1,$ff                       // Turn upward.
-    .byte $ff, 0,$fe                       // Exit through the top.
+patternLeftUTurnDown:
+    .byte 28,  2,  1                       // Enter from upper-left and cross toward the right half.
+    .byte 22,  2,  1                       // Keep this variant shallower before the turn.
+    .byte 16,  2,  0                       // Level out near the far side.
+    .byte  8,  2,  0                       // Hold the outward tangent briefly before curving back.
+    .byte  8,  1,  1                       // Arc downward while shedding horizontal speed.
+    .byte 10,$ff,  1                       // Reverse onto a shallow down-left tangent.
+    .byte $ff, 0,  0                       // Coast left and down; shallow angle should clear the side first.
 
-patternRightCrossTop:
-    .byte 34,$fe,  2                       // Enter upper-right and dive toward lower centre.
-    .byte 26,$fe,  1                       // Continue across while flattening.
-    .byte 14,$ff,  0                       // Brief mirrored lateral sweep.
-    .byte 12,$ff,$ff                       // Turn upward.
-    .byte $ff, 0,$fe                       // Exit through the top.
+patternRightUTurnDown:
+    .byte 28,$fe,  1                       // Enter from upper-right and cross toward the left half.
+    .byte 22,$fe,  1                       // Keep this mirrored variant shallower before the turn.
+    .byte 16,$fe,  0                       // Level out near the far side.
+    .byte  8,$fe,  0                       // Hold the outward tangent briefly before curving back.
+    .byte  8,$ff,  1                       // Arc downward while shedding horizontal speed.
+    .byte 10,  1,  1                       // Reverse onto a shallow down-right tangent.
+    .byte $ff, 0,  0                       // Coast right and down; shallow angle should clear the side first.
 
 
 ENEMY_PATTERNS_END:
