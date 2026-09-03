@@ -9,7 +9,7 @@
 .const TYPE_ENEMY_BULLET = 3
 
 .const MAX_ENEMY_BULLETS = 3
-.const ENEMY_FIRE_INTERVAL = 64              // Global frames between successful/attempted enemy shots.
+.const ENEMY_FIRE_INTERVAL = 42              // Global frames between successful/attempted enemy shots.
 .const ENEMY_BULLET_SPEED_Y = 3              // Fixed downward speed; X is quantised to a smooth -2..+2 slope.
 .const ENEMY_BULLET_COLOUR = 7               // Yellow individual sprite colour for the first projectile pass.
 
@@ -19,6 +19,11 @@
 .const SCORE_SCREEN = $0400 + 29              // Top row, right-aligned: "SCORE 00000".
 .const SCORE_COLOUR = $d800 + 29
 .const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
+.const LIVES_SCREEN = $0400 + 17               // Top row between FREE and SCORE: "LIVES 3".
+.const LIVES_COLOUR = $d800 + 17
+.const PLAYER_START_LIVES = 3                  // Three ships total, including the one currently in play.
+.const GAME_OVER_SCREEN = $0400 + (12 * 40) + 15
+.const GAME_OVER_COLOUR = $d800 + (12 * 40) + 15
 .const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
 
@@ -53,6 +58,7 @@
 .const PLAYER_STATE_ALIVE      = 0
 .const PLAYER_STATE_EXPLODING  = 1
 .const PLAYER_STATE_RESPAWNING = 2
+.const PLAYER_STATE_GAME_OVER  = 3
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
@@ -117,6 +123,7 @@ init:
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
+    jsr setupLivesDisplay                   // Draw "LIVES 3" and initialise the player's stock.
     jsr setupStarfield                      // Draw initial stars below the HUD row.
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
     jsr startRandomWave                      // Choose the first formation/pattern combination.
@@ -1043,7 +1050,7 @@ updateEnemyFire:
     lda OBJECT_Y,x                          // Keep firing to the readable middle of an attack.
     cmp #64
     bcc !next+
-    cmp #150
+    cmp #190
     bcs !next+
 
     stx ENEMY_FIRE_SOURCE                   // Preserve shooter while the allocator searches for a bullet slot.
@@ -1724,6 +1731,53 @@ buildBatchSpriteSchedule:
 !done:
     rts                                     // Return to the calling routine.
 
+// --- Routine: setupLivesDisplay --------------------------------------------
+// Initialise the stock and draw the compact top-row lives HUD.
+setupLivesDisplay:
+    lda #PLAYER_START_LIVES
+    sta PLAYER_LIVES
+    ldx #0
+!labelLoop:
+    lda livesLabel,x
+    sta LIVES_SCREEN,x
+    lda #1
+    sta LIVES_COLOUR,x
+    inx
+    cpx #7                                  // "LIVES " plus one digit.
+    bne !labelLoop-
+    rts
+
+// --- Routine: displayLives --------------------------------------------------
+// Current design only needs a single decimal digit; later upgrades/continues
+// can replace this if we ever allow more than nine ships.
+displayLives:
+    lda PLAYER_LIVES
+    clc
+    adc #48
+    sta LIVES_SCREEN + 6
+    rts
+
+livesLabel:
+    .byte 12,9,22,5,19,32,51               // Screen codes for "LIVES 3".
+
+// --- Routine: displayGameOver ----------------------------------------------
+// First-pass terminal state only.  The proper menu/game/game-over state machine
+// will later own screen transitions and restart behaviour.
+displayGameOver:
+    ldx #0
+!loop:
+    lda gameOverLabel,x
+    sta GAME_OVER_SCREEN,x
+    lda #1
+    sta GAME_OVER_COLOUR,x
+    inx
+    cpx #9
+    bne !loop-
+    rts
+
+gameOverLabel:
+    .byte 7,1,13,5,32,15,22,5,18           // Screen codes for "GAME OVER".
+
 // --- Routine: setupScoreDisplay --------------------------------------------
 // Clear the 16-bit score and draw "SCORE 00000" at the top-right of screen RAM.
 setupScoreDisplay:
@@ -2356,7 +2410,11 @@ updatePlayerState:
     beq !alive+
     cmp #PLAYER_STATE_EXPLODING
     beq !exploding+
-    jmp !respawning+
+    cmp #PLAYER_STATE_RESPAWNING
+    bne !notRespawning+                     // Keep relative branch local; respawn handler is now too far away.
+    jmp !respawning+                        // Absolute jump safely reaches the larger respawn block.
+!notRespawning:
+    rts                                     // GAME OVER is terminal in this first-pass gameplay test.
 
 !alive:
     lda PLAYER_HIT                          // Has collision capture reported a vulnerable-player impact?
@@ -2396,7 +2454,12 @@ updatePlayerState:
     beq !explosion3+
     cmp #3
     beq !explosion4+
-    jmp !startRespawn+                      // Four frames shown: reposition and enter invulnerability.
+
+    dec PLAYER_LIVES                        // The destroyed ship is now consumed.
+    jsr displayLives                        // Keep the HUD in sync with the remaining stock.
+    lda PLAYER_LIVES
+    beq !gameOver+                          // No ships remain: do not reposition or respawn.
+    jmp !startRespawn+                      // Otherwise reposition and enter invulnerability.
 
 !explosion2:
     lda #playerExplosion2 / 64
@@ -2421,6 +2484,14 @@ updatePlayerState:
 !reloadExplosion:
     lda #PLAYER_EXPLOSION_HOLD
     sta PLAYER_STATE_TIMER
+    rts
+
+!gameOver:
+    lda #PLAYER_STATE_GAME_OVER             // Freeze player lifecycle permanently for this v1 test.
+    sta PLAYER_STATE
+    lda #blankSprite / 64                   // Remove the ship after its final explosion has completed.
+    sta OBJECT_SPRITE
+    jsr displayGameOver                     // Put a simple centred GAME OVER message on screen.
     rts
 
 !startRespawn:
@@ -2787,7 +2858,8 @@ ASSIGN_OBJECT:         .fill 16, $ff    // Logical owner installed by each raste
 
 PLAYER_HW_MASK:        .byte 0         // Current VIC hardware bit occupied by logical object 0.
 PLAYER_HIT:            .byte 0         // Latched vulnerable-player collision event.
-PLAYER_STATE:          .byte 0         // Alive, exploding, or respawning.
+PLAYER_STATE:          .byte 0         // Alive, exploding, respawning, or terminal game-over.
+PLAYER_LIVES:          .byte 0         // Ships remaining, including the currently active ship.
 PLAYER_STATE_TIMER:    .byte 0         // Explosion-frame hold or respawn-invulnerability countdown.
 PLAYER_EXPLOSION_FRAME:.byte 0         // Current explosion bitmap index 0-3.
 PLAYER_BLINK_TIMER:    .byte 0         // Free-running respawn visibility phase.
