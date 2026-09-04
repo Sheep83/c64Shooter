@@ -3189,8 +3189,15 @@ enemyBulletSprite:
 // 7 upper-left  -> cross screen -> smooth U-turn -> exit lower-left
 // 8 upper-right -> cross screen -> smooth U-turn -> exit lower-right
 
+// attackEnemyCount and attackSpriteStart are declared as assembler lists so the
+// compile-time guard further down can bounds-check every entry against the
+// 8-entries-per-visual-set enemySpriteSequence layout.  The emitted bytes are
+// identical to a plain .byte row.
+.var attackEnemyCountData  = List().add(6, 6, 5, 5, 6, 6, 6, 5, 5)
+.var attackSpriteStartData = List().add(0, 8, 16, 24, 0, 8, 16, 24, 0)
+
 attackEnemyCount:
-    .byte 6, 6, 5, 5, 6, 6, 6, 5, 5
+    .fill attackEnemyCountData.size(), attackEnemyCountData.get(i)
 
 attackInterval:
     .byte 18,18,16,16,18,15,15,17,17
@@ -3216,7 +3223,7 @@ attackPathId:
 // Four reusable visual palettes.  Attack geometry and visuals remain separate
 // so stage data can later swap either independently.
 attackSpriteStart:
-    .byte 0,8,16,24,0,8,16,24,0
+    .fill attackSpriteStartData.size(), attackSpriteStartData.get(i)
 
 enemySpriteSequence:
     // Visual set 0.
@@ -3234,18 +3241,48 @@ enemySpriteSequence:
     // Visual set 3.
     .byte enemySpriteC/64, enemySpriteD/64, enemySpriteC/64, enemySpriteB/64
     .byte enemySpriteD/64, enemySpriteC/64, enemySpriteB/64, enemySpriteA/64
+enemySpriteSequenceEnd:
 
 enemyColourSequence:
     .byte 2, 6,10, 7, 7,10, 6, 2
     .byte 6,13, 7,10, 6,13, 7,10
     .byte 14,13,7, 2, 7,13,14, 2
     .byte 7,14, 7,10,14, 7,10, 2
+enemyColourSequenceEnd:
 
 // Cheap mapping from a four-bit CIA timer sample to nine attack IDs.
 // Uneven distribution is intentional/irrelevant for the temporary chaos
 // director; real stages will choose attacks explicitly.
 randomAttackMap:
     .byte 0,1,2,3,4,5,6,7,8,0,2,4,6,8,1,5
+
+// --- Compile-time bounds guard: curated attack visual sequences -----------
+// spawnEnemy reads attackEnemyCount[id] consecutive entries from
+// enemySpriteSequence / enemyColourSequence, starting at attackSpriteStart[id]
+// and advancing WAVE_SPRITE_INDEX once per spawn.  A visual set is 8 entries;
+// the whole sequence is 4 sets = 32 entries.  These checks mirror the existing
+// enemyPatterns size guard so tuning data can never silently walk off the end
+// of these parallel tables at runtime.
+.const ENEMY_SPRITE_SEQUENCE_LEN = 32
+
+.if ((enemySpriteSequenceEnd - enemySpriteSequence) != ENEMY_SPRITE_SEQUENCE_LEN) {
+    .error "enemySpriteSequence is not " + toIntString(ENEMY_SPRITE_SEQUENCE_LEN) + " entries"
+}
+.if ((enemyColourSequenceEnd - enemyColourSequence) != ENEMY_SPRITE_SEQUENCE_LEN) {
+    .error "enemyColourSequence length does not match enemySpriteSequence"
+}
+.if (attackEnemyCountData.size() != ATTACK_COUNT || attackSpriteStartData.size() != ATTACK_COUNT) {
+    .error "attack parameter tables must have ATTACK_COUNT entries"
+}
+
+.for (var i = 0; i < ATTACK_COUNT; i++) {
+    .if (attackEnemyCountData.get(i) > 8) {
+        .error "attackEnemyCount[" + toIntString(i) + "] > 8 exceeds one enemySpriteSequence visual set"
+    }
+    .if ((attackSpriteStartData.get(i) + attackEnemyCountData.get(i)) > ENEMY_SPRITE_SEQUENCE_LEN) {
+        .error "attack " + toIntString(i) + " sprite window runs past enemySpriteSequence"
+    }
+}
 
 // --- Movement pattern offsets ----------------------------------------------
 // Each object stores a byte offset into enemyPatterns as OBJECT_PATH_STEP.
