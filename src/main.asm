@@ -73,6 +73,9 @@
 .const ATTRACT_PAGE_TITLE  = 0
 .const ATTRACT_PAGE_SCORES = 1
 .const ATTRACT_CYCLE_FRAMES = 250                    // ~5 PAL seconds per attract page.
+
+.const INITIALS_PROMPT_SCREEN = $0400 + (10 * 40) + 10  // Row 10, "ENTER YOUR INITIALS" (19).
+.const INITIALS_SLOTS_SCREEN  = $0400 + (14 * 40) + 18  // Row 14: three letters at cols 18/20/22.
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
@@ -224,7 +227,11 @@ mainLoop:
     jsr gameOverScreen                      // Holds "GAME OVER", then routes to the menu.
     jmp !router-
 !notGameOver:
-    // MENU (ENTER_INITIALS branch is added in a later commit).
+    cmp #GAME_STATE_ENTER_INITIALS
+    bne !menuState+
+    jsr enterInitialsScreen                 // Type three initials, then routes to the menu.
+    jmp !router-
+!menuState:
     jsr attractMenu                         // Runs until fire starts a new game.
     jmp !router-
 
@@ -306,7 +313,9 @@ enterGameOver:
 
 // --- Routine: gameOverScreen -----------------------------------------
 // PLAIN ENGLISH: after your last ship is gone, "GAME OVER" sits on screen
-// over the drifting stars for a few seconds, then the attract menu returns.
+// over the drifting stars for a few seconds. Then, if the score beat the
+// bottom of the high-score table, the initials-entry screen appears;
+// otherwise the attract menu returns.
 gameOverScreen:
     jsr waitForFrameStart
     jsr updateStarfield
@@ -314,12 +323,263 @@ gameOverScreen:
 
     dec GAME_OVER_TIMER
     bne !hold+
-    lda #GAME_STATE_MENU                    // Hold elapsed: back to the attract menu.
+
+    jsr scoreQualifies                     // Carry set => this run makes the table.
+    bcc !toMenu+
+    lda #GAME_STATE_ENTER_INITIALS
+    sta GAME_STATE
+    jsr enterInitials
+    rts
+!toMenu:
+    lda #GAME_STATE_MENU
     sta GAME_STATE
     jsr enterMenu
     rts
 !hold:
     jmp gameOverScreen
+
+// --- Routine: scoreQualifies ---------------------------------------
+// Compare the just-finished SCORE (still in SCORE_LO/HI) against the
+// descending high-score table. Exit: carry set and NEW_SCORE_RANK = the
+// sorted insertion index if SCORE beats some entry; carry clear otherwise.
+scoreQualifies:
+    ldx #0
+!scan:
+    lda SCORE_HI
+    cmp HISCORE_HI,x
+    bcc !next+                              // SCORE high byte smaller -> SCORE < entry here.
+    bne !here+                              // SCORE high byte larger  -> SCORE > entry here.
+    lda SCORE_LO                            // High bytes equal: decide on the low byte.
+    cmp HISCORE_LO,x
+    bcc !next+
+    beq !next+                             // Equal score does not displace an existing entry.
+!here:
+    stx NEW_SCORE_RANK
+    sec
+    rts
+!next:
+    inx
+    cpx #HISCORE_COUNT
+    bne !scan-
+    clc                                    // Not greater than any entry, including the lowest.
+    rts
+
+// --- Routine: enterInitials --------------------------------------
+// One-time setup for the initials-entry screen.
+enterInitials:
+    lda #147
+    jsr $ffd2
+    jsr drawStarfield
+
+    lda #1                                  // Start every slot on "A".
+    sta INITIALS_CHARS + 0
+    sta INITIALS_CHARS + 1
+    sta INITIALS_CHARS + 2
+    lda #0
+    sta INITIALS_SLOT                       // Leftmost slot selected.
+    lda STICK_2
+    sta INITIALS_STICK_PREV                 // Seed edge detection with the current stick state.
+
+    jsr waitFireRelease                     // Ignore any fire still held from the GAME OVER screen.
+    jsr drawInitialsScreen
+    rts
+
+// --- Routine: enterInitialsScreen ---------------------------------
+// PLAIN ENGLISH: "ENTER YOUR INITIALS" with three letters below it. Push the
+// stick up/down to change the highlighted letter, left/right to pick which
+// letter you are changing, and press fire when all three are right. Your
+// score is then slotted into the table and the high-score page is shown.
+// Each stick direction only acts once per push (edge-triggered), so holding
+// a direction does not race through the alphabet.
+enterInitialsScreen:
+    jsr waitForFrameStart
+    jsr updateStarfield
+    jsr drawInitialsScreen
+
+    lda STICK_2                             // Edge-detect: bit becomes 1 only on a fresh press.
+    sta INITIALS_STICK_CUR
+    eor #$ff                                // ~current (bit set = pressed now).
+    and INITIALS_STICK_PREV                 // AND was-released-last-frame.
+    sta INITIALS_EDGE
+    lda INITIALS_STICK_CUR
+    sta INITIALS_STICK_PREV
+
+    lda INITIALS_EDGE
+    and #%00000001
+    bne !up+
+    lda INITIALS_EDGE
+    and #%00000010
+    bne !down+
+    lda INITIALS_EDGE
+    and #%00000100
+    bne !left+
+    lda INITIALS_EDGE
+    and #%00001000
+    bne !right+
+    lda INITIALS_EDGE
+    and #%00010000
+    bne !commit+
+    jmp enterInitialsScreen
+
+!up:
+    ldx INITIALS_SLOT                       // Next letter, wrapping Z -> A.
+    lda INITIALS_CHARS,x
+    cmp #26
+    bcc !bumpUp+
+    lda #0
+!bumpUp:
+    clc
+    adc #1
+    sta INITIALS_CHARS,x
+    jmp enterInitialsScreen
+
+!down:
+    ldx INITIALS_SLOT                       // Previous letter, wrapping A -> Z.
+    lda INITIALS_CHARS,x
+    cmp #2
+    bcs !bumpDown+
+    lda #27
+!bumpDown:
+    sec
+    sbc #1
+    sta INITIALS_CHARS,x
+    jmp enterInitialsScreen
+
+!left:
+    lda INITIALS_SLOT
+    beq !nav+
+    dec INITIALS_SLOT
+!nav:
+    jmp enterInitialsScreen
+
+!right:
+    lda INITIALS_SLOT
+    cmp #2
+    bcs !nav-
+    inc INITIALS_SLOT
+    jmp enterInitialsScreen
+
+!commit:
+    jsr insertHiscore                       // Slot SCORE + these initials into the table.
+
+    lda #147                                // Show the updated high-score page straight away.
+    jsr $ffd2
+    jsr drawStarfield
+    lda #ATTRACT_PAGE_SCORES
+    sta ATTRACT_PAGE
+    lda #ATTRACT_CYCLE_FRAMES
+    sta ATTRACT_TIMER
+    jsr drawHiscorePage
+
+    lda #GAME_STATE_MENU
+    sta GAME_STATE
+    jsr waitFireRelease                     // Don't let the commit press also start a new game.
+    rts
+
+// --- Routine: drawInitialsScreen --------------------------------
+// Prompt on row 10, the three current letters on row 14 (cols 18/20/22).
+// The selected slot is drawn yellow, the others white.
+drawInitialsScreen:
+    lda #<initialsPrompt
+    sta TEXT_SRC
+    lda #>initialsPrompt
+    sta TEXT_SRC + 1
+    lda #<INITIALS_PROMPT_SCREEN
+    sta TEXT_DST
+    lda #>INITIALS_PROMPT_SCREEN
+    sta TEXT_DST + 1
+    ldx #19                                 // "ENTER YOUR INITIALS".
+    lda #1
+    jsr drawTextRow
+
+    ldx #0                                  // X = slot 0..2 (also survives the stores below).
+!slotLoop:
+    txa
+    asl                                    // slot * 2 (letters are two columns apart).
+    clc
+    adc #<INITIALS_SLOTS_SCREEN
+    sta initLetterScreen + 1
+    sta initLetterColour + 1
+    lda #>INITIALS_SLOTS_SCREEN
+    adc #0
+    sta initLetterScreen + 2
+    clc
+    adc #$d4                                // Matching colour-RAM page.
+    sta initLetterColour + 2
+
+    lda #1                                  // White unless this is the selected slot.
+    cpx INITIALS_SLOT
+    bne !haveColour+
+    lda #7                                  // Yellow highlight.
+!haveColour:
+    sta initLetterColourVal + 1
+
+    lda INITIALS_CHARS,x
+initLetterScreen:
+    sta $ffff
+initLetterColourVal:
+    lda #0
+initLetterColour:
+    sta $ffff
+
+    inx
+    cpx #3
+    bne !slotLoop-
+    rts
+
+// --- Routine: insertHiscore ------------------------------------
+// Insert SCORE + INITIALS_CHARS at NEW_SCORE_RANK, shifting the lower
+// entries (and their names) down one slot and dropping the last. Then
+// rebuild the pre-rendered attract-page rows.
+insertHiscore:
+    ldx #HISCORE_COUNT - 1                  // Shift scores down from the bottom to the insert point.
+!scoreShift:
+    cpx NEW_SCORE_RANK
+    beq !scoreShifted+
+    lda HISCORE_LO - 1,x
+    sta HISCORE_LO,x
+    lda HISCORE_HI - 1,x
+    sta HISCORE_HI,x
+    dex
+    jmp !scoreShift-
+!scoreShifted:
+    ldx NEW_SCORE_RANK
+    lda SCORE_LO
+    sta HISCORE_LO,x
+    lda SCORE_HI
+    sta HISCORE_HI,x
+
+    lda NEW_SCORE_RANK                      // rank * 3 = first name byte for this entry.
+    asl
+    clc
+    adc NEW_SCORE_RANK
+    sta NAME_RANK_OFF
+    clc
+    adc #3                                  // Lowest destination byte a shift may fill.
+    sta NAME_STOP_OFF
+
+    ldx #HISCORE_COUNT * 3 - 1              // Shift 3-byte name blocks down.
+!nameShift:
+    cpx NAME_STOP_OFF
+    bcc !nameShifted+
+    lda HISCORE_NAME - 3,x
+    sta HISCORE_NAME,x
+    dex
+    jmp !nameShift-
+!nameShifted:
+    ldx NAME_RANK_OFF                       // Write the three new initials.
+    ldy #0
+!nameWrite:
+    lda INITIALS_CHARS,y
+    sta HISCORE_NAME,x
+    inx
+    iny
+    cpy #3
+    bne !nameWrite-
+
+    jsr formatHiscorePage
+    rts
+
 
 // --- Routine: drawGameOverText -------------------------------------
 // Stamp "GAME OVER" centred on row 12.
@@ -675,6 +935,8 @@ fireToStartLine:
     .text "FIRE TO START"                   // 13 screen codes.
 hiscoreHeading:
     .text "HIGH SCORES"                     // 11 screen codes.
+initialsPrompt:
+    .text "ENTER YOUR INITIALS"             // 19 screen codes.
 .encoding "petscii_upper"
 
 // --- Routine: setupStarfieldCharset ---------------------------------------
@@ -3315,6 +3577,15 @@ GAME_STATE:            .byte 0         // Top-level state: MENU / PLAYING / GAME
 ATTRACT_PAGE:          .byte 0         // 0 = title page, 1 = high-score page.
 ATTRACT_TIMER:         .byte 0         // Frames left before the attract screen flips pages.
 GAME_OVER_TIMER:       .byte 0         // Frames left on the GAME OVER screen.
+
+NEW_SCORE_RANK:        .byte 0         // Sorted insert index for a qualifying score.
+NAME_RANK_OFF:         .byte 0         // NEW_SCORE_RANK * 3 (first HISCORE_NAME byte).
+NAME_STOP_OFF:         .byte 0         // Lowest HISCORE_NAME byte a name shift may fill.
+INITIALS_CHARS:        .fill 3, 1      // The three initials being edited (screen codes 1..26).
+INITIALS_SLOT:         .byte 0         // Which initial (0..2) the stick is currently editing.
+INITIALS_STICK_PREV:   .byte 0         // Previous joystick reading for press-edge detection.
+INITIALS_STICK_CUR:    .byte 0         // Current joystick reading (scratch).
+INITIALS_EDGE:         .byte 0         // Bits that went released -> pressed this frame.
 
 HISCORE_SEED:          .byte 0         // Running seed for placeholder-initial generation.
 HS_ENTRY:              .byte 0         // Scratch: current entry index during table formatting.
