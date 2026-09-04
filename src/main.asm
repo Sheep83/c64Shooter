@@ -410,6 +410,7 @@ endGame:
 enterGameOver:
     lda #147
     jsr $ffd2                               // Wipe the game HUD / playfield.
+    jsr clearBackgroundShadow               // No stale terrain left for stars to restore.
     jsr drawStarfield                       // Keep the starfield running underneath.
     jsr drawGameOverText
     rts
@@ -706,6 +707,7 @@ drawGameOverText:
 enterMenu:
     lda #147
     jsr $ffd2                               // Clear screen RAM (also wipes any game HUD / GAME OVER text).
+    jsr clearBackgroundShadow               // No stale terrain left for stars to restore.
     jsr drawStarfield                       // Repaint the stars over the cleared screen.
 
     lda #ATTRACT_PAGE_TITLE                 // Always come back to the title first.
@@ -4782,6 +4784,35 @@ BG_COLOUR_SHADOW_END:
 .if ((BG_COLOUR_BASE & $ff) != 0) {
     .error "BG_COLOUR_BASE must be $xx00-aligned for the shadow-address high-byte trick"
 }
+
+// --- Routine: clearBackgroundShadow ---------------------------------------
+// Reset both shadow buffers to open sky (found in testing: without this,
+// leaving a game with terrain on screen and returning to a screen with no
+// scrolling landscape - GAME OVER, the menu - left stale terrain in the
+// shadow buffers, which star movement would then restore via eraseOneStar,
+// making old terrain fragments visibly "bleed back" onto a screen that
+// should be pure starfield). Called whenever a non-PLAYING screen is
+// entered. X counts 0-249 across four 250-byte segments to cover each
+// 1000-byte buffer without a 16-bit loop counter. (Found in testing: an
+// earlier X-wraps-0-255 version overran each buffer by 6 bytes into the
+// following resident code on every pass - 250*4=1000, but 256*4=1024.)
+clearBackgroundShadow:
+    ldx #0
+!loop:
+    lda #BG_CHAR_SKY
+    sta bgCharShadow,x
+    sta bgCharShadow + 250,x
+    sta bgCharShadow + 500,x
+    sta bgCharShadow + 750,x
+    lda #0
+    sta bgColourShadow,x
+    sta bgColourShadow + 250,x
+    sta bgColourShadow + 500,x
+    sta bgColourShadow + 750,x
+    inx
+    cpx #250
+    bne !loop-
+    rts
 
 // --- Routine: resetHudScroll -------------------------------------------
 // Force YSCROL to 0 for the top of the frame (row 0/HUD) so the raster split
