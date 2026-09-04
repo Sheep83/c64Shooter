@@ -1,38 +1,61 @@
 # Background / stage engine — design notes
 
-Status: builds and runs, but **scrolling does not work correctly** as
-implemented. Placeholder art and a placeholder test map throughout; the
-*mechanism* is intended to be final once this is fixed.
+Status: scrolling logic confirmed correct and continuous. The coarse-step
+implementation is currently a deliberately unoptimised "brute-force" fix
+(see below) with a known, not-yet-addressed performance cost - that is
+the next problem, tracked separately from the correctness bug this
+section used to describe. Placeholder art and a placeholder test map
+throughout; the *mechanism* is intended to be final.
 
-## KNOWN ISSUE — scrolling is broken (reported by human playtesting)
+## RESOLVED — the "snap back" scrolling bug was a live/shadow sync bug, not a raster-timing bug
 
-Observed on real playthrough (not caught by this session's own automated
-testing, which only compared static screenshots taken tens of millions of
-cycles apart and so never watched continuous per-frame motion): the
-background advances roughly one character row, then visibly snaps back.
-Some characters appear to advance while most do not.
+The original hypothesis in this section (raster-timing/scheduling) was
+**wrong** and was superseded before any raster work was attempted, per an
+independent review that correctly diagnosed the actual defect from the
+code alone: `advanceCoarseRow` called `shiftShadowRowsDown` (which only
+ever touches the two shadow buffers) and then `blitShadowRowToLive` for
+**row 1 only**. Live screen RAM (`$0400`) and colour RAM (`$D800`) rows
+2-24 were therefore never updated after the initial static build - a
+plain logical-ownership bug with nothing to do with raster timing.
 
-This was not root-caused before the branch was pushed. Best working
-hypothesis, for whoever picks this up: the coarse row-shift
-(`shiftShadowRowsDown` + `renderMapRowIntoShadow` + `blitShadowRowToLive`,
-driven from `advanceCoarseRow`) is deliberately *not* synchronised to any
-raster-safe window - it's timed on cycle-budget reasoning alone (see "Why
-fine-Y hardware scroll" below), on the assumption that it always finishes
-before the shifted rows are next raster-scanned. The reported symptom -
-partial advance, snap-back, only some characters affected - is consistent
-with that assumption being wrong: if the shift is still in progress (or a
-raster IRQ interrupts it) when the beam reaches an already-shifted vs.
-not-yet-shifted row, some rows would show new content and others stale
-content in the same frame (matching "some characters advance, most don't"),
-and the *next* frame's fine-scroll relative to a partially-shifted picture
-would look like a snap-back. This is exactly the risk flagged as a
-deliberate, revisit-if-visible trade-off in the design section below - it
-has now visibly manifested. The two things worth checking first: (1)
-instrument exactly when in the raster frame the shift/blit actually run
-relative to `HUD_SPLIT_RASTER` and the batch schedule, and (2) whether
-`SCROLL_FINE`'s wrap-to-`advanceCoarseRow` transition and the row 1
-blit-to-live are actually landing in the same frame as each other, or one
-frame apart.
+Confirmed empirically before changing anything (as instructed - see
+`git log` for the exact protocol): a disposable diagnostic build dumped
+shadow vs. live screen-RAM bytes at several rows immediately after the
+first coarse transition. Row 1 matched (it *was* blitted); row 10 showed
+shadow=`$20` (sky) vs. live=`$e9` (233, a stale pre-shift turret-head
+glyph left over from the initial build); row 20 showed shadow=`$e0` vs.
+live=`$e1` (a different rock-tile byte). That divergence is exactly what
+produces "advances one row then snaps back, only some cells move": row 1
+alone changing, the rest reverting to old content, on every coarse step.
+It also explains the reported "random" corruption - once shadow and live
+diverge, `eraseOneStar` (which is intentionally shadow-authoritative)
+copies now-mismatched shadow content into individual live cells wherever
+a star happens to move, scattering fragments of the "true" (shadow)
+background across the still-stale live screen.
+
+**Fix applied** (`advanceCoarseRow`): blit *every* row (1-24) from shadow
+to live on every coarse step, not just row 1 - reusing the existing,
+already-correct `blitShadowRowToLive` in a loop. Deliberately the
+simplest possible correct fix, chosen over any raster-safety work per the
+instruction to prove logical correctness first. Re-verified via the same
+shadow-vs-live byte comparison after six repeated coarse transitions
+(all rows checked matched); watched a close-spaced sequence of screenshots
+(~1-2M cycles apart) show continuous, correct terrain progression with no
+snap-back, including the background-attached turret scrolling correctly
+with it.
+
+**Known follow-up (not yet addressed - this is "problem B", deliberately
+separated from the correctness fix above):** blitting all 24 rows costs
+roughly 23,000 extra cycles on top of the existing ~24,000-cycle shadow
+shift, i.e. a coarse-step frame now costs on the order of 50-55k cycles -
+about 2.5-3x a normal 19,656-cycle PAL frame. No visual tearing was
+observed in testing (the existing LIVE/BUILD double-buffered render-plan
+swap means this heavy work happens during background-plan construction,
+before the next presented frame, so the effect is a pacing stutter rather
+than a mid-scan corruption), and the FREE-cycle debug HUD stayed positive
+throughout, but this has not been measured under sustained real-time play
+and is exactly the kind of cost the original raster-timing/optimisation
+work should target next, informed by profiling with the FREE-cycle HUD.
 
 ## Why fine-Y hardware scroll + a live coarse row-shift
 

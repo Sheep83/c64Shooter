@@ -4974,8 +4974,23 @@ advanceCoarseRow:
     jsr renderMapRowIntoShadow
     jsr stampTurretsIntoRow
 
+    // BRUTE-FORCE CORRECTNESS FIX (diagnostic-confirmed bug, see
+    // docs/background-engine.md): shiftShadowRowsDown only ever advances
+    // the shadow buffers. Previously only row 1 was blitted to the live
+    // screen here, so live rows 2-24 were never updated after the initial
+    // static build - confirmed by directly comparing shadow vs. live bytes
+    // in VICE immediately after the first coarse transition (row 10 showed
+    // shadow=$20/sky vs. live=$e9, a stale pre-shift turret-head glyph;
+    // row 20 showed shadow=$e0 vs. live=$e1). Blitting every row, every
+    // coarse step, is the simplest possible correct fix and is deliberately
+    // not optimised yet - see the doc for the follow-up performance work
+    // once this is confirmed to make scrolling continuous.
     ldx #1
+!liveSyncLoop:
     jsr blitShadowRowToLive
+    inx
+    cpx #25
+    bne !liveSyncLoop-
     rts
 
 // --- Routine: shiftShadowRowsDown -----------------------------------------
