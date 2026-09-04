@@ -23,7 +23,7 @@
 .const LIVES_COLOUR = $d800 + 17
 .const PLAYER_START_LIVES = 3                  // Three ships total, including the one currently in play.
 .const GAME_OVER_SCREEN = $0400 + (12 * 40) + 15
-.const GAME_OVER_COLOUR = $d800 + (12 * 40) + 15
+.const GAME_OVER_HOLD_FRAMES = 180                 // ~3.6 PAL seconds on the GAME OVER screen.
 .const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
 
@@ -219,7 +219,12 @@ mainLoop:
     jsr gameLoop                            // Runs until the player reaches GAME OVER.
     jmp !router-
 !notPlaying:
-    // MENU today; later commits add GAME_OVER / ENTER_INITIALS branches here.
+    cmp #GAME_STATE_GAME_OVER
+    bne !notGameOver+
+    jsr gameOverScreen                      // Holds "GAME OVER", then routes to the menu.
+    jmp !router-
+!notGameOver:
+    // MENU (ENTER_INITIALS branch is added in a later commit).
     jsr attractMenu                         // Runs until fire starts a new game.
     jmp !router-
 
@@ -263,10 +268,9 @@ gameLoop:
 // --- Routine: endGame ---------------------------------------------------
 // PLAIN ENGLISH: the instant your last life is gone the game freezes. The
 // per-scanline interrupt that juggles more than eight sprites is switched
-// off, the KERNAL's normal interrupt is put back in charge, every hardware
-// sprite is hidden, and control returns to the menu. For this first
-// structural step GAME OVER drops straight back to the attract screen; the
-// dedicated "GAME OVER" hold and initials entry arrive in later commits.
+// off, the KERNAL's normal interrupt is put back in charge, and every
+// hardware sprite is hidden. Control then moves to the GAME OVER screen,
+// which holds for a few seconds before returning to the attract menu.
 endGame:
     sei                                     // Change interrupt hardware with IRQs held off.
     lda IRQ_ENABLE
@@ -284,9 +288,53 @@ endGame:
     sta SPRITE_ENABLE                       // Hide every hardware sprite.
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
 
-    lda #GAME_STATE_MENU                    // Later commits set GAME_OVER / ENTER_INITIALS here instead.
+    lda #GAME_STATE_GAME_OVER
     sta GAME_STATE
-    jsr enterMenu                           // Prepare the attract screen before the router runs it.
+    lda #GAME_OVER_HOLD_FRAMES
+    sta GAME_OVER_TIMER
+    jsr enterGameOver                       // Clear screen, repaint stars, stamp "GAME OVER".
+    rts
+
+// --- Routine: enterGameOver -------------------------------------------
+// One-time setup for the GAME OVER screen.
+enterGameOver:
+    lda #147
+    jsr $ffd2                               // Wipe the game HUD / playfield.
+    jsr drawStarfield                       // Keep the starfield running underneath.
+    jsr drawGameOverText
+    rts
+
+// --- Routine: gameOverScreen -----------------------------------------
+// PLAIN ENGLISH: after your last ship is gone, "GAME OVER" sits on screen
+// over the drifting stars for a few seconds, then the attract menu returns.
+gameOverScreen:
+    jsr waitForFrameStart
+    jsr updateStarfield
+    jsr drawGameOverText                    // Re-stamp every frame so stars pass behind it.
+
+    dec GAME_OVER_TIMER
+    bne !hold+
+    lda #GAME_STATE_MENU                    // Hold elapsed: back to the attract menu.
+    sta GAME_STATE
+    jsr enterMenu
+    rts
+!hold:
+    jmp gameOverScreen
+
+// --- Routine: drawGameOverText -------------------------------------
+// Stamp "GAME OVER" centred on row 12.
+drawGameOverText:
+    lda #<gameOverLabel
+    sta TEXT_SRC
+    lda #>gameOverLabel
+    sta TEXT_SRC + 1
+    lda #<GAME_OVER_SCREEN
+    sta TEXT_DST
+    lda #>GAME_OVER_SCREEN
+    sta TEXT_DST + 1
+    ldx #9                                  // "GAME OVER".
+    lda #2                                  // Red.
+    jsr drawTextRow
     rts
 
 // --- Routine: enterMenu -----------------------------------------------
@@ -2183,23 +2231,9 @@ displayLives:
 livesLabel:
     .byte 12,9,22,5,19,32,51               // Screen codes for "LIVES 3".
 
-// --- Routine: displayGameOver ----------------------------------------------
-// First-pass terminal state only.  The proper menu/game/game-over state machine
-// will later own screen transitions and restart behaviour.
-displayGameOver:
-    ldx #0
-!loop:
-    lda gameOverLabel,x
-    sta GAME_OVER_SCREEN,x
-    lda #1
-    sta GAME_OVER_COLOUR,x
-    inx
-    cpx #9
-    bne !loop-
-    rts
-
+// "GAME OVER" screen codes, stamped by drawGameOverText via drawTextRow.
 gameOverLabel:
-    .byte 7,1,13,5,32,15,22,5,18           // Screen codes for "GAME OVER".
+    .byte 7,1,13,5,32,15,22,5,18
 
 // --- Routine: setupScoreDisplay --------------------------------------------
 // Clear the 16-bit score and draw "SCORE 00000" at the top-right of screen RAM.
@@ -3280,6 +3314,7 @@ ASSIGN_OBJECT:         .fill 16, $ff    // Logical owner installed by each raste
 GAME_STATE:            .byte 0         // Top-level state: MENU / PLAYING / GAME_OVER / ENTER_INITIALS.
 ATTRACT_PAGE:          .byte 0         // 0 = title page, 1 = high-score page.
 ATTRACT_TIMER:         .byte 0         // Frames left before the attract screen flips pages.
+GAME_OVER_TIMER:       .byte 0         // Frames left on the GAME OVER screen.
 
 HISCORE_SEED:          .byte 0         // Running seed for placeholder-initial generation.
 HS_ENTRY:              .byte 0         // Scratch: current entry index during table formatting.
