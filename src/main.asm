@@ -4745,6 +4745,38 @@ ACTIVE_TURRET_COL:        .fill TURRET_POOL_SIZE, 0        // Cached character c
 ACTIVE_TURRET_X_LO:       .fill TURRET_POOL_SIZE, 0         // Cached 9-bit pixel X (col*8).
 ACTIVE_TURRET_X_MSB:      .fill TURRET_POOL_SIZE, 0
 
+// --- Shadow "true background" buffers --------------------------------------
+// BG_CHAR_BASE/BG_COLOUR_BASE were declared as address constants up in the
+// shared-constants block, but that on its own does NOT reserve the RAM - the
+// actual 1000-byte arrays must be assembled here. (Bug found in testing:
+// without this, resident code below $4000 simply grew straight through
+// $4400/$4800 and every shadow-buffer read/write was silently corrupting -
+// and being corrupted by - this routine code itself.) Explicit addresses so
+// BG_CHAR_HI_DELTA/BG_COLOUR_HI_DELTA's "add a constant to the high byte"
+// trick stays valid; row 0 of each (the first 40 bytes) is unused filler,
+// since HUD row 0 is never touched by the background system.
+* = BG_CHAR_BASE
+bgCharShadow:
+    .fill 1000, BG_CHAR_SKY
+BG_CHAR_SHADOW_END:
+.if ((BG_CHAR_SHADOW_END - bgCharShadow) != 1000) {
+    .error "bgCharShadow is not exactly 1000 bytes"
+}
+.if ((BG_CHAR_BASE & $ff) != 0) {
+    .error "BG_CHAR_BASE must be $xx00-aligned for the shadow-address high-byte trick"
+}
+
+* = BG_COLOUR_BASE
+bgColourShadow:
+    .fill 1000, 0
+BG_COLOUR_SHADOW_END:
+.if ((BG_COLOUR_SHADOW_END - bgColourShadow) != 1000) {
+    .error "bgColourShadow is not exactly 1000 bytes"
+}
+.if ((BG_COLOUR_BASE & $ff) != 0) {
+    .error "BG_COLOUR_BASE must be $xx00-aligned for the shadow-address high-byte trick"
+}
+
 // --- Routine: resetHudScroll -------------------------------------------
 // Force YSCROL to 0 for the top of the frame (row 0/HUD) so the raster split
 // (scrollSplitIRQ) only ever reveals the real scroll value below row 0.
