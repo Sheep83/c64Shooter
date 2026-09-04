@@ -1,7 +1,38 @@
 # Background / stage engine — design notes
 
-Status: first working prototype ("v1"). Placeholder art and a placeholder
-test map throughout; the *mechanism* is intended to be final.
+Status: builds and runs, but **scrolling does not work correctly** as
+implemented. Placeholder art and a placeholder test map throughout; the
+*mechanism* is intended to be final once this is fixed.
+
+## KNOWN ISSUE — scrolling is broken (reported by human playtesting)
+
+Observed on real playthrough (not caught by this session's own automated
+testing, which only compared static screenshots taken tens of millions of
+cycles apart and so never watched continuous per-frame motion): the
+background advances roughly one character row, then visibly snaps back.
+Some characters appear to advance while most do not.
+
+This was not root-caused before the branch was pushed. Best working
+hypothesis, for whoever picks this up: the coarse row-shift
+(`shiftShadowRowsDown` + `renderMapRowIntoShadow` + `blitShadowRowToLive`,
+driven from `advanceCoarseRow`) is deliberately *not* synchronised to any
+raster-safe window - it's timed on cycle-budget reasoning alone (see "Why
+fine-Y hardware scroll" below), on the assumption that it always finishes
+before the shifted rows are next raster-scanned. The reported symptom -
+partial advance, snap-back, only some characters affected - is consistent
+with that assumption being wrong: if the shift is still in progress (or a
+raster IRQ interrupts it) when the beam reaches an already-shifted vs.
+not-yet-shifted row, some rows would show new content and others stale
+content in the same frame (matching "some characters advance, most don't"),
+and the *next* frame's fine-scroll relative to a partially-shifted picture
+would look like a snap-back. This is exactly the risk flagged as a
+deliberate, revisit-if-visible trade-off in the design section below - it
+has now visibly manifested. The two things worth checking first: (1)
+instrument exactly when in the raster frame the shift/blit actually run
+relative to `HUD_SPLIT_RASTER` and the batch schedule, and (2) whether
+`SCROLL_FINE`'s wrap-to-`advanceCoarseRow` transition and the row 1
+blit-to-live are actually landing in the same frame as each other, or one
+frame apart.
 
 ## Why fine-Y hardware scroll + a live coarse row-shift
 
