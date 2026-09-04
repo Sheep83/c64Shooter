@@ -54,8 +54,14 @@
 // ($x400/$x800, low byte $00), so a shadow address is always "screen address
 // with a constant added to the high byte" - the same idiom the star code
 // already uses for colour RAM (+$d4).
-.const BG_CHAR_HI_DELTA   = >BG_CHAR_BASE   - >$0400
-.const BG_COLOUR_HI_DELTA = >BG_COLOUR_BASE - >$0400
+// Parenthesised deliberately: KickAssembler binds ">" looser than "-" here,
+// so the unparenthesised form silently computed >(BG_CHAR_BASE - >$0400)
+// instead of (>BG_CHAR_BASE) - (>$0400) - found in testing, see the commit
+// history for how this was diagnosed (it manifested as self-modifying
+// shadow-buffer writes overwriting resident code many rows into the first
+// scrolling-background build).
+.const BG_CHAR_HI_DELTA   = (>BG_CHAR_BASE)   - (>$0400)
+.const BG_COLOUR_HI_DELTA = (>BG_COLOUR_BASE) - (>$0400)
 
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N frames.
 .const HUD_SPLIT_RASTER = 58                        // First scanline of character row 1 (empirically tuned).
