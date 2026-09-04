@@ -1,16 +1,20 @@
 # Background / stage engine — design notes
 
-Status: scrolling is logically correct (confirmed both by memory-level
-diagnostic and by human playtesting - it genuinely scrolls now, no more
-snap-back). **Confirmed by human playtesting: heavy glitching every few
-frames.** This is "problem B" below - the unoptimised brute-force
-coarse-step cost - manifesting exactly as predicted once played for real
-rather than sampled via cycle-limited screenshots. This is the open
-problem on this branch: making the coarse transition raster-safe/cheap
-enough not to glitch, without redesigning the HUD split, sprite
-multiplexer, or LIVE/BUILD render-plan architecture. Placeholder art and
-a placeholder test map throughout; the *mechanism* is intended to be
-final once this is resolved.
+Status: scrolling is logically correct AND the brute-force coarse-step
+glitching (the "problem B" that used to be described here) is now FIXED
+by a raster-safe double-buffered redesign - see "RESOLVED — raster-safe
+double-buffered coarse transitions" below. Verified clean (background +
+stars + turrets, many coarse transitions, `-exitscreenshot` sweeps) with
+combat/enemies/spawner disabled. **However: a NEW regression was found
+when combat/enemies/spawner are re-enabled** - intermittent sprite
+corruption (garbled enemy sprites) that does NOT occur on the pre-refactor
+code at the same cycle counts. Root cause not yet confirmed; strongly
+suspected to be a per-frame CPU-budget overrun on the heaviest chunk
+frames colliding with the (untouched) sprite multiplexer's raster timing
+once combat load is added on top. See "OPEN — sprite corruption under
+full combat load" below. **This branch is not yet playtest-ready**: the
+background itself is fixed, but the interaction with gameplay is not.
+Placeholder art and a placeholder test map throughout.
 
 ## RESOLVED — the "snap back" scrolling bug was a live/shadow sync bug, not a raster-timing bug
 
@@ -299,3 +303,105 @@ All of the above are plain `.byte` tables today; swapping them for
 `.import binary "stageN.bin"` blocks (KickAssembler) at the same labels,
 built at each of the section boundaries above, is the entire migration —
 no runtime code changes anticipated.
+
+## RESOLVED — raster-safe double-buffered coarse transitions
+
+Replaces the brute-force 24-row live-sync loop (previously the only
+"correctness reference" fix). The old design blitted the entire shadow
+buffer into live screen/colour RAM synchronously, once, at the coarse
+boundary (~54-58k cycles, ~3 PAL frames) - correct, but guaranteed both
+visible tearing (writing into actively-scanned `$0400`/`$D800`) and a
+multi-frame CPU stall every 8px. Both are now gone.
+
+**Ownership model** (two roles, each backed by two physical buffers,
+swapped together atomically):
+
+* **Screen A** (`$0400`) / **Screen B** (`$3400`, a free 1K-aligned gap
+  between the health-sprite pool and the `$3800` charset RAM) - the two
+  VIC-displayable character matrices. `ACTIVE_SCREEN` (0/1) says which one
+  `$D018` currently selects.
+* **Shadow A** (`bgCharShadowA`, `$4400`) / **Shadow B** (`bgCharShadowB`,
+  `$4800`, reusing the old colour-shadow's slot) - star-free ground-truth
+  terrain, one per screen. `ShadowCurrent`/`ShadowNext` are roles, not
+  fixed buffers: they always mean "the shadow paired with the active
+  screen" / "the shadow paired with the inactive screen".
+* Colour RAM (`$D800`) is **not** double-buffered (a single physical
+  resource) - terrain colour is fixed (`TERRAIN_COLOUR`, filled once at
+  boot); only turret cells deviate, as a small bounded exception (see
+  below). `bgColourShadow` is gone entirely.
+
+**Per-coarse-step pipeline**, spread across the 8 fine-scroll frames
+(`updateBackgroundScroll` → `beginNextCoarseState`/`relocateNextChunk`):
+on the fine 7→0 wrap, `beginNextCoarseState` advances the world-position
+counters and renders the one genuinely new stage row straight into
+`ShadowNext` + the inactive screen. Each of the following frames,
+`relocateNextChunk` relocates up to 4 more rows from `ShadowCurrent` (read
+only, never mutated) into `ShadowNext` + the inactive screen in one pass -
+no separate shift-then-blit, and no in-place-shift overlap hazard, since
+source and destination are different physical buffers. By fine frame 7,
+`SCREEN_FLIP_PENDING` is set. `ACTIVE_SCREEN` is never touched by any of
+this - it is written in exactly one place.
+
+**The flip itself is raster-safe**: `scrollSplitIRQ` (the existing
+HUD/playfield raster split, unchanged in every other respect) checks
+`SCREEN_FLIP_PENDING` at the same instant it already writes `SCROLL_FINE`
+into `VIC_CONTROL_1`, and if set, flips `VIC_MEMORY_SETUP`'s screen-base
+nibble only (`$1E`↔`$DE`, charset-at-`$3800` nibble never touched) and
+`ACTIVE_SCREEN` together, atomically, in the same few instructions. No
+main-line code ever changes `$D018` or `ACTIVE_SCREEN`. This guarantees
+the new fine-scroll phase and the new screen always present together,
+frame-exact, and that main-line code (stars, turrets) reading
+`ACTIVE_SCREEN` mid-execution always sees a self-consistent snapshot (each
+routine reads it exactly once per call and derives every address from
+that one snapshot via lookup tables - never re-reads the global).
+
+**Turrets**: `stampTurretsIntoRow` is gone. `restampActiveTurret` (used
+for animation state changes since before this work) is now the *only*
+place turret glyphs/colours are ever painted, via a bounded
+`restampAllActiveTurrets` pass (≤4 slots) run once after the initial
+build and once per coarse step, right after the flip commits - deferred
+to main-line code (`updateTurrets`, gated by `TURRET_REFRESH_PENDING`)
+rather than run inside the IRQ itself, because `restampActiveTurret` uses
+`BG_TURRET_*` scratch bytes that main-line turret code also uses; running
+it from the IRQ could tear a main-line call mid-use of those same bytes.
+
+**Verified** via `-exitscreenshot` sweeps (many coarse transitions,
+frame-by-frame around several 7→0 boundaries) with combat/enemies/spawner
+disabled: background alone clean, background+stars+turrets together
+clean. No tearing, no stalls, no one-frame seams found.
+
+## OPEN — sprite corruption when combat/enemies/spawner are re-enabled
+
+**Not yet resolved - found during this session's own verification pass,
+after the double-buffer work above tested clean in isolation.** With the
+full game loop restored (`updateSpawner`, `updateObjects`,
+`updateEnemyFire`, combat-effect updates all re-enabled alongside the new
+background pipeline), the same `-exitscreenshot` cycle counts that were
+clean with those systems disabled show intermittent multicoloured
+"static" - garbled enemy sprites, confirmed by hex-dumping the underlying
+screen/shadow character bytes at the same moment (all sane terrain codes,
+e.g. `$20`/`$e0` - the *background data* is correct; the corruption is
+visual/sprite-side). Confirmed this is a **regression**, not pre-existing:
+the pre-refactor code (commit `cd8e316`), built and run the same way at
+the same cycle counts with the same full game loop, shows no such
+corruption.
+
+Root cause not yet confirmed. Leading hypothesis: the incremental
+per-frame background work (measured ~4-8k cycles on the heaviest chunk
+frame in isolation) was budgeted against the frame's *nominal* PAL budget
+(19,656 cycles), not against how much headroom the full game's own
+combat/enemy/spawner logic actually leaves once it's all running
+together - flagged as an open assumption in the design proposal and not
+yet checked empirically before implementation. If some frames are now
+genuinely running over budget, the sprite multiplexer's raster-timed IRQ
+batches (`armFirstBatch`/`multiplexIRQ`, deliberately untouched by this
+work) would miss their windows, which is a known way to get exactly this
+symptom (garbled sprite images) on real VIC-II hardware and in VICE.
+
+**Not yet attempted**: reducing `CHUNK_ROWS`, re-measuring actual
+per-frame cycle cost with the full game loop live (not just the debug
+FREE-cycle display, which was disabled in the isolation tests), or
+confirming/ruling out the raster-budget hypothesis directly. This must be
+resolved - and re-verified the same way (many coarse transitions, full
+game loop, watching specifically for both background tearing and sprite
+corruption) - before this branch is playtest-ready.

@@ -47,8 +47,26 @@
 .const BG_MAP_COLS  = 40 / BG_META_SIZE             // 40-column playfield = 10 metatiles wide.
 .const BG_MAP_ROWS  = 80                            // Test-map length in metatile rows (320 char rows).
 
-.const BG_CHAR_BASE   = $4400                       // Shadow "true background" screen codes (1000 bytes).
-.const BG_COLOUR_BASE = $4800                       // Shadow "true background" colours (1000 bytes).
+// --- Double-buffered background engine, v2 --------------------------------
+// docs/background-engine.md documents the full ownership design. Summary:
+// two VIC-displayable character screens (A=$0400, B=$3400) and two star-free
+// "ground truth" shadow buffers (one per screen) are kept simultaneously.
+// ACTIVE_SCREEN (0/1) says which screen/shadow pair is presently ACTIVE
+// (on-screen, immutable ground truth) vs. NEXT (off-screen, under
+// construction). Both roles flip together, atomically, only inside
+// scrollSplitIRQ - never from main-line code - so nothing ever observes a
+// screen/shadow pairing that doesn't match what VIC is actually scanning.
+// Colour RAM cannot be double-buffered (one physical resource), so terrain
+// colour is fixed (TERRAIN_COLOUR) and $D800 is written once at boot; only
+// turret cells deviate from it, as a small bounded exception.
+.const SCREEN_A_BASE = $0400
+.const SCREEN_B_BASE = $3400                        // Free, 1K-aligned gap between the health-sprite pool
+                                                     // ($3000-$33ff) and the $3800 charset RAM.
+.const SCREEN_B_HI_DELTA = (>SCREEN_B_BASE) - (>SCREEN_A_BASE)
+
+.const BG_CHAR_BASE_A = $4400                       // Shadow "true background" screen codes for Screen A (1000B).
+.const BG_CHAR_BASE_B = $4800                       // Same, for Screen B. (Was bgColourShadow's slot: colour
+                                                     // scrolling is gone, so this space was free to reuse.)
 // Row 0 of each shadow buffer is unused filler: HUD row 0 is never touched by
 // the background system. Both buffers share screen RAM's low-byte alignment
 // ($x400/$x800, low byte $00), so a shadow address is always "screen address
@@ -60,8 +78,11 @@
 // history for how this was diagnosed (it manifested as self-modifying
 // shadow-buffer writes overwriting resident code many rows into the first
 // scrolling-background build).
-.const BG_CHAR_HI_DELTA   = (>BG_CHAR_BASE)   - (>$0400)
-.const BG_COLOUR_HI_DELTA = (>BG_COLOUR_BASE) - (>$0400)
+.const BG_CHAR_HI_DELTA_A = (>BG_CHAR_BASE_A) - (>SCREEN_A_BASE)
+.const BG_CHAR_HI_DELTA_B = (>BG_CHAR_BASE_B) - (>SCREEN_A_BASE)
+
+.const TERRAIN_COLOUR = 9                           // Fixed foreground colour for all scrolling terrain glyphs.
+                                                     // Turret cells override this locally; see restampActiveTurret.
 
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N frames.
 .const HUD_SPLIT_RASTER = 58                        // First scanline of character row 1 (empirically tuned).
@@ -1202,6 +1223,11 @@ updateStarfield:
 // belongs in this cell (BACKGROUND ENGINE integration: no longer a blind
 // space - the shadow buffer BG_CHAR/BG_COLOUR is the source of truth so
 // scrolling terrain is never damaged by a star moving away).
+// X (star index) is live on entry AND on exit - callers keep using it right
+// after the jsr - so it must never be clobbered here. Y is free once the
+// STAR_Y,x lookup is done, and is used below to snapshot ACTIVE_SCREEN
+// exactly once so this routine's screen/shadow addressing can't be torn by
+// a scrollSplitIRQ landing mid-routine (see ACTIVE_SCREEN's comment).
 eraseOneStar:
     ldy STAR_Y,x
     lda starRowLo,y
@@ -1210,32 +1236,33 @@ eraseOneStar:
     sta starEraseStore + 1
     sta starEraseColourStore + 1
     sta starEraseBgCharLoad + 1
-    sta starEraseBgColourLoad + 1
 
     lda starRowHi,y
     adc #0
-    sta starEraseStore + 2                  // Screen RAM page.
+    sta BG_SCRATCH                          // Plain $0400-relative row high byte.
 
+    ldy ACTIVE_SCREEN                       // Single atomic snapshot for this call.
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
-    sta starEraseBgCharLoad + 2             // BG_CHAR shadow page.
+    adc activeScreenDeltaTable,y
+    sta starEraseStore + 2                  // Live (active) screen RAM page.
 
-    lda starEraseStore + 2                  // Recover the plain screen-RAM high byte.
+    lda BG_SCRATCH
+    clc
+    adc shadowCurrentDeltaTable,y
+    sta starEraseBgCharLoad + 2             // Ground-truth shadow page for the active screen.
+
+    lda BG_SCRATCH
     clc
     adc #$d4
-    sta starEraseColourStore + 2            // Colour RAM page.
-
-    lda starEraseStore + 2
-    clc
-    adc #BG_COLOUR_HI_DELTA
-    sta starEraseBgColourLoad + 2           // BG_COLOUR shadow page.
+    sta starEraseColourStore + 2            // Colour RAM page (screen-independent: $D800 is not
+                                             // double-buffered).
 
 starEraseBgCharLoad:
     lda $ffff                               // True background character for this cell.
 starEraseStore:
     sta $ffff
-starEraseBgColourLoad:
-    lda $ffff                               // True background colour for this cell.
+    lda #TERRAIN_COLOUR                     // Terrain colour is fixed now - no shadow read needed.
 starEraseColourStore:
     sta $ffff
     rts
@@ -1246,6 +1273,9 @@ starEraseColourStore:
 // cell is open sky. Over solid terrain the star's position/phase still
 // advances as normal in updateStarfield - it just stays invisible until it
 // next moves over sky, so scrolling scenery always wins immediately.
+// Same X/Y ownership rule as eraseOneStar: X (star index) must survive this
+// call untouched; Y is free after the initial STAR_Y,x lookup and is used to
+// snapshot ACTIVE_SCREEN once.
 drawOneStar:
     ldy STAR_Y,x
     lda starRowLo,y
@@ -1257,15 +1287,21 @@ drawOneStar:
 
     lda starRowHi,y
     adc #0
-    sta starDrawScreen + 2
-    pha                                     // Keep the screen-RAM high byte to derive both shadow pages.
+    sta BG_SCRATCH                          // Plain $0400-relative row high byte.
+
+    ldy ACTIVE_SCREEN                       // Single atomic snapshot for this call.
+    lda BG_SCRATCH
     clc
-    adc #$d4                                // Matching colour RAM page.
+    adc #$d4                                // Colour RAM page (screen-independent).
     sta starDrawColour + 2
-    pla
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
-    sta starBgCheck + 2
+    adc activeScreenDeltaTable,y
+    sta starDrawScreen + 2                  // Live (active) screen RAM page.
+    lda BG_SCRATCH
+    clc
+    adc shadowCurrentDeltaTable,y
+    sta starBgCheck + 2                     // Ground-truth shadow page for the active screen.
 
 starBgCheck:
     lda $ffff                               // BG_CHAR shadow value for this cell.
@@ -1329,13 +1365,15 @@ setOneStarTwinkleColour:
     sta starTwinkleBgCheck + 1
     lda starRowHi,y
     adc #0
-    pha
+    sta BG_SCRATCH
+    ldy ACTIVE_SCREEN                       // Single atomic snapshot for this call.
+    lda BG_SCRATCH
     clc
     adc #$d4
     sta starTwinkleStore + 2
-    pla
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
+    adc shadowCurrentDeltaTable,y
     sta starTwinkleBgCheck + 2
 
 starTwinkleBgCheck:
@@ -1361,13 +1399,15 @@ setOneStarNormalColour:
     sta starNormalBgCheck + 1
     lda starRowHi,y
     adc #0
-    pha
+    sta BG_SCRATCH
+    ldy ACTIVE_SCREEN                       // Single atomic snapshot for this call.
+    lda BG_SCRATCH
     clc
     adc #$d4
     sta starNormalColourStore + 2
-    pla
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
+    adc shadowCurrentDeltaTable,y
     sta starNormalBgCheck + 2
 
 starNormalBgCheck:
@@ -4699,6 +4739,21 @@ HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
 }
+.if (HEALTH_SPRITE_POOL_END > SCREEN_B_BASE) {
+    .error "Health sprite pool overruns Screen B's reserved slot"
+}
+
+// --- Screen B (second VIC-displayable character matrix) --------------------
+// Reserved explicitly so no other resident code/data can drift into this
+// gap between the health-sprite pool and the $3800 charset RAM. See
+// docs/background-engine.md for the double-buffer ownership design.
+* = SCREEN_B_BASE
+screenB:
+    .fill 1000, BG_CHAR_SKY
+SCREEN_B_END:
+.if ((SCREEN_B_END - screenB) > 1024) {
+    .error "Screen B reservation overruns the $3800 charset RAM"
+}
 
 // ============================================================================
 // BACKGROUND / STAGE ENGINE - resident code and state.
@@ -4733,6 +4788,45 @@ BG_SCRATCH2:           .byte 0
 BG_STAMP_CHAR:         .byte 0
 BG_STAMP_COLOUR:       .byte 0
 
+// --- Double-buffer ownership state ------------------------------------------
+// ACTIVE_SCREEN is the single source of truth for "which screen/shadow pair
+// is presently on-screen". It is written ONLY by scrollSplitIRQ, in lockstep
+// with the real $D018 flip, so screen and shadow roles are always consistent
+// with what VIC is actually scanning. Main-line code (stars, turrets, the
+// incremental row builder) must snapshot it once per routine/call (e.g. into
+// X) and derive every address from that one snapshot via the tables below -
+// never re-read the global mid-routine, since an IRQ can land between two
+// reads and hand back a torn pairing otherwise.
+ACTIVE_SCREEN:          .byte 0         // 0 = Screen A active, 1 = Screen B active.
+SCREEN_FLIP_PENDING:    .byte 0         // Set by the main loop once the inactive screen is fully built;
+                                        // consumed (and cleared) by scrollSplitIRQ at the next HUD split.
+ROW_BUILD_CURSOR:       .byte 0         // Highest destination row (0-24) committed into the NEXT
+                                        // screen/shadow so far this coarse window. Reset to 0 right
+                                        // after a flip commits (see scrollSplitIRQ).
+TURRET_REFRESH_PENDING: .byte 0         // Set by scrollSplitIRQ right after a flip commits; consumed
+                                        // by updateTurrets (main-line, not the IRQ - see its comment)
+                                        // to re-stamp every active turret into the newly-active
+                                        // screen/shadow. Kept out of the IRQ itself because
+                                        // restampActiveTurret uses BG_TURRET_* scratch bytes that
+                                        // main-line turret code also uses; running it from the IRQ
+                                        // could tear a main-line call using the same scratch bytes.
+
+// Indexed by ACTIVE_SCREEN (X = 0 or 1). "Screen" deltas add to a $0400-
+// relative row address to reach that screen's live page; "shadow" deltas
+// likewise reach that screen's ground-truth shadow page.
+activeScreenDeltaTable:    .byte 0, SCREEN_B_HI_DELTA               // active screen's own delta
+inactiveScreenDeltaTable:  .byte SCREEN_B_HI_DELTA, 0                // the OTHER screen's delta
+shadowCurrentDeltaTable:   .byte BG_CHAR_HI_DELTA_A, BG_CHAR_HI_DELTA_B
+shadowNextDeltaTable:      .byte BG_CHAR_HI_DELTA_B, BG_CHAR_HI_DELTA_A
+// Indexed the same way: $D018 screen-base nibble (top 4 bits) for each
+// screen. Verified against init's existing setup: Screen A/$3800 charset =
+// $1E, Screen B/$3800 charset = $DE (charset nibble %1110 in both, unchanged).
+screenD018HighNibble:      .byte %00010000, %11010000
+
+BG_SHADOW_DELTA:       .byte 0         // Caller-set destination delta pair for renderMapRowIntoShadow
+BG_SCREEN_DELTA:       .byte 0         // and relocateNextChunk: which shadow/screen this call targets.
+BG_SRC_DELTA:          .byte 0         // relocateNextChunk only: source (ShadowCurrent) delta.
+
 BG_TURRET_SCAN_IDX:    .byte 0         // Scratch: index into stageTurrets during activateTurrets.
 BG_TURRET_POOL_IDX:    .byte 0         // Scratch: which ACTIVE_TURRET_* slot a helper is working on.
 BG_TURRET_HEAD_ROW:    .byte 0         // Scratch/output of computeTurretScreenRows.
@@ -4754,35 +4848,36 @@ ACTIVE_TURRET_X_LO:       .fill TURRET_POOL_SIZE, 0         // Cached 9-bit pixe
 ACTIVE_TURRET_X_MSB:      .fill TURRET_POOL_SIZE, 0
 
 // --- Shadow "true background" buffers --------------------------------------
-// BG_CHAR_BASE/BG_COLOUR_BASE were declared as address constants up in the
-// shared-constants block, but that on its own does NOT reserve the RAM - the
-// actual 1000-byte arrays must be assembled here. (Bug found in testing:
-// without this, resident code below $4000 simply grew straight through
-// $4400/$4800 and every shadow-buffer read/write was silently corrupting -
-// and being corrupted by - this routine code itself.) Explicit addresses so
-// BG_CHAR_HI_DELTA/BG_COLOUR_HI_DELTA's "add a constant to the high byte"
-// trick stays valid; row 0 of each (the first 40 bytes) is unused filler,
-// since HUD row 0 is never touched by the background system.
-* = BG_CHAR_BASE
-bgCharShadow:
+// Two 1000-byte character buffers now (bgColourShadow is gone - terrain
+// colour is fixed, see TERRAIN_COLOUR). BG_CHAR_BASE_A/B were declared as
+// address constants up in the shared-constants block, but that on its own
+// does NOT reserve the RAM - the actual arrays must be assembled here. (Bug
+// found in testing: without this, resident code below $4000 simply grew
+// straight through $4400/$4800 and every shadow-buffer read/write was
+// silently corrupting - and being corrupted by - this routine code itself.)
+// Explicit addresses so BG_CHAR_HI_DELTA_A/B's "add a constant to the high
+// byte" trick stays valid; row 0 of each (the first 40 bytes) is unused
+// filler, since HUD row 0 is never touched by the background system.
+* = BG_CHAR_BASE_A
+bgCharShadowA:
     .fill 1000, BG_CHAR_SKY
-BG_CHAR_SHADOW_END:
-.if ((BG_CHAR_SHADOW_END - bgCharShadow) != 1000) {
-    .error "bgCharShadow is not exactly 1000 bytes"
+BG_CHAR_SHADOW_A_END:
+.if ((BG_CHAR_SHADOW_A_END - bgCharShadowA) != 1000) {
+    .error "bgCharShadowA is not exactly 1000 bytes"
 }
-.if ((BG_CHAR_BASE & $ff) != 0) {
-    .error "BG_CHAR_BASE must be $xx00-aligned for the shadow-address high-byte trick"
+.if ((BG_CHAR_BASE_A & $ff) != 0) {
+    .error "BG_CHAR_BASE_A must be $xx00-aligned for the shadow-address high-byte trick"
 }
 
-* = BG_COLOUR_BASE
-bgColourShadow:
-    .fill 1000, 0
-BG_COLOUR_SHADOW_END:
-.if ((BG_COLOUR_SHADOW_END - bgColourShadow) != 1000) {
-    .error "bgColourShadow is not exactly 1000 bytes"
+* = BG_CHAR_BASE_B
+bgCharShadowB:
+    .fill 1000, BG_CHAR_SKY
+BG_CHAR_SHADOW_B_END:
+.if ((BG_CHAR_SHADOW_B_END - bgCharShadowB) != 1000) {
+    .error "bgCharShadowB is not exactly 1000 bytes"
 }
-.if ((BG_COLOUR_BASE & $ff) != 0) {
-    .error "BG_COLOUR_BASE must be $xx00-aligned for the shadow-address high-byte trick"
+.if ((BG_CHAR_BASE_B & $ff) != 0) {
+    .error "BG_CHAR_BASE_B must be $xx00-aligned for the shadow-address high-byte trick"
 }
 
 // --- Routine: clearBackgroundShadow ---------------------------------------
@@ -4796,19 +4891,34 @@ BG_COLOUR_SHADOW_END:
 // 1000-byte buffer without a 16-bit loop counter. (Found in testing: an
 // earlier X-wraps-0-255 version overran each buffer by 6 bytes into the
 // following resident code on every pass - 250*4=1000, but 256*4=1024.)
+// Also unconditionally snaps $D018/ACTIVE_SCREEN back to Screen A: every
+// other screen (menu, high scores, game over) is written by code that
+// rightly assumes plain $0400/$D800 and knows nothing about the
+// double-buffer, so leaving Screen B active into one of those states would
+// leave them invisible (drawn onto the wrong, inactive screen) or, worse,
+// showing a frozen last PLAYING frame. Scrolling gameplay always restarts
+// the double-buffer from a clean Screen-A state anyway (buildInitialBackground).
 clearBackgroundShadow:
+    lda VIC_MEMORY_SETUP
+    and #%00001111
+    ora screenD018HighNibble
+    sta VIC_MEMORY_SETUP
+    lda #0
+    sta ACTIVE_SCREEN
+    sta SCREEN_FLIP_PENDING
+    sta TURRET_REFRESH_PENDING
+
     ldx #0
 !loop:
     lda #BG_CHAR_SKY
-    sta bgCharShadow,x
-    sta bgCharShadow + 250,x
-    sta bgCharShadow + 500,x
-    sta bgCharShadow + 750,x
-    lda #0
-    sta bgColourShadow,x
-    sta bgColourShadow + 250,x
-    sta bgColourShadow + 500,x
-    sta bgColourShadow + 750,x
+    sta bgCharShadowA,x
+    sta bgCharShadowA + 250,x
+    sta bgCharShadowA + 500,x
+    sta bgCharShadowA + 750,x
+    sta bgCharShadowB,x
+    sta bgCharShadowB + 250,x
+    sta bgCharShadowB + 500,x
+    sta bgCharShadowB + 750,x
     inx
     cpx #250
     bne !loop-
@@ -4819,12 +4929,29 @@ clearBackgroundShadow:
 // (scrollSplitIRQ) only ever reveals the real scroll value below row 0.
 // Called once per frame, immediately after waitForFrameStart, well before
 // HUD_SPLIT_RASTER is reached.
+// Also mirrors row 0 (the HUD text - score/lives) from Screen A into Screen
+// B's row 0 every frame: $D018 selects one screen base for ALL 25 rows,
+// including row 0, so whichever screen is active determines where row 0 is
+// fetched from too. Score/lives are written by unrelated HUD code that
+// (rightly, to stay simple) always targets the fixed $0400 addresses, so
+// this bounded 40-byte mirror is what keeps row 0 correct after a flip
+// without having to touch every HUD write site. Colour RAM needs no mirror
+// - it is not double-buffered, so row 0's colour is already correct
+// regardless of which screen is active.
 resetHudScroll:
     sei
     lda VIC_CONTROL_1
     and #%11111000
     sta VIC_CONTROL_1
     cli
+
+    ldx #0
+!hudMirrorLoop:
+    lda SCREEN_A_BASE,x
+    sta screenB,x
+    inx
+    cpx #40
+    bne !hudMirrorLoop-
     rts
 
 // --- Routine: armScrollSplit ---------------------------------------------
@@ -4878,6 +5005,33 @@ scrollSplitIRQ:
     and #%11111000
     ora SCROLL_FINE
     sta VIC_CONTROL_1
+
+    // Commit a pending screen flip HERE, at the exact raster line where the
+    // fine-scroll value above is also committed - both take effect in the
+    // same instant, for the same playfield scan, so there is no one-frame
+    // window where a stale fine-scroll phase is shown against the new
+    // screen (or vice versa). $D018's screen-base nibble only is touched;
+    // the charset-at-$3800 nibble (bits 1-3) is never disturbed. This is
+    // the ONLY place ACTIVE_SCREEN is ever written, so main-line code can
+    // always trust one atomic snapshot of it (see ACTIVE_SCREEN's comment).
+    lda SCREEN_FLIP_PENDING
+    beq !noFlip+
+    lda #0
+    sta SCREEN_FLIP_PENDING
+    lda ACTIVE_SCREEN
+    eor #1
+    sta ACTIVE_SCREEN
+    tax
+    lda VIC_MEMORY_SETUP
+    and #%00001111
+    ora screenD018HighNibble,x
+    sta VIC_MEMORY_SETUP
+    lda #0
+    sta ROW_BUILD_CURSOR                // Fresh window: nothing relocated yet toward the new NEXT.
+    lda #1
+    sta TURRET_REFRESH_PENDING          // Main-line (updateTurrets) will repaint all active turrets
+                                         // into the newly-active screen/shadow - see its comment.
+!noFlip:
     lda #%00000001
     sta IRQ_STATUS
 
@@ -4914,8 +5068,11 @@ scrollSplitIRQ:
     jmp $ea31
 
 // --- Routine: updateBackgroundScroll -------------------------------------
-// Advances fine scroll by one frame's worth; on an 8px wrap, performs one
-// coarse row advance. Called once per frame during PLAYING only.
+// Advances fine scroll by one frame's worth. Every frame (not just on the
+// 8px wrap) also gives the incremental NEXT-screen builder a bounded slice
+// of work, so a whole coarse step's worth of preparation is spread across
+// the 8 fine-scroll frames instead of landing in one lump at the wrap. See
+// docs/background-engine.md for the full ownership design.
 updateBackgroundScroll:
     lda STAGE_STATE
     bne !done+                          // STAGE_STATE_COMPLETE: stage has ended, freeze scrolling.
@@ -4930,19 +5087,30 @@ updateBackgroundScroll:
     inc SCROLL_FINE
     lda SCROLL_FINE
     cmp #8
-    bcc !done+
+    bcc !chunk+
     lda #0
     sta SCROLL_FINE
-    jsr advanceCoarseRow
+    jsr beginNextCoarseState            // Fine 7->0 wrap: counters advance, new row 1 is born.
+    jmp !done+
+
+!chunk:
+    jsr relocateNextChunk               // Fine 1-7: a few more rows relocated into the NEXT state.
+    lda SCROLL_FINE
+    cmp #7
+    bne !done+
+    lda #1
+    sta SCREEN_FLIP_PENDING             // Last chunk done: NEXT screen is complete, ready to present.
 !done:
     rts
 
-// --- Routine: advanceCoarseRow -------------------------------------------
-// One character row's worth of world advances: bump the sub-row/meta-row
-// counters (or complete the stage), shift the shadow buffer, render the
-// freshly-revealed top row, stamp any turrets into it, and re-scan turret
-// pool membership.
-advanceCoarseRow:
+// --- Routine: beginNextCoarseState ----------------------------------------
+// Runs once per coarse step, at the fine 7->0 wrap. Advances the world
+// position counters (or completes the stage), resets the incremental
+// builder for the new window, and renders the ONE genuinely new stage row
+// (the only row that can't just be relocated from existing data) straight
+// into the NEXT shadow + inactive screen. The other 23 rows are relocated
+// by relocateNextChunk over the frames that follow.
+beginNextCoarseState:
     inc SCROLL_SUB_ROW
     lda SCROLL_SUB_ROW
     cmp #4
@@ -4961,9 +5129,11 @@ advanceCoarseRow:
     rts
 
 !haveRow:
-    jsr shiftShadowRowsDown
-
-    jsr activateTurrets
+    jsr activateTurrets                  // Pool membership only - painting is now handled entirely
+                                          // by the post-flip restampAllActiveTurrets pass, so this
+                                          // step no longer needs to stamp anything into the row.
+    lda #0
+    sta ROW_BUILD_CURSOR                 // Nothing relocated into the NEXT state yet this window.
 
     lda SCROLL_META_ROW
     sta BG_META_ROW
@@ -4971,90 +5141,89 @@ advanceCoarseRow:
     sta BG_SUB_ROW
     lda #1
     sta BG_DEST_ROW
-    jsr renderMapRowIntoShadow
-    jsr stampTurretsIntoRow
 
-    // BRUTE-FORCE CORRECTNESS FIX (diagnostic-confirmed bug, see
-    // docs/background-engine.md): shiftShadowRowsDown only ever advances
-    // the shadow buffers. Previously only row 1 was blitted to the live
-    // screen here, so live rows 2-24 were never updated after the initial
-    // static build - confirmed by directly comparing shadow vs. live bytes
-    // in VICE immediately after the first coarse transition (row 10 showed
-    // shadow=$20/sky vs. live=$e9, a stale pre-shift turret-head glyph;
-    // row 20 showed shadow=$e0 vs. live=$e1). Blitting every row, every
-    // coarse step, is the simplest possible correct fix and is deliberately
-    // not optimised yet - see the doc for the follow-up performance work
-    // once this is confirmed to make scrolling continuous.
-    ldx #1
-!liveSyncLoop:
-    jsr blitShadowRowToLive
-    inx
-    cpx #25
-    bne !liveSyncLoop-
+    ldx ACTIVE_SCREEN                    // Target the NEXT (currently inactive) pair.
+    lda shadowNextDeltaTable,x
+    sta BG_SHADOW_DELTA
+    lda inactiveScreenDeltaTable,x
+    sta BG_SCREEN_DELTA
+    jsr renderMapRowIntoShadow
+
+    lda #1
+    sta ROW_BUILD_CURSOR                 // Destination row 1 is now committed.
     rts
 
-// --- Routine: shiftShadowRowsDown -----------------------------------------
-// Shift shadow rows 1-23 down into rows 2-24 (screen-row numbering), for
-// both the character and colour planes. Runs live, in place, once per
-// coarse step; timed to complete well before those rows are next raster-
-// scanned (the scrolling landscape moves at most one row every
-// SCROLL_FRAME_DIVIDER*8 frames, so this has an entire frame's slack). See
-// docs/background-engine.md for why this was chosen over double-buffering.
-shiftShadowRowsDown:
-    ldx #24                              // Destination row, working from the bottom up.
-!rowLoop:
+// --- Routine: relocateNextChunk --------------------------------------------
+// Copies up to CHUNK_ROWS source rows from ShadowCurrent into ShadowNext AND
+// the inactive screen in the same pass (one read of each byte, two writes -
+// no separate shift-then-blit). Source row r's content becomes destination
+// row r+1 (matches the relationship the original shiftShadowRowsDown used,
+// verified against the code rather than assumed). Self-limiting via
+// ROW_BUILD_CURSOR, so calling it more times than strictly necessary across
+// the 8 fine frames is harmless - it just does nothing once all 23 rows are
+// done. Colour is NOT touched here: terrain colour is fixed (TERRAIN_COLOUR,
+// written once at boot) and turret cells are repainted after the flip by
+// restampAllActiveTurrets, so there is nothing to relocate.
+.const CHUNK_ROWS = 4
+relocateNextChunk:
+    ldx ACTIVE_SCREEN
+    lda shadowCurrentDeltaTable,x
+    sta BG_SRC_DELTA
+    lda shadowNextDeltaTable,x
+    sta BG_SHADOW_DELTA
+    lda inactiveScreenDeltaTable,x
+    sta BG_SCREEN_DELTA
+
+    lda #CHUNK_ROWS
+    sta BG_SCRATCH2                      // Outer "rows left in this chunk" counter (X is used below
+                                          // for the row-number lookups, so it can't also hold this).
+!chunkLoop:
+    lda ROW_BUILD_CURSOR
+    cmp #24
+    bcs !done+                           // All 23 source rows (dest 2-24) already relocated.
+
+    tax                                  // X = source row (= current cursor value, 1-23).
     lda starRowLo,x
-    sta shiftCharDst + 1
-    sta shiftColourDst + 1
-    lda starRowLo - 1,x
-    sta shiftCharSrc + 1
-    sta shiftColourSrc + 1
-
+    sta relocSrc + 1
     lda starRowHi,x
     clc
-    adc #BG_CHAR_HI_DELTA
-    sta shiftCharDst + 2
-    lda starRowHi - 1,x
-    clc
-    adc #BG_CHAR_HI_DELTA
-    sta shiftCharSrc + 2
+    adc BG_SRC_DELTA
+    sta relocSrc + 2
 
+    inx                                  // X = destination row (source + 1, 2-24).
+    lda starRowLo,x
+    sta relocDstShadow + 1
+    sta relocDstScreen + 1
     lda starRowHi,x
     clc
-    adc #BG_COLOUR_HI_DELTA
-    sta shiftColourDst + 2
-    lda starRowHi - 1,x
+    adc BG_SHADOW_DELTA
+    sta relocDstShadow + 2
+    lda starRowHi,x
     clc
-    adc #BG_COLOUR_HI_DELTA
-    sta shiftColourSrc + 2
+    adc BG_SCREEN_DELTA
+    sta relocDstScreen + 2
 
     ldy #39
-!charByte:
-shiftCharSrc:
+!byteLoop:
+relocSrc:
     lda $ffff,y
-shiftCharDst:
+relocDstShadow:
+    sta $ffff,y
+relocDstScreen:
     sta $ffff,y
     dey
-    bpl !charByte-
+    bpl !byteLoop-
 
-    ldy #39
-!colourByte:
-shiftColourSrc:
-    lda $ffff,y
-shiftColourDst:
-    sta $ffff,y
-    dey
-    bpl !colourByte-
-
-    dex
-    cpx #1
-    bne !rowLoop-
+    inc ROW_BUILD_CURSOR
+    dec BG_SCRATCH2
+    bne !chunkLoop-
+!done:
     rts
 
 // --- Routine: computeStageMapRowPtr ---------------------------------------
-// BG_MAP_ROW_LO/HI = stageMap + BG_META_ROW*BG_MAP_COLS. Not hot (runs at
-// most once per coarse step, or a handful of times during the initial
-// static render), so a plain add-in-a-loop is simple and fast enough.
+// BG_MAP_ROW_LO/HI = stageMap + BG_META_ROW*BG_MAP_COLS. Only ever called
+// once per coarse step (for the single freshly-rendered row), so a plain
+// add-in-a-loop is simple and fast enough - it is NOT in the per-frame path.
 computeStageMapRowPtr:
     lda #<stageMap
     sta BG_MAP_ROW_LO
@@ -5076,9 +5245,11 @@ computeStageMapRowPtr:
     rts
 
 // --- Routine: renderMapRowIntoShadow --------------------------------------
-// Render metatile-row BG_META_ROW's sub-row BG_SUB_ROW into shadow buffer
-// row BG_DEST_ROW (1-24). Used both for the one-time initial static render
-// and for each coarse step's freshly-revealed row.
+// Render metatile-row BG_META_ROW's sub-row BG_SUB_ROW into destination row
+// BG_DEST_ROW (1-24) of BOTH a shadow buffer and a screen buffer, selected
+// by the caller via BG_SHADOW_DELTA/BG_SCREEN_DELTA (set before calling).
+// Character only - colour is fixed (TERRAIN_COLOUR) except for turret
+// cells, which restampAllActiveTurrets repaints after the flip.
 renderMapRowIntoShadow:
     jsr computeStageMapRowPtr
     lda BG_MAP_ROW_LO
@@ -5094,15 +5265,15 @@ renderMapRowIntoShadow:
     ldx BG_DEST_ROW
     lda starRowLo,x
     sta shadowCharRow + 1
-    sta shadowColourRow + 1
+    sta screenCharRow + 1
     lda starRowHi,x
     clc
-    adc #BG_CHAR_HI_DELTA
+    adc BG_SHADOW_DELTA
     sta shadowCharRow + 2
     lda starRowHi,x
     clc
-    adc #BG_COLOUR_HI_DELTA
-    sta shadowColourRow + 2
+    adc BG_SCREEN_DELTA
+    sta screenCharRow + 2
 
     ldx #0                            // Destination character column, 0-39.
 !colLoop:
@@ -5117,10 +5288,6 @@ renderMapRowIntoShadow:
     sta metaCharByte + 1
     lda metaCharPtrHi,y
     sta metaCharByte + 2
-    lda metaColourPtrLo,y
-    sta metaColourByte + 1
-    lda metaColourPtrHi,y
-    sta metaColourByte + 2
 
     txa
     and #%00000011                    // A = destCol mod 4 = column within this metatile (0-3).
@@ -5132,51 +5299,12 @@ metaCharByte:
     lda $ffff,y
 shadowCharRow:
     sta $ffff,x
-metaColourByte:
-    lda $ffff,y
-shadowColourRow:
+screenCharRow:
     sta $ffff,x
 
     inx
     cpx #40
     bne !colLoop-
-    rts
-
-// --- Routine: blitShadowRowToLive -----------------------------------------
-// Entry: X = row (1-24). Copies shadow char/colour for that row straight
-// into live screen/colour RAM.
-blitShadowRowToLive:
-    lda starRowLo,x
-    sta liveCharRow + 1
-    sta liveColourRow + 1
-    sta shadowCharRowR + 1
-    sta shadowColourRowR + 1
-    lda starRowHi,x
-    sta liveCharRow + 2
-    clc
-    adc #$d4
-    sta liveColourRow + 2
-    lda starRowHi,x
-    clc
-    adc #BG_CHAR_HI_DELTA
-    sta shadowCharRowR + 2
-    lda starRowHi,x
-    clc
-    adc #BG_COLOUR_HI_DELTA
-    sta shadowColourRowR + 2
-
-    ldy #39
-!byteLoop:
-shadowCharRowR:
-    lda $ffff,y
-liveCharRow:
-    sta $ffff,y
-shadowColourRowR:
-    lda $ffff,y
-liveColourRow:
-    sta $ffff,y
-    dey
-    bpl !byteLoop-
     rts
 
 // --- Routine: buildInitialBackground --------------------------------------
@@ -5191,6 +5319,14 @@ buildInitialBackground:
     sta SCROLL_SUB_ROW
     sta SCROLL_META_ROW
     sta STAGE_STATE
+    sta ACTIVE_SCREEN                  // Always start a new game on Screen A/Shadow A.
+    sta SCREEN_FLIP_PENDING
+    sta ROW_BUILD_CURSOR
+    sta TURRET_REFRESH_PENDING
+    lda VIC_MEMORY_SETUP
+    and #%00001111
+    ora screenD018HighNibble
+    sta VIC_MEMORY_SETUP
 
     ldx #0
 !clearTurretPool:
@@ -5200,18 +5336,36 @@ buildInitialBackground:
     cpx #TURRET_POOL_SIZE
     bne !clearTurretPool-
 
+    // Fixed terrain colour: written once, covering rows 1-24 (row 0/HUD is
+    // owned by the score/lives draw code, not touched here). $D800 is a
+    // single physical resource regardless of which screen is active, so
+    // this one fill is all colour RAM ever needs for plain terrain - see
+    // TERRAIN_COLOUR's comment. Turret cells are the bounded exception,
+    // repainted by restampAllActiveTurrets below.
+    ldx #0
+!colourFill:
+    lda #TERRAIN_COLOUR
+    sta $d800 + 40,x
+    sta $d800 + 40 + 240,x
+    sta $d800 + 40 + 480,x
+    sta $d800 + 40 + 720,x
+    inx
+    cpx #240
+    bne !colourFill-
+
     jsr activateTurrets
 
     lda #0
     sta BG_META_ROW
     sta BG_SUB_ROW
+    lda #BG_CHAR_HI_DELTA_A              // The one-time initial build always targets Shadow A +
+    sta BG_SHADOW_DELTA                  // Screen A directly (ACTIVE_SCREEN is 0 at this point).
+    lda #0
+    sta BG_SCREEN_DELTA
     ldx #1                             // Screen row, 1-24.
 !rowLoop:
     stx BG_DEST_ROW
     jsr renderMapRowIntoShadow
-    jsr stampTurretsIntoRow
-    ldx BG_DEST_ROW
-    jsr blitShadowRowToLive
 
     inc BG_SUB_ROW
     lda BG_SUB_ROW
@@ -5225,6 +5379,9 @@ buildInitialBackground:
     inx
     cpx #25
     bne !rowLoop-
+
+    jsr restampAllActiveTurrets         // One bounded pass paints every turret currently in the
+                                         // activation window - see the routine's comment.
     rts
 
 // --- Routine: activateTurrets ---------------------------------------------
@@ -5340,137 +5497,30 @@ deactivateOneTurret:
     bne !find-
     rts
 
-// --- Routine: stampTurretsIntoRow ------------------------------------------
-// Entry: BG_META_ROW/BG_SUB_ROW/BG_DEST_ROW describe the row just rendered
-// by renderMapRowIntoShadow. Overwrites that row's terrain with an active
-// turret's head or base glyph wherever one of its two cells falls here.
-stampTurretsIntoRow:
-    ldx BG_DEST_ROW
-    lda starRowLo,x
-    sta stampCharStore + 1
-    sta stampColourStore + 1
-    lda starRowHi,x
-    clc
-    adc #BG_CHAR_HI_DELTA
-    sta stampCharStore + 2
-    lda starRowHi,x
-    clc
-    adc #BG_COLOUR_HI_DELTA
-    sta stampColourStore + 2
-
-    ldx #0                               // Pool slot index.
+// --- Routine: restampAllActiveTurrets ---------------------------------------
+// Bounded pass (at most TURRET_POOL_SIZE=4 slots) that (re)paints every
+// occupied turret pool slot via restampActiveTurret. Runs once after the
+// initial static build, and once per coarse step right after the screen
+// flip commits (see updateTurrets/TURRET_REFRESH_PENDING). This is now the
+// ONLY place turret glyphs/colours are ever painted - the old per-row
+// stampTurretsIntoRow (called during row generation, targeting a row that
+// might not even be on-screen yet) is gone: restampActiveTurret already
+// recomputes each turret's current row fresh from SCROLL_META_ROW/SUB_ROW
+// and ACTIVE_SCREEN, so a single pass right after the flip correctly paints
+// both brand-new turrets (just entering row 1) and turrets simply carried
+// along by the terrain relocation, with no risk of writing into $D800/the
+// character matrix ahead of when that row is actually the displayed one.
+restampAllActiveTurrets:
+    ldx #0
 !poolLoop:
-    stx BG_TURRET_POOL_IDX
     lda ACTIVE_TURRET_STAGE_IDX,x
     cmp #$ff
-    bne !haveIdx+
-    jmp !nextSlot+                        // Long: !nextSlot exceeds branch range from here.
-!haveIdx:
-
-    asl
-    asl
-    tay
-    lda stageTurrets,y                   // metaRow
-    cmp BG_META_ROW
-    beq !metaMatch+
-    jmp !nextSlot+
-!metaMatch:
-    lda stageTurrets + 1,y                // head sub-row
-    cmp BG_SUB_ROW
-    beq !isHead+
-    clc
-    adc #1                                 // base sub-row = head+1
-    cmp BG_SUB_ROW
-    beq !isBase+
-    jmp !nextSlot+
-!isBase:
-
-    ldx BG_TURRET_POOL_IDX
-    lda ACTIVE_TURRET_HIT_TIMER,x
-    bne !flashBase+
-    lda ACTIVE_TURRET_DESTROYED,x
-    bne !wreckBase+
-    lda ACTIVE_TURRET_HEALTH,x
-    cmp #2
-    bcs !normalBase+
-    lda #235
-    jmp !haveBaseChar+
-!normalBase:
-    lda #230
-    jmp !haveBaseChar+
-!wreckBase:
-    lda #236
-!haveBaseChar:
-    sta BG_STAMP_CHAR
-    lda #5
-    sta BG_STAMP_COLOUR
-    jmp !doStamp+
-!flashBase:
-    lda ACTIVE_TURRET_DESTROYED,x
-    beq !flashBaseAlive+
-    lda #236
-    jmp !flashBaseChar+
-!flashBaseAlive:
-    lda #230
-!flashBaseChar:
-    sta BG_STAMP_CHAR
-    lda #1
-    sta BG_STAMP_COLOUR
-    jmp !doStamp+
-
-!isHead:
-    ldx BG_TURRET_POOL_IDX
-    lda ACTIVE_TURRET_HIT_TIMER,x
-    bne !flashHead+
-    lda ACTIVE_TURRET_DESTROYED,x
-    bne !wreckHead+
-    lda ACTIVE_TURRET_MUZZLE,x
-    bne !muzzleHead+
-    lda ACTIVE_TURRET_AIM,x
-    clc
-    adc #231
-    jmp !haveHeadChar+
-!muzzleHead:
-    lda #234
-    jmp !haveHeadChar+
-!wreckHead:
-    lda #236
-!haveHeadChar:
-    sta BG_STAMP_CHAR
-    lda #1
-    sta BG_STAMP_COLOUR
-    jmp !doStamp+
-!flashHead:
-    lda ACTIVE_TURRET_DESTROYED,x
-    beq !flashHeadAlive+
-    lda #236
-    jmp !flashHeadChar+
-!flashHeadAlive:
-    lda ACTIVE_TURRET_AIM,x
-    clc
-    adc #231
-!flashHeadChar:
-    sta BG_STAMP_CHAR
-    lda #1
-    sta BG_STAMP_COLOUR
-
-!doStamp:
-    ldy BG_TURRET_POOL_IDX
-    ldx ACTIVE_TURRET_COL,y
-    lda BG_STAMP_CHAR
-stampCharStore:
-    sta $ffff,x
-    lda BG_STAMP_COLOUR
-stampColourStore:
-    sta $ffff,x
-
+    beq !nextSlot+
+    jsr restampActiveTurret
 !nextSlot:
-    ldx BG_TURRET_POOL_IDX
     inx
     cpx #TURRET_POOL_SIZE
-    beq !allDone+
-    jmp !poolLoop-
-!allDone:
+    bne !poolLoop-
     rts
 
 // --- Routine: computeTurretScreenRows --------------------------------------
@@ -5528,27 +5578,29 @@ restampActiveTurret:
     rts
 
 // --- Routine: restampHeadAtRow ---------------------------------------------
-// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot.
+// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot. Writes the
+// turret's head glyph into ShadowCurrent (so star sky-checks correctly stay
+// suppressed over it) and the active screen; colour goes only to $D800
+// (screen-independent, and not shadowed - turret colour is a small bounded
+// exception to the fixed terrain colour, not itself double-buffered).
 restampHeadAtRow:
     lda starRowLo,x
     sta rsHeadShadowChar + 1
-    sta rsHeadShadowColour + 1
     sta rsHeadLiveChar + 1
     sta rsHeadLiveColour + 1
     lda starRowHi,x
-    pha
+    sta BG_SCRATCH
+
+    ldx ACTIVE_SCREEN                   // Single atomic snapshot for this call (X free again below).
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
+    adc shadowCurrentDeltaTable,x
     sta rsHeadShadowChar + 2
-    pla
-    pha
+    lda BG_SCRATCH
     clc
-    adc #BG_COLOUR_HI_DELTA
-    sta rsHeadShadowColour + 2
-    pla
-    pha
+    adc activeScreenDeltaTable,x
     sta rsHeadLiveChar + 2
-    pla
+    lda BG_SCRATCH
     clc
     adc #$d4
     sta rsHeadLiveColour + 2
@@ -5587,34 +5639,31 @@ rsHeadShadowChar:
 rsHeadLiveChar:
     sta $ffff,x
     lda #1                              // Head is always white; state is conveyed by the glyph itself.
-rsHeadShadowColour:
-    sta $ffff,x
 rsHeadLiveColour:
     sta $ffff,x
     rts
 
 // --- Routine: restampBaseAtRow ---------------------------------------------
-// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot.
+// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot. Same
+// shadow/live/colour split as restampHeadAtRow.
 restampBaseAtRow:
     lda starRowLo,x
     sta rsBaseShadowChar + 1
-    sta rsBaseShadowColour + 1
     sta rsBaseLiveChar + 1
     sta rsBaseLiveColour + 1
     lda starRowHi,x
-    pha
+    sta BG_SCRATCH
+
+    ldx ACTIVE_SCREEN                   // Single atomic snapshot for this call (X free again below).
+    lda BG_SCRATCH
     clc
-    adc #BG_CHAR_HI_DELTA
+    adc shadowCurrentDeltaTable,x
     sta rsBaseShadowChar + 2
-    pla
-    pha
+    lda BG_SCRATCH
     clc
-    adc #BG_COLOUR_HI_DELTA
-    sta rsBaseShadowColour + 2
-    pla
-    pha
+    adc activeScreenDeltaTable,x
     sta rsBaseLiveChar + 2
-    pla
+    lda BG_SCRATCH
     clc
     adc #$d4
     sta rsBaseLiveColour + 2
@@ -5650,8 +5699,6 @@ rsBaseShadowChar:
 rsBaseLiveChar:
     sta $ffff,x
     lda #5
-rsBaseShadowColour:
-    sta $ffff,x
 rsBaseLiveColour:
     sta $ffff,x
     rts
@@ -5661,7 +5708,20 @@ rsBaseLiveColour:
 // timers, re-aims periodically, and attempts fire on its own cadence.
 // Deliberately re-loads BG_TURRET_POOL_IDX from memory before every array
 // access rather than trusting X across the various jsr calls below.
+// Checked FIRST, every frame: TURRET_REFRESH_PENDING, set by scrollSplitIRQ
+// right after a screen flip commits. Handling it here (main-line) rather
+// than inside the IRQ itself avoids a scratch-byte race - restampActiveTurret
+// and this routine's own per-frame loop below share the same BG_TURRET_*
+// scratch bytes, and running restampActiveTurret from inside an IRQ that
+// could interrupt this routine mid-use of those same bytes would tear them.
 updateTurrets:
+    lda TURRET_REFRESH_PENDING
+    beq !noRefresh+
+    lda #0
+    sta TURRET_REFRESH_PENDING
+    jsr restampAllActiveTurrets
+!noRefresh:
+
     lda #0
     sta BG_TURRET_POOL_IDX
 !loop:
