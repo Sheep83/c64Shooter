@@ -62,8 +62,8 @@
 .const GAME_STATE_GAME_OVER      = 2          // Brief "GAME OVER" hold before menu / initials entry.
 .const GAME_STATE_ENTER_INITIALS = 3          // Type three initials for a qualifying score.
 
-.const MENU_PROMPT_SCREEN = $0400 + (20 * 40) + 13   // Row 20, centred for the 13-char prompt.
-.const MENU_PROMPT_COLOUR = $d800 + (20 * 40) + 13
+.const MENU_TITLE_SCREEN  = $0400 + (6 * 40) + 10    // Row 6, centred for "MY FIRST C64 SHOOTER" (20).
+.const MENU_PROMPT_SCREEN = $0400 + (20 * 40) + 13   // Row 20, centred for "FIRE TO START" (13).
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
@@ -281,23 +281,23 @@ endGame:
 
 // --- Routine: enterMenu -----------------------------------------------
 // One-time setup when the attract screen becomes active: clear the screen,
-// repaint the starfield, and draw the prompt. Title art and the cycling
-// high-score page arrive in later commits.
+// repaint the starfield, and draw the title page. The cycling high-score
+// page arrives in a later commit.
 enterMenu:
     lda #147
     jsr $ffd2                               // Clear screen RAM (also wipes any game HUD / GAME OVER text).
     jsr drawStarfield                       // Repaint the stars over the cleared screen.
-    jsr drawMenuPrompt                      // Put the prompt text on screen for the first frame.
+    jsr drawTitlePage                       // Put the title text on screen for the first frame.
     rts
 
 // --- Routine: attractMenu -----------------------------------------------
-// PLAIN ENGLISH: the screen you see before playing. Stars drift past and the
-// prompt stays put on top of them (previously the moving stars erased it).
-// Press fire and a fresh game begins.
+// PLAIN ENGLISH: the title screen you see before playing. Stars drift past
+// and the text stays put on top of them (previously the moving stars erased
+// it). Press fire and a fresh game begins.
 attractMenu:
     jsr waitForFrameStart
     jsr updateStarfield
-    jsr drawMenuPrompt                      // Re-stamp the text every frame, right after the stars move,
+    jsr drawTitlePage                       // Re-stamp the text every frame, right after the stars move,
                                             // so a star that just vacated a text cell never leaves a gap.
 
     lda STICK_2                             // Joystick port 2, fire is active-low bit 4.
@@ -309,18 +309,64 @@ attractMenu:
 !noFire:
     jmp attractMenu
 
-// --- Routine: drawMenuPrompt ------------------------------------------
-// Stamp the attract prompt into screen + colour RAM. Called every attract
-// frame immediately after updateStarfield.
-drawMenuPrompt:
-    ldx #0
-!loop:
-    lda menuPromptText,x
-    sta MENU_PROMPT_SCREEN,x
+// --- Routine: drawTitlePage -----------------------------------------
+// Stamp the title and the "FIRE TO START" prompt over the starfield. Called
+// every attract frame immediately after updateStarfield.
+drawTitlePage:
+    lda #<titleLine
+    sta TEXT_SRC
+    lda #>titleLine
+    sta TEXT_SRC + 1
+    lda #<MENU_TITLE_SCREEN
+    sta TEXT_DST
+    lda #>MENU_TITLE_SCREEN
+    sta TEXT_DST + 1
+    ldx #20                                 // "MY FIRST C64 SHOOTER".
+    lda #14                                 // Light blue.
+    jsr drawTextRow
+
+    lda #<fireToStartLine
+    sta TEXT_SRC
+    lda #>fireToStartLine
+    sta TEXT_SRC + 1
+    lda #<MENU_PROMPT_SCREEN
+    sta TEXT_DST
+    lda #>MENU_PROMPT_SCREEN
+    sta TEXT_DST + 1
+    ldx #13                                 // "FIRE TO START".
     lda #1                                  // White.
-    sta MENU_PROMPT_COLOUR,x
-    inx
-    cpx #13                                 // "FIRE TO START" is 13 screen codes.
+    jsr drawTextRow
+    rts
+
+// --- Routine: drawTextRow -----------------------------------------------
+// Blit one row of screen codes plus a flat colour into screen + colour RAM.
+// Entry: TEXT_SRC -> screen-code bytes, TEXT_DST -> screen RAM address,
+//        X = length (1..255), A = colour.
+// Colour RAM is always the screen page + $d400 ($0400 -> $d800).
+drawTextRow:
+    sta drawTextRowColourVal + 1            // Patch the per-cell colour immediate.
+    stx drawTextRowLen + 1                  // Patch the loop terminator.
+    lda TEXT_DST                            // Low byte is shared by the screen and colour stores.
+    sta drawTextRowScreen + 1
+    sta drawTextRowColour + 1
+    lda TEXT_DST + 1
+    sta drawTextRowScreen + 2
+    clc
+    adc #$d4                                // Screen page -> colour-RAM page.
+    sta drawTextRowColour + 2
+
+    ldy #0
+!loop:
+    lda (TEXT_SRC),y                        // Next screen code from the source string.
+drawTextRowScreen:
+    sta $ffff,y                             // -> screen RAM (address patched above).
+drawTextRowColourVal:
+    lda #0                                  // Immediate patched from A on entry.
+drawTextRowColour:
+    sta $ffff,y                             // -> colour RAM (address patched above).
+    iny
+drawTextRowLen:
+    cpy #0                                  // Immediate patched from X on entry.
     bne !loop-
     rts
 
@@ -336,8 +382,10 @@ waitFireRelease:
     rts
 
 .encoding "screencode_upper"
-menuPromptText:
-    .text "FIRE TO START"                   // 13 screen codes; keep drawMenuPrompt's cpx in step.
+titleLine:
+    .text "MY FIRST C64 SHOOTER"            // 20 screen codes; keep drawTitlePage's ldx in step.
+fireToStartLine:
+    .text "FIRE TO START"                   // 13 screen codes.
 .encoding "petscii_upper"
 
 // --- Routine: setupStarfieldCharset ---------------------------------------

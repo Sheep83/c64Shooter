@@ -34,4 +34,9 @@
 .var TEMP_OBJECT_Y            = $0034
 .var TEMP_EVENT_INDEX         = $0035
 .var TEMP_FREE_RASTER         = $0036
+// Menu/HUD text blitting (drawTextRow): source screen-code pointer and
+// destination screen-RAM pointer. $fb-$fe are genuinely free zero page on the
+// C64 (no KERNAL/BASIC use) while this program owns the machine.
+.var TEXT_SRC                 = $fb
+.var TEXT_DST                 = $fd
 .const BACKGROUND_COLOUR      = $D021
