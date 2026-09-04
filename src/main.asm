@@ -274,7 +274,7 @@ startGame:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
-    jsr initBackground                      // Paint the initial static scrolling background (Screen A).
+    jsr initBackground                      // Paint the diagnostic background in the single $0400 matrix.
 
     lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
     sta GAME_STATE
@@ -315,6 +315,7 @@ gameLoop:
                                              // split, no IRQ: the whole 25-row screen scrolls together.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
 
 !frameLoop:
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
@@ -332,18 +333,20 @@ gameLoop:
 
     jsr updateSpawner                       // Periodically create a new enemy.
     // updateStarfield deliberately not called during PLAYING - see startGame.
-    jsr updateBackgroundScroll              // Advance fine scroll (milestone 1: no coarse row advance yet).
+    jsr updateBackgroundScroll              // Prepare the next fine phase; request a coarse transition on wrap.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
+    jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
     jsr applyFineScroll                     // Write this frame's YSCROL - see its comment.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
 
 // --- Routine: endGame ---------------------------------------------------
@@ -2649,6 +2652,11 @@ setupLivesDisplay:
 // Current design only needs a single decimal digit; later upgrades/continues
 // can replace this if we ever allow more than nine ships.
 displayLives:
+    lda GAME_STATE                          // The diagnostic background owns every character during PLAYING.
+    cmp #GAME_STATE_PLAYING
+    bne !draw+
+    rts
+!draw:
     lda PLAYER_LIVES
     clc
     adc #48
@@ -2705,6 +2713,11 @@ awardKillScore:
 // Convert the 16-bit binary score to five decimal digits at SCORE_SCREEN+6.
 // The existing decimal divisor table is shared with the FREE-cycle display.
 displayScore:
+    lda GAME_STATE                          // Keep scoring, but leave the scrolling matrix alone.
+    cmp #GAME_STATE_PLAYING
+    bne !draw+
+    rts
+!draw:
     lda SCORE_LO
     sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
     lda SCORE_HI
@@ -2774,7 +2787,8 @@ updateCycleDebug:
     cmp #DEBUG_FRAMES                       // Has roughly one PAL second elapsed?
     bne !sample+                            // If not, skip the relatively expensive decimal display update.
 
-    jsr displayCycleMinimum                 // Display the worst free-cycle figure from the previous interval.
+    // No displayCycleMinimum during PLAYING: retain the RAM measurement,
+    // but the diagnostic background owns the entire screen (no fixed HUD).
     lda #0                                  // Begin a fresh 50-frame interval.
     sta DEBUG_FRAME_COUNT                   // Reset the frame counter.
     lda #$ff                                // Reset the rolling minimum to the largest possible 16-bit value.
@@ -3746,15 +3760,15 @@ BATCH_RASTER:          .fill 16, 0
 
 // --- Minimal background-scroll state -------------------------------------
 // No HUD, no raster split, no second screen. $D011 bits 0-2 (YSCROL) are
-// the ONLY thing this touches, written once per frame from the main loop -
+// are written once per presented frame from the main loop -
 // no IRQ of any kind is armed for the background. The sprite multiplexer
 // (armFirstBatch/multiplexIRQ, above) is untouched, byte-for-byte
 // identical to the pre-background baseline.
 SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
 SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the WHOLE screen.
-SCROLL_ROW:            .byte 0          // Raw-row index currently at screen row 0 (milestone 2+).
+SCROLL_ROW:            .byte 0          // Diagnostic row ID at screen row 0 (wraps modulo 256).
 BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
-BG_STAMP_CHAR:         .byte 0          // Scratch: one placeholder glyph, held across address setup.
+BG_STAMP_CHAR:         .byte 0          // Scratch: source row ID used by the diagnostic renderer.
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
 ASSIGN_SLOT:           .fill 16, $ff
@@ -4601,23 +4615,22 @@ HEALTH_SPRITE_POOL_END:
 }
 
 // ============================================================================
-// Minimal background-scroll engine code, MILESTONE 1 ONLY (see
-// docs/background-engine.md): a single static full-screen test pattern on
-// $0400, and ONE $D011 write per frame cycling YSCROL through its 8 fine
-// positions. No HUD, no raster split, no second screen, no coarse
-// transition yet - those come later, only once this is confirmed clean by
-// actually watching it run. Placed in the existing, already-unused gap
-// between the $2400 block and the health-sprite pool at $3000 (confirmed
-// free in the pre-background baseline's own memory map) - the resident
-// $0801-$1fxx segment has no spare room for new code inline.
+// Single-screen diagnostic scrolling. Ordinary main-loop work only; no
+// screen flip, colour scroll, background IRQ, shadow or temporary row buffer.
+// Two in-place portions straddle presentation; see docs/background-engine.md.
+// Control fits in the existing gap below health sprites; unrolled copies
+// live outside VIC bank 0, where there is room to keep the cycle count simple.
 // ============================================================================
 * = $2920
 
 // --- Routine: applyFineScroll -----------------------------------------------
-// Writes SCROLL_FINE into $D011 bits 0-2, preserving every other bit
-// (bit 7, the raster-compare high bit the sprite multiplexer manages
-// itself, included). Called once per presented frame from gameLoop. This
-// is the ONLY thing this prototype does to $D011 - no split, no second
+// Writes SCROLL_FINE into $D011 bits 0-2, retaining the display mode bits.
+// $D011 bit 7 reads current raster high, but writes IRQ compare high.
+// This read/write is safe here because the call is at
+// raster 0, so the read high bit equals the scheduler's below-256 compare
+// high bit. It would NOT preserve that compare bit at arbitrary rasters.
+// Called once per presented frame from gameLoop. This
+// is the only background write to $D011 - no split, no second
 // value, no IRQ of any kind armed for it.
 applyFineScroll:
     sei
@@ -4628,18 +4641,27 @@ applyFineScroll:
     cli
     rts
 
-// --- Routine: initBackground -------------------------------------------
-// One-time (per new game) setup: fill the WHOLE screen ($0400, all 25
-// rows - there is no fixed HUD in this prototype) with the raw-row
-// placeholder pattern, fill all of $D800 with the one fixed
-// TERRAIN_COLOUR, and reset scroll state. Called from startGame.
+// --- Routine: initBackground -----------------------------------------------
+// Fill one screen and fixed colour RAM. The diagnostic has hexadecimal row
+// IDs, two vertical rails and a diagonal crossing successive row boundaries.
 initBackground:
     lda #0
     sta SCROLL_FRAME_COUNT
     sta SCROLL_FINE
+    sta BG_COARSE_PENDING
+    sta BG_COARSE_FINISH
+    sta BG_COARSE_DEFERRED
+    lda #$80
     sta SCROLL_ROW
 
-    ldx #0                                  // Fixed-colour fill, the whole 1000-byte colour matrix.
+    ldx #15                                 // Two unused glyphs in the existing RAM charset.
+!glyphLoop:
+    lda bgDiagnosticGlyphs,x
+    sta STAR_CHARSET + 224 * 8,x
+    dex
+    bpl !glyphLoop-
+
+    ldx #0
 !colourFill:
     lda #TERRAIN_COLOUR
     sta $d800,x
@@ -4650,69 +4672,78 @@ initBackground:
     cpx #250
     bne !colourFill-
 
-    ldx #0                                  // Screen row 0-24 (the whole screen scrolls).
+    ldx #0
 !rowLoop:
     stx BG_DEST_ROW
     jsr renderRawRowIntoScreenA
-    inc SCROLL_ROW
     ldx BG_DEST_ROW
     inx
     cpx #25
     bne !rowLoop-
-    rts
-
-// --- Routine: rawRowGlyph ----------------------------------------------
-// Entry: A = raw-row index (SCROLL_ROW, 0-249). Exit: A = that row's
-// placeholder character - a single digit-glyph screen code (row mod 10),
-// repeated across all 40 columns. This IS the "simple raw character-row
-// source": every row is fully determined by its own index, with no table
-// lookup needed, which makes a coarse advance (milestone 2+) trivially
-// easy to verify by eye - any skip or repeat is immediately visible.
-rawRowGlyph:
-!mod10:
-    cmp #10
-    bcc !haveDigit+
-    sec
-    sbc #10
-    jmp !mod10-
-!haveDigit:
-    clc
-    adc #$30                                // Digit screen codes are identity with PETSCII in this range.
+    lda #$80                                // SCROLL_ROW always identifies the top matrix row.
+    sta SCROLL_ROW
     rts
 
 // --- Routine: renderRawRowIntoScreenA ---------------------------------------
-// Entry: BG_DEST_ROW (0-24), SCROLL_ROW (raw-row index). Fills that row of
-// $0400 with rawRowGlyph(SCROLL_ROW), 40 bytes. Used only by
-// initBackground for this milestone - there is no per-frame row
-// generation yet (that's milestone 2's coarse transition).
+// Entry: BG_DEST_ROW (0-24), SCROLL_ROW (8-bit ID at the TOP of the matrix).
+// Only screen RAM is written; neither colour RAM nor sprite pointers change.
 renderRawRowIntoScreenA:
-    lda SCROLL_ROW
-    jsr rawRowGlyph
-    sta BG_STAMP_CHAR                       // Stash the glyph - the address setup below needs A too.
-
+    lda SCROLL_ROW                          // Reproducible source: top row ID + destination row.
+    clc
+    adc BG_DEST_ROW
+    sta BG_STAMP_CHAR
     ldx BG_DEST_ROW
     lda starRowLo,x
-    sta renderRawStore + 1
+    sta TEXT_DST
     lda starRowHi,x
-    sta renderRawStore + 2
+    sta TEXT_DST + 1
+
+    lda #32
+    ldy #39
+!fillLoop:
+    sta (TEXT_DST),y
+    dey
+    bpl !fillLoop-
+
+    lda #224                                // Continuous vertical rails.
+    ldy #6
+    sta (TEXT_DST),y
+    ldy #33
+    sta (TEXT_DST),y
 
     lda BG_STAMP_CHAR
-    ldx #39
-!fillLoop:
-renderRawStore:
-    sta $ffff,x
-    dex
-    bpl !fillLoop-
+    lsr
+    lsr
+    lsr
+    lsr
+    tax
+    lda bgHexDigits,x
+    ldy #1
+    sta (TEXT_DST),y
+    lda BG_STAMP_CHAR
+    and #15
+    tax
+    lda bgHexDigits,x
+    iny
+    sta (TEXT_DST),y
+
+    txa
+    clc
+    adc #8
+    tay
+    lda #225                                // One diagonal glyph; adjacent rows continue its slope.
+    sta (TEXT_DST),y
     rts
 
-// --- Routine: updateBackgroundScroll -------------------------------------
-// MILESTONE 1: advances SCROLL_FINE through 0-7 and wraps straight back to
-// 0 - no coarse-row transition yet, so the static test pattern will
-// visibly snap back by 8 pixels on every wrap. That snap is the expected,
-// correct look of pure YSCROL cycling on unchanging content; it is milestone
-// 2's job (a coarse-row transition) to make the motion continuous instead,
-// and it is deliberately not implemented until this milestone is confirmed
-// clean by actually watching it run.
+bgHexDigits:
+    .byte 48,49,50,51,52,53,54,55,56,57,1,2,3,4,5,6
+bgDiagnosticGlyphs:
+    .byte $18,$18,$18,$18,$18,$18,$18,$18
+    .byte $80,$40,$20,$10,$08,$04,$02,$01
+
+// --- Routine: updateBackgroundScroll ---------------------------------------
+// Advance 1px every SCROLL_FRAME_DIVIDER frames. A wrap is only published
+// after prepareBackgroundCoarse has updated the upper matrix behind the beam.
 updateBackgroundScroll:
     inc SCROLL_FRAME_COUNT
     lda SCROLL_FRAME_COUNT
@@ -4720,12 +4751,105 @@ updateBackgroundScroll:
     bcc !done+
     lda #0
     sta SCROLL_FRAME_COUNT
-
-    inc SCROLL_FINE
     lda SCROLL_FINE
-    cmp #8
-    bcc !done+
-    lda #0
-    sta SCROLL_FINE
+    cmp #7
+    beq !coarse+
+    inc SCROLL_FINE
+    rts
+!coarse:
+    lda #1
+    sta BG_COARSE_PENDING
 !done:
     rts
+
+// --- Routine: prepareBackgroundCoarse --------------------------------------
+// At YSCROL=7 the VIC fetches row 12 on line 151. From line 152 onward,
+// rows 0-12 can change without affecting this frame (the VIC caches row 12).
+// Keep the old lower rows until the NEXT frame. Their one crossing source
+// row (old row 12) is reproducible from its ID, so no row/screen shadow exists.
+// Called AFTER BUILD preparation, before the unchanged frame-start wait.
+prepareBackgroundCoarse:
+    lda BG_COARSE_PENDING
+    beq !done+
+    lda #0
+    sta BG_COARSE_PENDING
+
+    lda VIC_CONTROL_1                       // Do not start late and run over sprite presentation at line 0.
+    bmi !defer+
+    lda RASTER
+    cmp #200
+    bcs !defer+
+!waitRead:
+    lda RASTER
+    cmp #152
+    bcc !waitRead-
+
+    jsr shiftBackgroundUpper
+bgUpperCopied:
+    dec SCROLL_ROW                          // New scenery enters ABOVE the previous top row.
+    lda #0
+    sta BG_DEST_ROW
+    jsr renderRawRowIntoScreenA
+bgUpperReady:
+    lda #0
+    sta SCROLL_FINE                         // Published by applyFineScroll at the next raster 0.
+    lda #1
+    sta BG_COARSE_FINISH
+!done:
+    rts
+!defer:
+    inc BG_COARSE_DEFERRED                  // Diagnostic counter: preserve a whole old frame if overloaded.
+    lda #SCROLL_FRAME_DIVIDER - 1
+    sta SCROLL_FRAME_COUNT                  // Retry next frame; no matrix or VIC phase has changed.
+    rts
+
+// --- Routine: finishBackgroundCoarse ---------------------------------------
+// Called immediately AFTER armFirstBatch. Fine 0 is already set. The VIC
+// will not fetch row 13 until line 152, leaving ample time for this half.
+// Move rows 23->24 down through 13->14, then reproduce old row 12 at row 13.
+// SCROLL_ROW+13 = old top ID+12. This is an existing row, not another advance.
+finishBackgroundCoarse:
+    lda BG_COARSE_FINISH
+    beq !done+
+    lda #0
+    sta BG_COARSE_FINISH
+    jsr shiftBackgroundLower
+    lda #13
+    sta BG_DEST_ROW
+    jsr renderRawRowIntoScreenA
+bgLowerReady:
+!done:
+    rts
+
+BG_COARSE_PENDING:     .byte 0
+BG_COARSE_FINISH:      .byte 0
+BG_COARSE_DEFERRED:    .byte 0
+BACKGROUND_CONTROL_END:
+.if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
+    .error "Background control code overlaps health sprite RAM"
+}
+
+// Code only, outside VIC bank 0. Plenty of RAM: absolute LDA/STA pairs make
+// each copied byte exactly 8 CPU cycles, with no indexed page penalties.
+// Interrupts remain enabled. Neither copy reaches $07e8-$07ff / sprite pointers.
+* = $4000
+shiftBackgroundUpper:
+    .for (var row = 12; row >= 1; row--) {
+        .for (var col = 0; col < 40; col++) {
+            lda BG_SCREEN_A + (row - 1) * 40 + col
+            sta BG_SCREEN_A + row * 40 + col
+        }
+    }
+    rts                                     // 480 bytes: 3840 cycles + RTS.
+shiftBackgroundLower:
+    .for (var row = 24; row >= 14; row--) {
+        .for (var col = 0; col < 40; col++) {
+            lda BG_SCREEN_A + (row - 1) * 40 + col
+            sta BG_SCREEN_A + row * 40 + col
+        }
+    }
+    rts                                     // 440 bytes: 3520 cycles + RTS.
+BACKGROUND_CODE_END:
+.if (BACKGROUND_CODE_END > $a000) {
+    .error "Background copy code overlaps BASIC ROM"
+}
