@@ -32,11 +32,6 @@
 .const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
 .const STAR_GLYPH_BYTES = 96
 
-// Sanxion (Rob Hubbard) PSID player entry points.
-.const MUSIC_LOAD = $B000
-.const MUSIC_INIT = $BE00
-.const MUSIC_PLAY = $BE20
-.const CPU_MEMORY_PORT = $01                       // 6510 memory-map control register.
 .const ATTACK_TOP_TURN_LEFT       = 0
 .const ATTACK_TOP_TURN_RIGHT      = 1
 .const ATTACK_TOP_LOOP_LEFT       = 2
@@ -128,14 +123,6 @@ init:
     jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
     jsr startRandomWave                      // Choose the first formation/pattern combination.
 
-    lda #$36                                // Bank BASIC ROM out; expose RAM at $a000-$bfff while keeping KERNAL + I/O visible.
-    sta CPU_MEMORY_PORT                     // Sanxion's init/play code lives in RAM underneath BASIC ROM at $be00/$be20.
-
-    lda #0                                  // PSID subtunes are zero-based: 0 selects Sanxion's default first tune.
-    tax                                     // Give the player clean X/Y on entry as a conservative courtesy.
-    tay
-    jsr MUSIC_INIT                          // Initialise the embedded SID player once.
-
     lda #PLAYER_START_X                     // Reset player low X coordinate to its normal start point.
     sta OBJECT_X                            // Object 0 is permanently player-owned.
     lda #0                                  // Player start X is within the low 256-pixel range.
@@ -193,8 +180,7 @@ mainLoop:
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
-    //jsr MUSIC_PLAY                        // Temporarily muted during attack-pattern testing.
-    jsr updateCycleDebug                    // Record remaining budget including the SID player's CPU cost.
+    jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
@@ -3442,18 +3428,4 @@ healthSpritePool:
 HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
-}
-
-
-// --- Embedded SID music -----------------------------------------------------
-// Raw C64 payload extracted from Sanxion.sid. The PSID container itself is not
-// assembled; only the native player/data bytes are placed at the address the
-// tune requests. MUSIC_INIT is called once, MUSIC_PLAY once per PAL frame.
-* = MUSIC_LOAD
-sanxionMusic:
-    .import binary "Sanxion.bin"
-SANXION_MUSIC_END:
-
-.if (SANXION_MUSIC_END > $CD40) {
-    .error "Sanxion payload assembled beyond its expected end address"
 }
