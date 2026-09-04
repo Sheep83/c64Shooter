@@ -54,6 +54,16 @@
 .const PLAYER_STATE_EXPLODING  = 1
 .const PLAYER_STATE_RESPAWNING = 2
 .const PLAYER_STATE_GAME_OVER  = 3
+
+// Top-level game states, dispatched once per frame by mainLoop in the same
+// cmp/beq style as PLAYER_STATE is dispatched inside the game itself.
+.const GAME_STATE_MENU           = 0          // Attract screen: starfield + title / high-score pages.
+.const GAME_STATE_PLAYING        = 1          // The core game frame loop (gameLoop).
+.const GAME_STATE_GAME_OVER      = 2          // Brief "GAME OVER" hold before menu / initials entry.
+.const GAME_STATE_ENTER_INITIALS = 3          // Type three initials for a qualifying score.
+
+.const MENU_PROMPT_SCREEN = $0400 + (20 * 40) + 13   // Row 20, centred for the 13-char prompt.
+.const MENU_PROMPT_COLOUR = $d800 + (20 * 40) + 13
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
@@ -94,8 +104,10 @@
 // Game state -> sorted object list -> BUILD_PLAN -> swap -> VIC-II renderer.
 // ============================================================================
 
-// --- Routine: init ----------------------------------------------------------
-// Configure VIC-II, seed the object pool, and prepare the first render plan.
+// --- Routine: init --------------------------------------------------------
+// One-time hardware bring-up only. Per-game state now lives in startGame, so
+// init just configures the VIC, paints the starfield, and drops into the
+// attract screen via the mainLoop state router.
 init:
     lda VIC_BANK                            // Load A from VIC_BANK.
     and #%11111100                          // AND A with #%11111100.
@@ -109,19 +121,42 @@ init:
     ora #%00001110                          // Character set at $3800 within VIC bank 0.
     sta VIC_MEMORY_SETUP
 
-    lda #147                                // Load A from #147.
-    jsr $ffd2                               // Clear screen
-
     lda #0
     sta BORDER_COLOUR                       // Black border.
     sta BACKGROUND_COLOUR                   // Black playfield.
 
+    jsr setupStarfield                      // Seed star positions/phases and paint them once.
+
+    lda #GAME_STATE_MENU                    // Boot straight into the attract screen.
+    sta GAME_STATE
+    jsr enterMenu                           // Clear screen, repaint stars, draw the prompt.
+    jmp mainLoop                            // Enter the top-level state router.
+
+// --- Routine: startGame --------------------------------------------------
+// Reset every per-game variable, wipe leftover menu text, build the first
+// render plan, and switch the top-level state to PLAYING. Re-callable for
+// each new game from the attract screen.
+startGame:
+    lda #147                                // Wipe any menu / high-score text from screen RAM.
+    jsr $ffd2
+    jsr drawStarfield                       // Repaint every star over the freshly cleared screen.
+
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
     jsr setupLivesDisplay                   // Draw "LIVES 3" and initialise the player's stock.
-    jsr setupStarfield                      // Draw initial stars below the HUD row.
-    jsr setupSprites                        // Call setupSprites; return here when it executes RTS.
+    jsr setupSprites                        // Reapply sprite VIC config and seed placeholder positions.
     jsr startRandomWave                      // Choose the first formation/pattern combination.
+
+    ldx #0                                  // Release every logical object slot left over from a previous game.
+!clearObjects:
+    lda #0
+    sta OBJECT_ACTIVE,x
+    sta OBJECT_DEATH_TIMER,x
+    sta OBJECT_HIT_TIMER,x
+    sta OBJECT_HEALTH,x
+    inx
+    cpx #MAX_OBJECTS
+    bne !clearObjects-
 
     lda #PLAYER_START_X                     // Reset player low X coordinate to its normal start point.
     sta OBJECT_X                            // Object 0 is permanently player-owned.
@@ -152,18 +187,37 @@ init:
     lda #2                                  // Load A from #2.
     sta OBJECT_COLOUR                       // Store A in OBJECT_COLOUR.
 
-    // Enemies are seeded entirely by the wave/attack spawner now, so init no
-    // longer pre-fills any enemy object slots here.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
-    jmp mainLoop                            // Jump unconditionally to mainLoop.
 
-// --- Routine: mainLoop ------------------------------------------------------
-// Display LIVE_PLAN while the CPU prepares BUILD_PLAN for the next frame.
+    lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
+    sta GAME_STATE
+    rts
+
+// --- Routine: mainLoop --------------------------------------------------
+// Top-level game-state router. Each state's handler owns its own per-frame
+// loop and returns here when the state changes, mirroring the PLAYER_STATE
+// cmp/beq dispatch used inside the game.
 mainLoop:
+!router:
+    lda GAME_STATE                          // Which top-level state are we in?
+    cmp #GAME_STATE_PLAYING
+    bne !notPlaying+
+    jsr gameLoop                            // Runs until the player reaches GAME OVER.
+    jmp !router-
+!notPlaying:
+    // MENU today; later commits add GAME_OVER / ENTER_INITIALS branches here.
+    jsr attractMenu                         // Runs until fire starts a new game.
+    jmp !router-
+
+// --- Routine: gameLoop -------------------------------------------------
+// The core game frame loop: display LIVE_PLAN while the CPU prepares
+// BUILD_PLAN for the next frame. Returns to the router once the player has
+// lost every life (PLAYER_STATE_GAME_OVER).
+gameLoop:
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
@@ -174,6 +228,14 @@ mainLoop:
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
     jsr updateEnemyFire                     // Let at most one eligible enemy launch an aimed projectile.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
+
+    lda PLAYER_STATE                        // Has the last life just been spent?
+    cmp #PLAYER_STATE_GAME_OVER
+    bne !stillPlaying+
+    jsr endGame                             // Tear down the raster IRQ / sprites and set the next state.
+    rts                                     // Back to the router.
+!stillPlaying:
+
     jsr updateSpawner                       // Periodically create a new enemy.
     jsr updateStarfield                     // Scroll and twinkle the character background.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
@@ -187,6 +249,96 @@ mainLoop:
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
+
+// --- Routine: endGame ---------------------------------------------------
+// PLAIN ENGLISH: the instant your last life is gone the game freezes. The
+// per-scanline interrupt that juggles more than eight sprites is switched
+// off, the KERNAL's normal interrupt is put back in charge, every hardware
+// sprite is hidden, and control returns to the menu. For this first
+// structural step GAME OVER drops straight back to the attract screen; the
+// dedicated "GAME OVER" hold and initials entry arrive in later commits.
+endGame:
+    sei                                     // Change interrupt hardware with IRQs held off.
+    lda IRQ_ENABLE
+    and #%11111110                          // Clear the VIC raster-interrupt enable bit.
+    sta IRQ_ENABLE
+    lda #%00000001
+    sta IRQ_STATUS                          // Acknowledge any raster interrupt still latched.
+    lda #<$ea31                             // Point the KERNAL IRQ vector back at its default handler so a
+    sta IRQ_VECTOR                          // stray interrupt can no longer reach multiplexIRQ.
+    lda #>$ea31
+    sta IRQ_VECTOR + 1
+    cli
+
+    lda #0
+    sta SPRITE_ENABLE                       // Hide every hardware sprite.
+    sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
+
+    lda #GAME_STATE_MENU                    // Later commits set GAME_OVER / ENTER_INITIALS here instead.
+    sta GAME_STATE
+    jsr enterMenu                           // Prepare the attract screen before the router runs it.
+    rts
+
+// --- Routine: enterMenu -----------------------------------------------
+// One-time setup when the attract screen becomes active: clear the screen,
+// repaint the starfield, and draw the prompt. Title art and the cycling
+// high-score page arrive in later commits.
+enterMenu:
+    lda #147
+    jsr $ffd2                               // Clear screen RAM (also wipes any game HUD / GAME OVER text).
+    jsr drawStarfield                       // Repaint the stars over the cleared screen.
+    jsr drawMenuPrompt                      // Put the prompt text on screen for the first frame.
+    rts
+
+// --- Routine: attractMenu -----------------------------------------------
+// PLAIN ENGLISH: the screen you see before playing. Stars drift past and the
+// prompt stays put on top of them (previously the moving stars erased it).
+// Press fire and a fresh game begins.
+attractMenu:
+    jsr waitForFrameStart
+    jsr updateStarfield
+    jsr drawMenuPrompt                      // Re-stamp the text every frame, right after the stars move,
+                                            // so a star that just vacated a text cell never leaves a gap.
+
+    lda STICK_2                             // Joystick port 2, fire is active-low bit 4.
+    and #%00010000
+    bne !noFire+
+    jsr waitFireRelease                     // Don't let this same press also fire on game frame 1.
+    jsr startGame                           // Build the first game frame and switch state to PLAYING.
+    rts                                     // Back to the router, which will now call gameLoop.
+!noFire:
+    jmp attractMenu
+
+// --- Routine: drawMenuPrompt ------------------------------------------
+// Stamp the attract prompt into screen + colour RAM. Called every attract
+// frame immediately after updateStarfield.
+drawMenuPrompt:
+    ldx #0
+!loop:
+    lda menuPromptText,x
+    sta MENU_PROMPT_SCREEN,x
+    lda #1                                  // White.
+    sta MENU_PROMPT_COLOUR,x
+    inx
+    cpx #13                                 // "FIRE TO START" is 13 screen codes.
+    bne !loop-
+    rts
+
+// --- Routine: waitFireRelease ---------------------------------------------
+// Block until joystick-2 fire is released so one physical press cannot be
+// consumed by two states across a transition.
+waitFireRelease:
+!wait:
+    jsr waitForFrameStart                   // Sample once per frame.
+    lda STICK_2
+    and #%00010000                          // Bit set = fire released.
+    beq !wait-
+    rts
+
+.encoding "screencode_upper"
+menuPromptText:
+    .text "FIRE TO START"                   // 13 screen codes; keep drawMenuPrompt's cpx in step.
+.encoding "petscii_upper"
 
 // --- Routine: setupStarfieldCharset ---------------------------------------
 // Copy the standard upper-case/graphics character ROM to $3800, then replace
@@ -2469,12 +2621,11 @@ updatePlayerState:
     rts
 
 !gameOver:
-    lda #PLAYER_STATE_GAME_OVER             // Freeze player lifecycle permanently for this v1 test.
+    lda #PLAYER_STATE_GAME_OVER             // Signal gameLoop to hand control back to the state router.
     sta PLAYER_STATE
     lda #blankSprite / 64                   // Remove the ship after its final explosion has completed.
     sta OBJECT_SPRITE
-    jsr displayGameOver                     // Put a simple centred GAME OVER message on screen.
-    rts
+    rts                                     // endGame (game level) owns teardown and the GAME OVER screen now.
 
 !startRespawn:
     lda #PLAYER_START_X                     // Move the permanently-owned player object back to start.
@@ -2836,6 +2987,8 @@ ASSIGN_X_MSB:          .fill 16, 0
 ASSIGN_SPRITE:         .fill 16, 0
 ASSIGN_COLOUR:         .fill 16, 0
 ASSIGN_OBJECT:         .fill 16, $ff    // Logical owner installed by each raster assignment.
+
+GAME_STATE:            .byte 0         // Top-level state: MENU / PLAYING / GAME_OVER / ENTER_INITIALS.
 
 PLAYER_HW_MASK:        .byte 0         // Current VIC hardware bit occupied by logical object 0.
 PLAYER_HIT:            .byte 0         // Latched vulnerable-player collision event.
