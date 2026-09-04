@@ -136,9 +136,6 @@ init:
     tay
     jsr MUSIC_INIT                          // Initialise the embedded SID player once.
 
-    //lda #1                                  // Load A from #1.
-    //sta MOB_X_VEL                           // Enemy horizontal speed
-
     lda #PLAYER_START_X                     // Reset player low X coordinate to its normal start point.
     sta OBJECT_X                            // Object 0 is permanently player-owned.
     lda #0                                  // Player start X is within the low 256-pixel range.
@@ -168,25 +165,8 @@ init:
     lda #2                                  // Load A from #2.
     sta OBJECT_COLOUR                       // Store A in OBJECT_COLOUR.
 
-    ldx #1                                  // Load X from #1.
-//!enemyInit:
-    //lda #1                                  // Load A from #1.
-    //sta OBJECT_ACTIVE,x                     // Store A in OBJECT_ACTIVE,x.
-    //lda #TYPE_ENEMY                         // Load A from #TYPE_ENEMY.
-    //sta OBJECT_TYPE,x                       // Store A in OBJECT_TYPE,x.
-    //lda spritePointers,x                    // Load A from spritePointers,x.
-    //sta OBJECT_SPRITE,x                     // Store A in OBJECT_SPRITE,x.
-    //lda #3                                  // Load A from #3.
-    //sta OBJECT_COLOUR,x                     // Store A in OBJECT_COLOUR,x.
-    //lda #0
-    //sta OBJECT_PATTERN,x
-    //sta OBJECT_PATH_STEP,x
-    //sta OBJECT_PATH_TIMER,x
-    //inx                                     // Increment X by one.
-    //cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
-    ////cpx #02
-    //bne !enemyInit-                         // Branch to !enemyInit- if the previous result was non-zero/not equal.
-
+    // Enemies are seeded entirely by the wave/attack spawner now, so init no
+    // longer pre-fills any enemy object slots here.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
@@ -2787,7 +2767,6 @@ LOOKUP_TABLES_END:
 OBJECT_X:              .fill MAX_OBJECTS, 0
 OBJECT_Y:              .fill MAX_OBJECTS, 0
 OBJECT_X_MSB:          .fill MAX_OBJECTS, 0
-//OBJECT_DIR:            .fill MAX_OBJECTS, 0
 OBJECT_ACTIVE:         .fill MAX_OBJECTS, 0
 OBJECT_TYPE:           .fill MAX_OBJECTS, 0
 HW_SPRITE_OFFSET:      .byte 0,2,4,6,8,10,12,14

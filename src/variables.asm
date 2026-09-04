@@ -26,7 +26,6 @@
 // NOTE: these are in BASIC's zero-page workspace. That is acceptable while
 // this program owns the machine, but moving them to a deliberately reserved
 // area is a sensible later cleanup before the engine grows.
-//.var MOB_X_VEL                = $002b
 .var TEMP_Y_REG               = $002e
 .var TEMP_MSB                 = $002f
 .var JOY_STATE                = $0030
