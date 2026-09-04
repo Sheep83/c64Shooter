@@ -3007,6 +3007,19 @@ armFirstBatch:
     and #%11111110                          // AND A with #%11111110.
     sta IRQ_ENABLE                          // Disable raster IRQ while arming
 
+    // BUG FOUND IN PLAYTESTING (background painted the static placeholder
+    // but never scrolled at all): HUD_SPLIT_PENDING was only ever CLEARED
+    // (by hudSplitIRQ once it fires) and never SET again for the next
+    // frame. initBackground zeroes it once at game start, so armNextEvent
+    // treated the split as "already done" forever after - hudSplitIRQ
+    // never fired, VIC_CONTROL_1's low bits stayed pinned at 0 by
+    // resetHudScroll every frame (so SCROLL_FINE was computed but never
+    // actually revealed), and the screen flip was never committed either.
+    // Must be re-armed here, once per frame, before scheduling this
+    // frame's raster events.
+    lda #1
+    sta HUD_SPLIT_PENDING
+
     lda #0
     sta BATCH_INDEX
     jsr armNextEvent
@@ -4735,12 +4748,31 @@ BG_SCREEN_B_END:
 // only ever reveals the real scroll value below row 0. Called twice per
 // frame in gameLoop, immediately after each waitForFrameStart, well before
 // HUD_SPLIT_RASTER is reached.
+// BUG FOUND IN PLAYTESTING (row 0/HUD vanished, replaced by scrolled
+// placeholder content, right at the first coarse-step screen flip):
+// $D018 selects the screen base for ALL 25 rows, including row 0 - so
+// whichever screen is active determines where row 0 is fetched from too.
+// Screen B's row 0 was only ever the assembly-time BG_ROW_CHAR fill (it
+// is never otherwise written), so the moment Screen B first became
+// active, row 0 showed that instead of "FREE/LIVES/SCORE". Mirroring row
+// 0 from Screen A into Screen B every frame is what keeps it correct
+// after a flip, without having to touch every HUD-text draw site (they
+// all rightly assume plain $0400). Colour RAM needs no mirror - it isn't
+// double-buffered, so row 0's colour is already correct either way.
 resetHudScroll:
     sei
     lda VIC_CONTROL_1
     and #%11111000
     sta VIC_CONTROL_1
     cli
+
+    ldx #0
+!hudMirrorLoop:
+    lda BG_SCREEN_A,x
+    sta screenB,x
+    inx
+    cpx #40
+    bne !hudMirrorLoop-
     rts
 
 // --- Routine: initBackground -------------------------------------------

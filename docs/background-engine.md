@@ -119,6 +119,37 @@ needs.
     a human.
 12. Stop. **Not reached.**
 
+### Two real bugs found by human playtesting, both fixed
+
+The human playtest report was **"background is character numbers only and
+does not scroll at all"** - correct, and not something the earlier
+`-exitscreenshot` sampling had caught:
+
+1. **`HUD_SPLIT_PENDING` was never re-armed.** `armFirstBatch` delegated
+   straight to `armNextEvent` without first setting `HUD_SPLIT_PENDING = 1`
+   for the new frame. `initBackground` zeroes it once at game start, and
+   `hudSplitIRQ` only ever *clears* it (never sets it), so `armNextEvent`
+   treated the split as "already done" from the very first frame onward -
+   `hudSplitIRQ` never fired, `VIC_CONTROL_1`'s low bits stayed pinned at 0
+   by `resetHudScroll` every frame, and the screen flip was never
+   committed either. Fixed: `armFirstBatch` now sets `HUD_SPLIT_PENDING = 1`
+   once per frame, before scheduling that frame's raster events.
+2. **Screen B's row 0 was never given HUD content.** `$D018` selects the
+   screen base for all 25 rows, including row 0, so once fix #1 made the
+   first coarse-step flip actually happen, row 0 started showing Screen
+   B's assembly-time placeholder fill instead of "FREE/LIVES/SCORE" -
+   confirmed visually via `-exitscreenshot` right at the first flip. Fixed
+   by mirroring row 0 from Screen A into Screen B every frame in
+   `resetHudScroll` (cheap, 40 bytes; colour needs no mirror since $D800
+   isn't double-buffered).
+
+Re-verified via two more `-exitscreenshot` sweeps (30 frames each) after
+each fix: background now visibly scrolls (row content shifts down inside
+the row before advancing to the next digit sequence at the coarse
+boundary), row 0 stays fixed and readable across multiple coarse
+transitions, no corruption. Still not a substitute for continuous human
+playtesting - see the note below.
+
 ### Verification note (honesty about method limits)
 
 Implemented milestones 3-9 together (they're one coherent pipeline) rather
