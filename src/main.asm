@@ -27,6 +27,28 @@
 .const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
 
+// ============================================================================
+// MINIMAL scrolling-background prototype.
+// Deliberately narrow goal: prove a vertically scrolling character
+// background can coexist cleanly with the existing sprite multiplexer,
+// without touching its own scheduling. See docs/background-engine.md for
+// the milestone plan. Explicitly NOT here: starfield-during-PLAYING (see
+// startGame), turrets, entities, hitscan-vs-scenery, per-cell colour, dual
+// shadow buffers, stage completion, CharPad, multiload, metatiles.
+// ============================================================================
+.const BG_SCREEN_A = $0400
+.const BG_SCREEN_B = $3400                          // Free 1K-aligned gap: health-sprite pool ends at
+                                                     // $33ff, $3800 is charset RAM (untouched by this work).
+.const BG_SCREEN_B_HI_DELTA = (>BG_SCREEN_B) - (>BG_SCREEN_A)
+.const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
+                                                     // colour RAM work at all, scrolling or otherwise.
+.const BG_ROW_CHAR = 81                             // Crude deterministic placeholder glyph ('Q' screen code).
+.const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
+.const HUD_SPLIT_RASTER = 58                        // First scanline of character row 1 (matches the old,
+                                                     // known-good HUD-row convention).
+.const BG_RAW_ROW_COUNT = 200                       // Simple raw character-row source (milestone 11): one
+                                                     // fixed digit-glyph per row, no metatiles.
+
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
 .const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
@@ -201,7 +223,10 @@ init:
 startGame:
     lda #147                                // Wipe any menu / high-score text from screen RAM.
     jsr $ffd2
-    jsr drawStarfield                       // Repaint every star over the freshly cleared screen.
+    // Starfield deliberately NOT repainted here: it is disabled for the
+    // duration of PLAYING while the scrolling background is prototyped
+    // (see docs/background-engine.md, minimal-prototype milestones). Menu
+    // and GAME OVER still call drawStarfield/updateStarfield as before.
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
@@ -255,6 +280,8 @@ startGame:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
+    jsr initBackground                      // Paint the initial static scrolling background (Screen A).
+
     lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
     sta GAME_STATE
     rts
@@ -290,6 +317,7 @@ mainLoop:
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr resetHudScroll                      // Force YSCROL=0 before row 0 (HUD) is scanned this frame.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
 
@@ -308,7 +336,8 @@ gameLoop:
 !stillPlaying:
 
     jsr updateSpawner                       // Periodically create a new enemy.
-    jsr updateStarfield                     // Scroll and twinkle the character background.
+    // updateStarfield deliberately not called during PLAYING - see startGame.
+    jsr updateBackgroundScroll              // Advance the scrolling landscape (fine + coarse row advance).
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
@@ -316,6 +345,7 @@ gameLoop:
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr resetHudScroll                      // Force YSCROL=0 before row 0 (HUD) is scanned this frame.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
@@ -343,6 +373,15 @@ endGame:
     lda #0
     sta SPRITE_ENABLE                       // Hide every hardware sprite.
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
+
+    lda VIC_MEMORY_SETUP                    // Snap back to Screen A: GAME OVER/menu code always assumes
+    and #%00001111                          // plain $0400 and knows nothing about the scrolling
+    ora screenD018HighNibble                // background's second screen.
+    sta VIC_MEMORY_SETUP
+    lda #0
+    sta ACTIVE_SCREEN
+    sta SCREEN_FLIP_PENDING
+    sta HUD_SPLIT_PENDING
 
     lda #GAME_STATE_GAME_OVER
     sta GAME_STATE
@@ -2953,45 +2992,24 @@ renderSprites:
     rts                                     // Return to the calling routine.
 
 // --- Routine: armFirstBatch -------------------------------------------------
-// Install/arm LIVE_PLAN's first raster batch, if one exists.
+// Install/arm LIVE_PLAN's first raster batch, if one exists. UNCHANGED in
+// its own scheduling: the first sprite batch is still armed at its own
+// BATCH_RASTER[0] line, exactly as before the background work. The only
+// addition is delegating the "what fires next" decision to armNextEvent,
+// which also knows about the HUD/scroll raster split and will arm THAT
+// instead, this once, if its line falls before the first batch's - see
+// armNextEvent's comment. When there is no split pending (background
+// scrolling not active, e.g. menu/game-over), behaviour is identical to
+// before: first batch armed if one exists, nothing armed otherwise.
 armFirstBatch:
     sei                                     // Block maskable IRQs while critical state is changed.
     lda IRQ_ENABLE                          // Load A from IRQ_ENABLE.
     and #%11111110                          // AND A with #%11111110.
     sta IRQ_ENABLE                          // Disable raster IRQ while arming
 
-    ldy LIVE_PLAN
-    lda BATCH_COUNT,y
-    bne !hasBatch+
-
-    lda #%00000001                          // Select raster interrupt latch.
-    sta IRQ_STATUS                          // Clear any stale raster condition.
-    jmp !done+
-
-!hasBatch:
-
-    lda #0                                  // Load A from #0.
-    sta BATCH_INDEX                         // Store A in BATCH_INDEX.
-
-    lda #<multiplexIRQ                      // Load A from #<multiplexIRQ.
-    sta IRQ_VECTOR                          // Store A in IRQ_VECTOR.
-    lda #>multiplexIRQ                      // Load A from #>multiplexIRQ.
-    sta IRQ_VECTOR + 1                      // Store A in IRQ_VECTOR + 1.
-
-    lda VIC_CONTROL_1                       // Load A from VIC_CONTROL_1.
-    and #%01111111                          // AND A with #%01111111.
-    sta VIC_CONTROL_1                       // Raster compare below 256
-
-    ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda BATCH_RASTER,y                      // Load A from BATCH_RASTER,y.
-    sta RASTER                              // Store A in RASTER.
-
-    lda #%00000001                          // Load A from #%00000001.
-    sta IRQ_STATUS                          // Clear stale raster IRQ
-    lda IRQ_ENABLE                          // Load A from IRQ_ENABLE.
-    ora #%00000001                          // OR A with #%00000001.
-    sta IRQ_ENABLE                          // Store A in IRQ_ENABLE.
-!done:
+    lda #0
+    sta BATCH_INDEX
+    jsr armNextEvent
     cli                                     // Allow maskable IRQs.
     rts                                     // Return to the calling routine.
 
@@ -3077,29 +3095,127 @@ multiplexIRQ:
     sta IRQ_STATUS                          // Acknowledge raster IRQ
 
     inc BATCH_INDEX                         // Increment BATCH_INDEX by one.
-    ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda BATCH_INDEX                         // Load A from BATCH_INDEX.
-    cmp BATCH_COUNT,y                       // Compare A with BATCH_COUNT,y; set flags, leaving A unchanged.
-    bcs !allDone+                           // Branch to !allDone+ if carry is set.
-
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    adc LIVE_PLAN                           // Add LIVE_PLAN to A, including carry.
-    tax                                     // Copy A into X.
-    lda BATCH_RASTER,x                      // Load A from BATCH_RASTER,x.
-    sta RASTER                              // Arm next batch
+    jsr armNextEvent                        // Next batch, the HUD split, or nothing - see its comment.
     jmp $ea31                               // Jump unconditionally to $ea31.
 
-!allDone:
-    lda IRQ_ENABLE                          // Load the VIC interrupt-enable register.
-    and #%11111110                          // Clear raster interrupt enable bit.
-    sta IRQ_ENABLE                          // Disable further raster IRQ generation.
+// --- Routine: armNextEvent ---------------------------------------------------
+// Shared tail logic for armFirstBatch/multiplexIRQ/hudSplitIRQ. Entry:
+// BATCH_INDEX = the next sprite batch to consider (may be >= BATCH_COUNT,
+// meaning none remain). Decides what fires next this frame: the HUD/
+// scroll raster split (hudSplitIRQ), if HUD_SPLIT_PENDING is still set and
+// its raster line is <= the next batch's (or no batch remains at all), or
+// that next sprite batch (multiplexIRQ) otherwise. This is what lets the
+// split coexist with the sprite multiplexer WITHOUT ever moving the first
+// batch's own raster line - each event is armed at its own true line, in
+// whichever order they actually fall this frame, exactly like a single
+// merged raster schedule. If neither remains, raster IRQ generation is
+// switched off for the rest of the frame, same as the original !allDone.
+armNextEvent:
+    ldy LIVE_PLAN
+    lda BATCH_INDEX
+    cmp BATCH_COUNT,y
+    bcs !onlySplitMaybe+                    // No batches left (or none armed this frame).
 
-    lda #%00000001                          // Select the VIC raster interrupt latch.
-    sta IRQ_STATUS                          // Clear any pending/stale raster condition.
+    clc
+    adc LIVE_PLAN
+    tax
+    lda HUD_SPLIT_PENDING
+    beq !armBatch+                          // Split already fired this frame: just arm the batch.
+    lda BATCH_RASTER,x
+    cmp #HUD_SPLIT_RASTER
+    bcc !armBatch+                          // This batch's line is earlier: arm the batch.
+    jmp armHudSplitEvent                    // Split's line is earlier-or-equal: arm it instead.
 
-    lda #0                                  // Reset batch position for the next frame.
-    sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
-    jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
+!armBatch:
+    lda #<multiplexIRQ
+    sta IRQ_VECTOR
+    lda #>multiplexIRQ
+    sta IRQ_VECTOR + 1
+    lda VIC_CONTROL_1
+    and #%01111111
+    sta VIC_CONTROL_1
+    lda BATCH_RASTER,x
+    sta RASTER
+    lda #%00000001
+    sta IRQ_STATUS
+    lda IRQ_ENABLE
+    ora #%00000001
+    sta IRQ_ENABLE
+    rts
+
+!onlySplitMaybe:
+    lda HUD_SPLIT_PENDING
+    bne armHudSplitEvent
+
+    lda IRQ_ENABLE                          // Nothing left to schedule this frame.
+    and #%11111110
+    sta IRQ_ENABLE
+    lda #%00000001
+    sta IRQ_STATUS
+    rts
+
+armHudSplitEvent:
+    lda #<hudSplitIRQ
+    sta IRQ_VECTOR
+    lda #>hudSplitIRQ
+    sta IRQ_VECTOR + 1
+    lda VIC_CONTROL_1
+    and #%01111111
+    sta VIC_CONTROL_1
+    lda #HUD_SPLIT_RASTER
+    sta RASTER
+    lda #%00000001
+    sta IRQ_STATUS
+    lda IRQ_ENABLE
+    ora #%00000001
+    sta IRQ_ENABLE
+    rts
+
+// --- Routine: hudSplitIRQ ----------------------------------------------------
+// Fires once per frame, whenever HUD_SPLIT_RASTER (line 58, first scanline
+// of character row 1) is next among this frame's raster events - see
+// armNextEvent. Writes the real fine-scroll value below row 0, and commits
+// a pending screen-buffer flip in the same instant (see SCREEN_FLIP_PENDING's
+// comment for why both must happen together here, not in the main loop).
+// Does NOT touch sprite/collision state - capturePlayerCollision is
+// multiplexIRQ's job, only relevant when a batch is about to change
+// hardware-sprite ownership.
+hudSplitIRQ:
+    lda IRQ_ENABLE
+    and #%00000001
+    beq !notOurs+
+    lda IRQ_STATUS
+    and #%00000001
+    beq !notOurs+
+
+    lda VIC_CONTROL_1
+    and #%11111000
+    ora SCROLL_FINE
+    sta VIC_CONTROL_1
+
+    lda SCREEN_FLIP_PENDING
+    beq !noFlip+
+    lda #0
+    sta SCREEN_FLIP_PENDING
+    lda ACTIVE_SCREEN
+    eor #1
+    sta ACTIVE_SCREEN
+    tax
+    lda VIC_MEMORY_SETUP
+    and #%00001111
+    ora screenD018HighNibble,x
+    sta VIC_MEMORY_SETUP
+!noFlip:
+    lda #0
+    sta HUD_SPLIT_PENDING
+
+    lda #%00000001
+    sta IRQ_STATUS
+    jsr armNextEvent                        // BATCH_INDEX unchanged: arm whatever's next, if anything.
+    jmp $ea31
+
+!notOurs:
+    jmp $ea31
 
 // --- Routine: capturePlayerCollision ---------------------------------------
 // $d01e remains the cheap hardware broad phase.  If the player's current VIC
@@ -3711,6 +3827,35 @@ PATH_ABS_X:           .byte 0              // Main-thread scratch used by direct
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
 BATCH_RASTER:          .fill 16, 0
+HUD_SPLIT_PENDING:     .byte 0          // Set each frame by armFirstBatch; cleared by hudSplitIRQ once
+                                         // it fires. See armNextEvent's comment for how this merges
+                                         // with the sprite-batch schedule without moving batch 0.
+
+// --- Minimal background-scroll state -----------------------------------
+SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
+SCROLL_FINE:           .byte 0          // YSCROL applied below row 0, 0-7.
+SCROLL_ROW:            .byte 0          // Index into bgRawRows currently at screen row 1.
+ACTIVE_SCREEN:         .byte 0          // 0 = Screen A ($0400) active, 1 = Screen B ($3400) active.
+                                         // Written ONLY by hudSplitIRQ, in lockstep with the real
+                                         // $D018 flip - main-line code always sees a self-consistent
+                                         // snapshot (read it once per call, never mid-routine).
+SCREEN_FLIP_PENDING:   .byte 0          // Set by beginNextCoarseState once the inactive screen is
+                                         // fully built (same pass that wraps SCROLL_FINE to 0 - NOT
+                                         // one frame early; see docs/background-engine.md's postmortem
+                                         // on the previous branch's off-by-one). Consumed by hudSplitIRQ.
+ROW_BUILD_CURSOR:      .byte 0          // Rows (0-24) committed into the inactive screen this window.
+BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (1-24).
+BG_STAMP_CHAR:         .byte 0          // Scratch: one placeholder glyph, held across address setup.
+BG_SRC_DELTA:          .byte 0          // relocateRows only: source (active-screen) delta.
+BG_DST_DELTA:          .byte 0          // relocateRows/beginNextCoarseState: destination (inactive-
+                                         // screen) delta.
+BG_ROWS_TO_DO:         .byte 0          // relocateRows: remaining rows this call, counts down to 0.
+
+// Indexed by ACTIVE_SCREEN (0/1).
+screenD018HighNibble:  .byte %00010000, %11010000   // $D018 screen-base nibble per screen (charset-at-
+                                                     // $3800 nibble untouched either way).
+activeScreenDeltaTable:   .byte 0, BG_SCREEN_B_HI_DELTA
+inactiveScreenDeltaTable: .byte BG_SCREEN_B_HI_DELTA, 0
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
 ASSIGN_SLOT:           .fill 16, $ff
@@ -4555,3 +4700,286 @@ HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
 }
+.if (HEALTH_SPRITE_POOL_END > BG_SCREEN_B) {
+    .error "Health sprite pool overruns Screen B's reserved slot"
+}
+
+// --- Screen B (second VIC-displayable character matrix) --------------------
+// Reserved explicitly so no other resident code/data can drift into this
+// gap between the health-sprite pool and the $3800 charset RAM.
+* = BG_SCREEN_B
+screenB:
+    .fill 1000, BG_ROW_CHAR
+BG_SCREEN_B_END:
+.if ((BG_SCREEN_B_END - screenB) > 1024) {
+    .error "Screen B reservation overruns the $3800 charset RAM"
+}
+
+// ============================================================================
+// Minimal background-scroll engine code. The resident $0801-$1fxx code
+// segment had no spare room left for this much new code inline, so it's
+// placed in the existing, already-unused gap between the $2400 block and
+// the health-sprite pool at $3000 (confirmed free in the pre-background
+// baseline's own memory map) - this keeps the .prg contiguous and avoids
+// padding a large unused gap into the file (tried $6000 first: it works,
+// but adds ~10KB of dead space to the .prg that VICE's virtual-disk loader
+// has to churn through, making every test run dramatically slower for no
+// runtime benefit). Nothing here is on the sprite-multiplexer's own hot
+// path (armNextEvent/hudSplitIRQ, which had to stay near armFirstBatch/
+// multiplexIRQ, are defined there, not here).
+// ============================================================================
+* = $2920
+
+// --- Routine: resetHudScroll -------------------------------------------
+// Force YSCROL to 0 for the top of the frame (row 0/HUD) so hudSplitIRQ
+// only ever reveals the real scroll value below row 0. Called twice per
+// frame in gameLoop, immediately after each waitForFrameStart, well before
+// HUD_SPLIT_RASTER is reached.
+resetHudScroll:
+    sei
+    lda VIC_CONTROL_1
+    and #%11111000
+    sta VIC_CONTROL_1
+    cli
+    rts
+
+// --- Routine: initBackground -------------------------------------------
+// One-time (per new game) setup: fill Screen A rows 1-24 with the raw-row
+// placeholder pattern, fill $D800 rows 1-24 with the one fixed
+// TERRAIN_COLOUR, and reset every piece of scroll state. Called from
+// startGame. Deliberately a flat, un-split single pass - correctness here
+// isn't time-critical, it runs before the frame loop starts.
+initBackground:
+    lda #0
+    sta SCROLL_FRAME_COUNT
+    sta SCROLL_FINE
+    sta SCROLL_ROW
+    sta ACTIVE_SCREEN
+    sta SCREEN_FLIP_PENDING
+    sta ROW_BUILD_CURSOR
+    sta HUD_SPLIT_PENDING
+
+    lda VIC_MEMORY_SETUP
+    and #%00001111
+    ora screenD018HighNibble                // Index 0 = Screen A.
+    sta VIC_MEMORY_SETUP
+
+    ldx #0                                  // Fixed-colour fill, rows 1-24 (960 bytes, offset 40).
+!colourFill:
+    lda #TERRAIN_COLOUR
+    sta $d800 + 40,x
+    sta $d800 + 40 + 240,x
+    sta $d800 + 40 + 480,x
+    sta $d800 + 40 + 720,x
+    inx
+    cpx #240
+    bne !colourFill-
+
+    ldx #1                                  // Screen row 1-24.
+!rowLoop:
+    stx BG_DEST_ROW
+    jsr renderRawRowIntoScreenA
+    inc SCROLL_ROW
+    ldx BG_DEST_ROW
+    inx
+    cpx #25
+    bne !rowLoop-
+    rts
+
+// --- Routine: rawRowGlyph ----------------------------------------------
+// Entry: A = raw-row index (SCROLL_ROW, 0-249). Exit: A = that row's
+// placeholder character - a single digit-glyph screen code (row mod 10),
+// repeated across all 40 columns. This IS the "simple raw character-row
+// source": every row is fully determined by its own index, with no table
+// lookup needed, which makes a coarse advance trivially easy to verify by
+// eye (rows read 0,1,2,...,9,0,1,... as the world scrolls - any skip or
+// repeat is immediately visible). Milestone 11 (feeding rows from a larger
+// deterministic raw row map/table) can replace just this routine's body.
+rawRowGlyph:
+!mod10:
+    cmp #10
+    bcc !haveDigit+
+    sec
+    sbc #10
+    jmp !mod10-
+!haveDigit:
+    clc
+    adc #$30                                // Digit screen codes are identity with PETSCII in this range.
+    rts
+
+// --- Routine: renderRawRowIntoScreenA ---------------------------------------
+// Entry: BG_DEST_ROW (1-24), SCROLL_ROW (raw-row index). Fills that row of
+// Screen A with rawRowGlyph(SCROLL_ROW), 40 bytes. Used only by
+// initBackground - the per-frame incremental path (relocateNextChunk/
+// beginNextCoarseState) never needs this once scrolling is running, since
+// only row 1 is ever genuinely new; the rest is always relocated directly
+// from the currently active screen.
+renderRawRowIntoScreenA:
+    lda SCROLL_ROW
+    jsr rawRowGlyph
+    sta BG_STAMP_CHAR                       // Stash the glyph - the address setup below needs A too.
+
+    ldx BG_DEST_ROW
+    lda starRowLo,x
+    sta renderRawStore + 1
+    lda starRowHi,x
+    sta renderRawStore + 2
+
+    lda BG_STAMP_CHAR
+    ldx #39
+!fillLoop:
+renderRawStore:
+    sta $ffff,x
+    dex
+    bpl !fillLoop-
+    rts
+
+// --- Routine: updateBackgroundScroll -------------------------------------
+// Advances fine scroll by one frame's worth. Every frame also gives the
+// incremental "build the inactive screen" work a bounded slice
+// (relocateNextChunk), so a whole coarse step's worth of preparation is
+// spread across the 8 fine-scroll frames rather than landing in one lump
+// at the boundary. Called once per real frame from gameLoop.
+updateBackgroundScroll:
+    inc SCROLL_FRAME_COUNT
+    lda SCROLL_FRAME_COUNT
+    cmp #SCROLL_FRAME_DIVIDER
+    bcc !done+
+    lda #0
+    sta SCROLL_FRAME_COUNT
+
+    inc SCROLL_FINE
+    lda SCROLL_FINE
+    cmp #8
+    bcc !chunk+
+    lda #0
+    sta SCROLL_FINE
+    // Fine 7->0 wrap: SCREEN_FLIP_PENDING is set inside beginNextCoarseState,
+    // in this SAME pass, so the very next hudSplitIRQ presents fine=0
+    // together with the new screen - not one fine-scroll phase early (see
+    // docs/background-engine.md's postmortem on the previous branch).
+    jsr beginNextCoarseState
+    jmp !done+
+
+!chunk:
+    jsr relocateNextChunk
+!done:
+    rts
+
+// --- Routine: beginNextCoarseState ----------------------------------------
+// Runs once per coarse step, at the fine 7->0 wrap. Renders the one
+// genuinely new row (the only row that can't just be relocated from
+// existing data) straight into the inactive screen, finishes relocating
+// any rows the preceding fine-scroll frames hadn't gotten to yet, and only
+// THEN marks the inactive screen ready to present.
+beginNextCoarseState:
+    lda #0
+    sta ROW_BUILD_CURSOR
+
+    lda #1
+    sta BG_DEST_ROW
+    ldx ACTIVE_SCREEN
+    lda inactiveScreenDeltaTable,x
+    sta BG_DST_DELTA
+    jsr renderRawRowIntoInactiveScreen
+    inc SCROLL_ROW
+    lda #1
+    sta ROW_BUILD_CURSOR
+
+    jsr relocateAllRemaining
+
+    lda #1
+    sta SCREEN_FLIP_PENDING
+    rts
+
+// --- Routine: renderRawRowIntoInactiveScreen --------------------------------
+// Entry: BG_DEST_ROW (here always 1), BG_DST_DELTA (set by the caller).
+// Same idea as renderRawRowIntoScreenA, but targets whichever screen is
+// currently INACTIVE via BG_DST_DELTA rather than always Screen A.
+renderRawRowIntoInactiveScreen:
+    lda SCROLL_ROW
+    jsr rawRowGlyph
+    sta BG_STAMP_CHAR
+
+    ldx BG_DEST_ROW
+    lda starRowLo,x
+    sta renderRawStore2 + 1
+    lda starRowHi,x
+    clc
+    adc BG_DST_DELTA
+    sta renderRawStore2 + 2
+
+    lda BG_STAMP_CHAR
+    ldx #39
+!fillLoop:
+renderRawStore2:
+    sta $ffff,x
+    dex
+    bpl !fillLoop-
+    rts
+
+// --- Routine: relocateNextChunk / relocateAllRemaining / relocateRows ------
+// Copies rows from the currently ACTIVE screen (read-only - nothing ever
+// mutates it while it's active, since the starfield is off and there are
+// no entities in this prototype) into the INACTIVE screen, one read per
+// byte, one write. Source row r's content becomes destination row r+1 -
+// this is the same relationship a real single-buffer shift would use, but
+// since source and destination are different physical screens here there
+// is no overlap hazard and no ordering requirement. Self-limiting via
+// ROW_BUILD_CURSOR, so calling with more rows than remain is harmless.
+// relocateNextChunk does a bounded CHUNK_ROWS slice (called from fine
+// frames 1-6); relocateAllRemaining (called once, from beginNextCoarseState)
+// finishes whatever's left, normally a no-op since six chunks of 4 already
+// cover all 23 rows.
+.const CHUNK_ROWS = 4
+relocateNextChunk:
+    lda #CHUNK_ROWS
+    jmp relocateRows
+
+relocateAllRemaining:
+    lda #30                                 // Self-limited by ROW_BUILD_CURSOR<24 below; 30 is just
+    // fall through                         // "more than could possibly remain".
+
+relocateRows:
+    sta BG_ROWS_TO_DO
+    ldx ACTIVE_SCREEN
+    lda activeScreenDeltaTable,x
+    sta BG_SRC_DELTA
+    lda inactiveScreenDeltaTable,x
+    sta BG_DST_DELTA
+
+!chunkLoop:
+    lda ROW_BUILD_CURSOR
+    cmp #24
+    bcs !done+                              // All 23 source rows (dest 2-24) already relocated.
+
+    tax                                     // X = source row (cursor, 1-23).
+    lda starRowLo,x
+    sta relocSrc + 1
+    lda starRowHi,x
+    clc
+    adc BG_SRC_DELTA
+    sta relocSrc + 2
+
+    inx                                     // X = destination row (source + 1, 2-24).
+    lda starRowLo,x
+    sta relocDst + 1
+    lda starRowHi,x
+    clc
+    adc BG_DST_DELTA
+    sta relocDst + 2
+
+    ldy #39
+!byteLoop:
+relocSrc:
+    lda $ffff,y
+relocDst:
+    sta $ffff,y
+    dey
+    bpl !byteLoop-
+
+    inc ROW_BUILD_CURSOR
+    dec BG_ROWS_TO_DO
+    bne !chunkLoop-
+!done:
+    rts
