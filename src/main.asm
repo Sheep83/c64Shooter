@@ -873,6 +873,22 @@ healthBarByte1:
     .byte $00,$00,$00,$f0,$ff,$ff,$ff
 healthBarByte2:
     .byte $00,$00,$00,$00,$00,$f0,$ff
+healthBarByteEnd:
+
+// --- Compile-time bounds guard: enemy health-bar segment tables ----------
+// updateEnemyHealthSprite indexes healthBarByte0/1/2 by an enemy's remaining
+// HP (1 .. ENEMY_START_HEALTH-1 on a non-lethal hit; index 0 is the unused
+// dead slot).  Each row holds one byte per representable HP value, and the bar
+// art itself is six segments, so the tables can show at most (row length - 1)
+// HP.  If ENEMY_START_HEALTH is ever tuned past that, the indexed reads would
+// silently walk into neighbouring data instead of failing loudly here.
+.if (((healthBarByte2 - healthBarByte1) != (healthBarByte1 - healthBarByte0))
+        || ((healthBarByteEnd - healthBarByte2) != (healthBarByte1 - healthBarByte0))) {
+    .error "healthBarByte0/1/2 rows must all be the same length"
+}
+.if (ENEMY_START_HEALTH > (healthBarByte1 - healthBarByte0 - 1)) {
+    .error "ENEMY_START_HEALTH exceeds the healthBarByte0/1/2 segment tables"
+}
 
 // --- Routine: updatePlayerCombatEffects ------------------------------------
 // Decay fire cadence and restore the normal player bitmap after muzzle flash.
