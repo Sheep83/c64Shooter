@@ -64,6 +64,15 @@
 
 .const MENU_TITLE_SCREEN  = $0400 + (6 * 40) + 10    // Row 6, centred for "MY FIRST C64 SHOOTER" (20).
 .const MENU_PROMPT_SCREEN = $0400 + (20 * 40) + 13   // Row 20, centred for "FIRE TO START" (13).
+
+.const HISCORE_COUNT          = 8                    // High-score table entries.
+.const HISCORE_START_SCORE    = 100                  // Every seeded entry starts here.
+.const HISCORE_HEADING_SCREEN = $0400 + (4 * 40) + 14 // Row 4, centred for "HIGH SCORES" (11).
+.const HISCORE_ROW_WIDTH      = 10                   // "III  DDDDD": 3 initials, 2 spaces, 5 digits.
+
+.const ATTRACT_PAGE_TITLE  = 0
+.const ATTRACT_PAGE_SCORES = 1
+.const ATTRACT_CYCLE_FRAMES = 250                    // ~5 PAL seconds per attract page.
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
@@ -126,10 +135,11 @@ init:
     sta BACKGROUND_COLOUR                   // Black playfield.
 
     jsr setupStarfield                      // Seed star positions/phases and paint them once.
+    jsr seedHiscoreTable                    // Fill the high-score table with random initials, all at 100.
 
     lda #GAME_STATE_MENU                    // Boot straight into the attract screen.
     sta GAME_STATE
-    jsr enterMenu                           // Clear screen, repaint stars, draw the prompt.
+    jsr enterMenu                           // Clear screen, repaint stars, draw the first attract page.
     jmp mainLoop                            // Enter the top-level state router.
 
 // --- Routine: startGame --------------------------------------------------
@@ -281,25 +291,47 @@ endGame:
 
 // --- Routine: enterMenu -----------------------------------------------
 // One-time setup when the attract screen becomes active: clear the screen,
-// repaint the starfield, and draw the title page. The cycling high-score
-// page arrives in a later commit.
+// repaint the starfield, and start on the title page.
 enterMenu:
     lda #147
     jsr $ffd2                               // Clear screen RAM (also wipes any game HUD / GAME OVER text).
     jsr drawStarfield                       // Repaint the stars over the cleared screen.
-    jsr drawTitlePage                       // Put the title text on screen for the first frame.
+
+    lda #ATTRACT_PAGE_TITLE                 // Always come back to the title first.
+    sta ATTRACT_PAGE
+    lda #ATTRACT_CYCLE_FRAMES
+    sta ATTRACT_TIMER
+    jsr drawTitlePage                       // Draw the first frame's text immediately.
     rts
 
 // --- Routine: attractMenu -----------------------------------------------
-// PLAIN ENGLISH: the title screen you see before playing. Stars drift past
-// and the text stays put on top of them (previously the moving stars erased
-// it). Press fire and a fresh game begins.
+// PLAIN ENGLISH: the attract screen. It flips every few seconds between the
+// title page and the high-score table. Stars drift past and the text stays
+// put on top of them. Press fire on either page and a fresh game begins.
 attractMenu:
     jsr waitForFrameStart
     jsr updateStarfield
-    jsr drawTitlePage                       // Re-stamp the text every frame, right after the stars move,
-                                            // so a star that just vacated a text cell never leaves a gap.
 
+    lda ATTRACT_PAGE                        // Re-stamp the current page's text every frame, right after
+    bne !scoresPage+                        // the stars move, so a vacated text cell never shows a gap.
+    jsr drawTitlePage
+    jmp !pageDrawn+
+!scoresPage:
+    jsr drawHiscorePage
+!pageDrawn:
+
+    dec ATTRACT_TIMER                       // Time to flip to the other page?
+    bne !checkFire+
+    lda #ATTRACT_CYCLE_FRAMES
+    sta ATTRACT_TIMER
+    lda ATTRACT_PAGE
+    eor #1                                  // Toggle title <-> scores.
+    sta ATTRACT_PAGE
+    lda #147                                // Wipe the outgoing page's text, then repaint the stars.
+    jsr $ffd2
+    jsr drawStarfield
+
+!checkFire:
     lda STICK_2                             // Joystick port 2, fire is active-low bit 4.
     and #%00010000
     bne !noFire+
@@ -381,11 +413,220 @@ waitFireRelease:
     beq !wait-
     rts
 
+// --- Routine: seedHiscoreTable ------------------------------------------
+// Fill the high-score table with HISCORE_COUNT entries: three pseudo-random
+// initials each, every score equal to HISCORE_START_SCORE. The table is
+// therefore already in descending order (all equal), which the later insert
+// logic relies on. Called once from init.
+seedHiscoreTable:
+    lda CIA1_TIMER_A_LO                     // Any changing byte is a fine seed for throwaway names.
+    sta HISCORE_SEED
+
+    ldx #0                                  // X walks HISCORE_NAME byte by byte (0..HISCORE_COUNT*3-1).
+    ldy #0                                  // Y is the entry index.
+!entryLoop:
+    jsr nextRandomLetter                    // First initial.
+    sta HISCORE_NAME,x
+    inx
+    jsr nextRandomLetter                    // Second initial.
+    sta HISCORE_NAME,x
+    inx
+    jsr nextRandomLetter                    // Third initial.
+    sta HISCORE_NAME,x
+    inx
+
+    lda #<HISCORE_START_SCORE
+    sta HISCORE_LO,y
+    lda #>HISCORE_START_SCORE
+    sta HISCORE_HI,y
+
+    iny
+    cpy #HISCORE_COUNT
+    bne !entryLoop-
+
+    jsr formatHiscorePage                   // Pre-render the table text for the attract page.
+    rts
+
+// --- Routine: nextRandomLetter ----------------------------------------
+// Return A = a pseudo-random screen code in 1..26 (A-Z). Cheap LCG-ish mix
+// of a running seed and the free-running CIA timer; quality is irrelevant
+// for placeholder names.
+nextRandomLetter:
+    lda HISCORE_SEED
+    asl                                     // seed = seed*2 ...
+    eor HISCORE_SEED                        // ... xor seed ...
+    eor CIA1_TIMER_A_LO                     // ... xor a byte that changes every scanline.
+    sta HISCORE_SEED
+
+    and #%00011111                          // 0..31.
+!fold:
+    cmp #26
+    bcc !inRange+
+    sbc #26                                 // Carry is set here, so this is a plain subtract. 0..25.
+!inRange:
+    clc
+    adc #1                                  // 1..26 = screen codes for A..Z.
+    rts
+
+// --- Routine: formatHiscorePage ---------------------------------------
+// Rebuild HISCORE_PAGE_BUF: one HISCORE_ROW_WIDTH-char row per entry, laid
+// out "III  DDDDD" (3 initials, 2 spaces, 5 decimal digits). Call whenever
+// the table changes.
+formatHiscorePage:
+    ldx #0                                  // X = entry index.
+!rowLoop:
+    stx HS_ENTRY
+
+    txa                                     // Buffer offset for this row = entry * HISCORE_ROW_WIDTH (10).
+    asl                                     // *2
+    sta HS_TMP
+    asl                                     // *4
+    asl                                     // *8
+    clc
+    adc HS_TMP                              // *8 + *2 = *10
+    sta HS_BUF_OFF
+
+    txa                                     // Name offset = entry * 3.
+    asl
+    clc
+    adc HS_ENTRY
+    tay                                     // Y -> HISCORE_NAME for this entry.
+
+    ldx HS_BUF_OFF
+    lda HISCORE_NAME,y                      // Three initials.
+    sta HISCORE_PAGE_BUF,x
+    lda HISCORE_NAME + 1,y
+    sta HISCORE_PAGE_BUF + 1,x
+    lda HISCORE_NAME + 2,y
+    sta HISCORE_PAGE_BUF + 2,x
+    lda #32                                 // Two spaces between initials and score.
+    sta HISCORE_PAGE_BUF + 3,x
+    sta HISCORE_PAGE_BUF + 4,x
+
+    ldy HS_ENTRY                            // Copy this entry's score into the conversion scratch.
+    lda HISCORE_LO,y
+    sta HS_VAL_LO
+    lda HISCORE_HI,y
+    sta HS_VAL_HI
+
+    lda HS_BUF_OFF                          // Digits start five characters into the row.
+    clc
+    adc #5
+    tay
+    jsr formatScore5                       // Writes 5 screen codes at HISCORE_PAGE_BUF + Y.
+
+    ldx HS_ENTRY
+    inx
+    cpx #HISCORE_COUNT
+    bne !rowLoop-
+    rts
+
+// --- Routine: formatScore5 ------------------------------------------
+// Convert HS_VAL_LO/HI (destroyed) to exactly five decimal screen codes,
+// written to HISCORE_PAGE_BUF + Y .. +Y+4. Shares the decimal divisor table
+// with the FREE-cycle / score HUD converters.
+formatScore5:
+    sty HS_DIGIT_BASE
+    ldx #0                                  // X = decimal place: 0=10000s .. 4=1s.
+!placeLoop:
+    ldy #0                                  // Y counts how many times this divisor fits.
+!subLoop:
+    lda HS_VAL_HI
+    cmp debugDivisorHi,x
+    bcc !emit+
+    bne !doSub+
+    lda HS_VAL_LO
+    cmp debugDivisorLo,x
+    bcc !emit+
+!doSub:
+    lda HS_VAL_LO
+    sec
+    sbc debugDivisorLo,x
+    sta HS_VAL_LO
+    lda HS_VAL_HI
+    sbc debugDivisorHi,x
+    sta HS_VAL_HI
+    iny
+    bne !subLoop-
+!emit:
+    tya
+    clc
+    adc #48                                 // Screen codes 48-57 are digits 0-9.
+    pha
+    txa
+    clc
+    adc HS_DIGIT_BASE                       // Destination index = base + decimal place.
+    tay
+    pla
+    sta HISCORE_PAGE_BUF,y
+    inx
+    cpx #5
+    bne !placeLoop-
+    rts
+
+// --- Routine: drawHiscorePage ---------------------------------------
+// Stamp the "HIGH SCORES" heading and every pre-rendered table row over the
+// starfield. Called every attract frame while the scores page is showing.
+drawHiscorePage:
+    lda #<hiscoreHeading
+    sta TEXT_SRC
+    lda #>hiscoreHeading
+    sta TEXT_SRC + 1
+    lda #<HISCORE_HEADING_SCREEN
+    sta TEXT_DST
+    lda #>HISCORE_HEADING_SCREEN
+    sta TEXT_DST + 1
+    ldx #11                                 // "HIGH SCORES".
+    lda #7                                  // Yellow heading.
+    jsr drawTextRow
+
+    ldx #0                                  // X = entry index.
+!rowLoop:
+    stx HS_ENTRY
+
+    txa                                     // Row source = HISCORE_PAGE_BUF + entry * HISCORE_ROW_WIDTH.
+    asl
+    sta HS_TMP
+    asl
+    asl
+    clc
+    adc HS_TMP                              // entry * 10
+    clc
+    adc #<HISCORE_PAGE_BUF
+    sta TEXT_SRC
+    lda #>HISCORE_PAGE_BUF
+    adc #0
+    sta TEXT_SRC + 1
+
+    ldx HS_ENTRY                            // Row destination address from the precomputed table.
+    lda hiscoreRowLo,x
+    sta TEXT_DST
+    lda hiscoreRowHi,x
+    sta TEXT_DST + 1
+
+    ldx #HISCORE_ROW_WIDTH
+    lda #1                                  // White rows.
+    jsr drawTextRow
+
+    ldx HS_ENTRY
+    inx
+    cpx #HISCORE_COUNT
+    bne !rowLoop-
+    rts
+
+// Screen addresses for the eight table rows: rows 7,9,11,...,21, column 15.
+hiscoreRowLo:
+    .fill HISCORE_COUNT, <($0400 + (7 + i * 2) * 40 + 15)
+hiscoreRowHi:
+    .fill HISCORE_COUNT, >($0400 + (7 + i * 2) * 40 + 15)
+
 .encoding "screencode_upper"
 titleLine:
     .text "MY FIRST C64 SHOOTER"            // 20 screen codes; keep drawTitlePage's ldx in step.
 fireToStartLine:
     .text "FIRE TO START"                   // 13 screen codes.
+hiscoreHeading:
+    .text "HIGH SCORES"                     // 11 screen codes.
 .encoding "petscii_upper"
 
 // --- Routine: setupStarfieldCharset ---------------------------------------
@@ -3037,6 +3278,20 @@ ASSIGN_COLOUR:         .fill 16, 0
 ASSIGN_OBJECT:         .fill 16, $ff    // Logical owner installed by each raster assignment.
 
 GAME_STATE:            .byte 0         // Top-level state: MENU / PLAYING / GAME_OVER / ENTER_INITIALS.
+ATTRACT_PAGE:          .byte 0         // 0 = title page, 1 = high-score page.
+ATTRACT_TIMER:         .byte 0         // Frames left before the attract screen flips pages.
+
+HISCORE_SEED:          .byte 0         // Running seed for placeholder-initial generation.
+HS_ENTRY:              .byte 0         // Scratch: current entry index during table formatting.
+HS_BUF_OFF:            .byte 0         // Scratch: current row's byte offset into HISCORE_PAGE_BUF.
+HS_TMP:                .byte 0         // Scratch: multiply-by-10 partial.
+HS_VAL_LO:             .byte 0         // Scratch: score being converted to decimal.
+HS_VAL_HI:             .byte 0
+HS_DIGIT_BASE:         .byte 0         // Scratch: buffer index of a score's first digit.
+HISCORE_LO:            .fill HISCORE_COUNT, 0            // Per-entry score, low byte (kept descending).
+HISCORE_HI:            .fill HISCORE_COUNT, 0            // Per-entry score, high byte.
+HISCORE_NAME:          .fill HISCORE_COUNT * 3, 0        // Three initials (screen codes) per entry.
+HISCORE_PAGE_BUF:      .fill HISCORE_COUNT * HISCORE_ROW_WIDTH, 32  // Pre-rendered attract-page rows.
 
 PLAYER_HW_MASK:        .byte 0         // Current VIC hardware bit occupied by logical object 0.
 PLAYER_HIT:            .byte 0         // Latched vulnerable-player collision event.
