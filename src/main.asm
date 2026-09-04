@@ -41,14 +41,63 @@
 .const ATTACK_RIGHT_U_TURN_UP     = 6
 .const ATTACK_LEFT_U_TURN_DOWN    = 7
 .const ATTACK_RIGHT_U_TURN_DOWN   = 8
+// New curated combinations demonstrating fragment reuse: existing ingress,
+// manoeuvre and egress fragments re-paired in ways the old monolithic paths
+// never expressed, added at no cost in new path data.
+.const ATTACK_TOP_LONG_TURN_RIGHT     = 9   // Loop-family's long straight ingress feeding the tight turn-right manoeuvre.
+.const ATTACK_LEFT_SHALLOW_UP_TURN    = 10  // Shallow down-cross ingress feeding the sharper up-turn manoeuvre.
+.const ATTACK_RIGHT_SHALLOW_UP_TURN   = 11  // Mirror of the above.
 
-.const ATTACK_COUNT = 9
+.const ATTACK_COUNT = 12
 .const CIA1_TIMER_A_LO = $dc04
 .const WAVE_GAP        = 150                 // Frames between completed spawn formations.
 .const ENEMY_EXIT_RIGHT_LO = $58            // 344 = $0158, just beyond the right edge.
 .const ENEMY_ACCEL_INTERVAL = 12             // Descending enemies gain one pixel/frame of speed every 12 frames.
 .const ENEMY_MAX_PATH_SPEED = 3              // Cap integer path velocity so acceleration cannot run away.
 .const VIC_SPRITE_COLLISION = $d01e            // Reading clears the latched sprite/sprite collision bits.
+
+// Segmented movement: every enemy attack is an ingress fragment, then a
+// manoeuvre fragment, then an egress fragment, chained via OBJECT_STAGE.
+.const STAGE_INGRESS   = 0
+.const STAGE_MANOEUVRE = 1
+.const STAGE_EGRESS    = 2
+
+// Cheap direction-class bitmask used only at assemble time (never at runtime)
+// to verify a curated attack's ingress->manoeuvre->egress chain is a sensible
+// join: a fragment's exit class must share a bit with the next fragment's
+// entry mask.  Diagonal exits/entries set two bits.
+.const DIR_UP    = %0001
+.const DIR_DOWN  = %0010
+.const DIR_LEFT  = %0100
+.const DIR_RIGHT = %1000
+.const DIR_ANY   = %1111
+
+// Fragment IDs (declared here, not beside their data tables further down,
+// because KickAssembler resolves .var/List() attack tables in one pass and
+// needs these consts defined before that point).
+.const INGRESS_TOP_STRAIGHT_SHORT    = 0   // Short straight dive; feeds the tight top turns.
+.const INGRESS_TOP_STRAIGHT_LONG     = 1   // Longer straight dive; feeds the loops (and, reused, attack 9).
+.const INGRESS_LEFT_DIAG_CROSS_UP    = 2   // Upper-left cross, feeds an upward U-turn.
+.const INGRESS_RIGHT_DIAG_CROSS_UP   = 3   // Mirror.
+.const INGRESS_LEFT_DIAG_CROSS_DOWN  = 4   // Upper-left cross, feeds a downward U-turn (shallower/shorter than above).
+.const INGRESS_RIGHT_DIAG_CROSS_DOWN = 5   // Mirror.
+.const INGRESS_COUNT = 6
+
+.const MANOEUVRE_TURN_LEFT        = 0
+.const MANOEUVRE_TURN_RIGHT       = 1
+.const MANOEUVRE_LOOP_LEFT        = 2
+.const MANOEUVRE_LOOP_RIGHT       = 3
+.const MANOEUVRE_LOOP_TOP         = 4
+.const MANOEUVRE_UTURN_UP_LEFT    = 5
+.const MANOEUVRE_UTURN_UP_RIGHT   = 6
+.const MANOEUVRE_UTURN_DOWN_LEFT  = 7
+.const MANOEUVRE_UTURN_DOWN_RIGHT = 8
+.const MANOEUVRE_COUNT = 9
+
+.const EGRESS_COAST       = 0   // Generic: just inherit whatever velocity the manoeuvre ended with.
+.const EGRESS_UPPER_LEFT  = 1   // Shape a shallow up-left tangent before coasting.
+.const EGRESS_UPPER_RIGHT = 2   // Mirror.
+.const EGRESS_COUNT = 3
 
 .const PLAYER_STATE_ALIVE      = 0
 .const PLAYER_STATE_EXPLODING  = 1
@@ -1777,8 +1826,8 @@ updateEnemyFire:
     bne !next+
     lda OBJECT_DEATH_TIMER,x                // Dying/exploding enemies cannot fire.
     bne !next+
-    lda OBJECT_PATH_TIMER,x                 // $ff marks the momentum-only egress phase.
-    cmp #$ff
+    lda OBJECT_STAGE,x                      // Egress fragments (shaped or plain coast) never fire.
+    cmp #STAGE_EGRESS
     beq !next+
     lda OBJECT_Y,x                          // Keep firing to the readable middle of an attack.
     cmp #64
@@ -1973,30 +2022,44 @@ moveEnemyBullet:
     rts
 
 // --- Routine: moveEnemyPath -------------------------------------------------
-// Advance one enemy through its table-driven movement pattern.
-// Finite segments load a new signed velocity.  A final $ff segment is a coast:
-// it deliberately keeps the velocity produced by the preceding manoeuvre so an
-// enemy leaves the playfield carrying its existing momentum rather than snapping
-// to an unrelated canned exit vector.
+// Advance one enemy through its segmented ingress/manoeuvre/egress movement.
+// OBJECT_STAGE selects which of the three fragment tables OBJECT_PATH_STEP
+// indexes; setFragmentPointer resolves that into FRAG_PTR each time a new
+// segment header must be read.  Finite segments set a new TARGET velocity,
+// which easeVelocityTowardTarget then bends the live velocity towards by one
+// unit per frame, rather than snapping instantly.  A final $ff segment is a
+// coast: it deliberately keeps the velocity produced by the preceding
+// fragment so an enemy leaves the playfield carrying its existing momentum
+// rather than snapping to an unrelated canned exit vector.  A duration of
+// zero means the current fragment has ended: ingress hands off to the
+// object's manoeuvre fragment, manoeuvre hands off to its egress fragment,
+// and egress ending this way (rather than by screen-edge exit) deactivates
+// the object exactly as path completion always has.
 // Entry: X = logical object index.
 moveEnemyPath:
     lda OBJECT_PATH_TIMER,x                 // Load frames remaining in the current path segment.
-    bne !move+                              // If non-zero, continue the current segment.
+    bne !ramp+                              // If non-zero, ease velocity then continue the current segment.
 
+    jsr setFragmentPointer                  // FRAG_PTR now points at OBJECT_STAGE's active fragment table.
     ldy OBJECT_PATH_STEP,x                  // Y = byte offset of the current path segment.
-    lda enemyPatterns,y                     // Read this segment's duration from the selected pattern.
+    lda (FRAG_PTR),y                        // Read this segment's duration from the selected fragment.
     bne !loadSegment+                       // Non-zero means this is a valid movement segment.
-    jmp !finished+                          // Duration zero explicitly ends and deactivates this object.
+    jmp !advanceStage+                      // Duration zero means this fragment/stage has finished.
 
 !loadSegment:
     sta OBJECT_PATH_TIMER,x                 // Save duration; $ff is the momentum-preserving coast marker.
-    cmp #$ff                                // Final coast segments do not replace the current velocity.
-    beq !move+
+    cmp #$ff                                // Final coast segments do not replace the current target velocity.
+    beq !ramp+
 
-    lda enemyPatterns+1,y                   // Read signed horizontal velocity for this manoeuvre segment.
-    sta OBJECT_VEL_X,x                      // Velocity is persistent object state rather than a direct table add.
-    lda enemyPatterns+2,y                   // Read signed vertical velocity for this manoeuvre segment.
-    sta OBJECT_VEL_Y,x                      // Subsequent acceleration may increase this base vector.
+    iny                                     // Advance to the segment's signed vx byte.
+    lda (FRAG_PTR),y                        // Read signed horizontal velocity for this manoeuvre segment.
+    sta OBJECT_TARGET_VEL_X,x               // Ease towards this rather than snapping to it directly.
+    iny                                     // Advance to the segment's signed vy byte.
+    lda (FRAG_PTR),y                        // Read signed vertical velocity for this manoeuvre segment.
+    sta OBJECT_TARGET_VEL_Y,x               // Subsequent acceleration may increase this target further.
+
+!ramp:
+    jsr easeVelocityTowardTarget            // Bend live velocity one unit/frame towards the target vector.
 
 !move:
     lda OBJECT_VEL_X,x                      // Read the enemy's current signed horizontal velocity.
@@ -2076,6 +2139,78 @@ moveEnemyPath:
     sta OBJECT_ACTIVE,x                     // Return this logical object to the free pool.
     rts
 
+!advanceStage:
+    lda OBJECT_STAGE,x                      // Which stage just ran out of segments?
+    cmp #STAGE_INGRESS
+    bne !checkManoeuvre+
+
+    lda #STAGE_MANOEUVRE                    // Ingress finished: hand off to the precomputed manoeuvre fragment.
+    sta OBJECT_STAGE,x
+    lda OBJECT_MANOEUVRE_STEP,x
+    sta OBJECT_PATH_STEP,x
+    jmp moveEnemyPath                       // Re-enter now: OBJECT_PATH_TIMER,x is still 0, so this loads the
+                                             // manoeuvre's first segment header immediately (not next frame) -
+                                             // ticking it via !tick's dec would wrap 0 to $ff and strand the
+                                             // object forever if we instead fell through past the segment load.
+
+!checkManoeuvre:
+    cmp #STAGE_MANOEUVRE
+    bne !finished-                          // Already egress: fragment completion means the attack is over.
+
+    lda #STAGE_EGRESS                       // Manoeuvre finished: hand off to the precomputed egress fragment.
+    sta OBJECT_STAGE,x
+    lda OBJECT_EGRESS_STEP,x
+    sta OBJECT_PATH_STEP,x
+    jmp moveEnemyPath                       // Re-enter to load the egress's first segment header immediately.
+
+// --- Routine: setFragmentPointer --------------------------------------------
+// Point FRAG_PTR at the base of whichever fragment table OBJECT_STAGE,x
+// currently selects, so moveEnemyPath can read segments via (FRAG_PTR),y
+// regardless of which of the three per-stage tables the object is in.
+// Entry/exit: X = logical object index, preserved.
+setFragmentPointer:
+    ldy OBJECT_STAGE,x                      // 0=ingress, 1=manoeuvre, 2=egress: index straight into
+    lda fragmentTableLo,y                   // these two separate parallel lo/hi arrays (no doubling -
+                                             // each table is one byte per stage, not an interleaved pair).
+    sta FRAG_PTR
+    lda fragmentTableHi,y
+    sta FRAG_PTR+1
+    rts
+
+fragmentTableLo:
+    .byte <ingressFragments, <manoeuvreFragments, <egressFragments
+fragmentTableHi:
+    .byte >ingressFragments, >manoeuvreFragments, >egressFragments
+
+// --- Routine: easeVelocityTowardTarget --------------------------------------
+// Nudge OBJECT_VEL_X/Y one unit per frame towards OBJECT_TARGET_VEL_X/Y rather
+// than snapping straight to it, so fragment transitions visibly bend instead
+// of popping to a new vector.  Cheap signed compare via subtraction; no
+// multiply/divide.  Entry/exit: X = logical object index, preserved.
+easeVelocityTowardTarget:
+    lda OBJECT_TARGET_VEL_X,x
+    sec
+    sbc OBJECT_VEL_X,x                      // A = target - current (signed; range is small, cannot overflow).
+    beq !xDone+
+    bmi !xDec+
+    inc OBJECT_VEL_X,x                      // Current is below target: nudge up by one.
+    jmp !xDone+
+!xDec:
+    dec OBJECT_VEL_X,x                      // Current is above target: nudge down by one.
+!xDone:
+
+    lda OBJECT_TARGET_VEL_Y,x
+    sec
+    sbc OBJECT_VEL_Y,x
+    beq !yDone+
+    bmi !yDec+
+    inc OBJECT_VEL_Y,x
+    jmp !yDone+
+!yDec:
+    dec OBJECT_VEL_Y,x
+!yDone:
+    rts
+
 // --- Routine: accelerateEnemyDive ------------------------------------------
 // Give descending enemies a small integer acceleration in roughly the direction
 // they are already travelling.  Every ENEMY_ACCEL_INTERVAL descending frames we
@@ -2111,36 +2246,36 @@ accelerateEnemyDive:
     lda PATH_ABS_X                          // Shallower dive: increase horizontal magnitude instead.
     cmp #ENEMY_MAX_PATH_SPEED
     bcs !done+                              // Component already sits at the safety cap.
-    lda OBJECT_VEL_X,x
-    bmi !accelerateXLeft+
-    inc OBJECT_VEL_X,x                      // Positive horizontal velocity becomes more positive.
+    lda OBJECT_TARGET_VEL_X,x               // Accumulate into the target; easeVelocityTowardTarget will
+    bmi !accelerateXLeft+                   // carry the live velocity to it over the next frame or two.
+    inc OBJECT_TARGET_VEL_X,x               // Positive horizontal velocity becomes more positive.
     rts
 !accelerateXLeft:
-    dec OBJECT_VEL_X,x                      // Negative horizontal velocity becomes more negative.
+    dec OBJECT_TARGET_VEL_X,x               // Negative horizontal velocity becomes more negative.
     rts
 
 !accelerateY:
-    lda OBJECT_VEL_Y,x
+    lda OBJECT_TARGET_VEL_Y,x
     cmp #ENEMY_MAX_PATH_SPEED
     bcs !done+
-    inc OBJECT_VEL_Y,x                      // Steep dive gains one pixel/frame vertically.
+    inc OBJECT_TARGET_VEL_Y,x               // Steep dive gains one pixel/frame vertically.
     rts
 
 !accelerateBoth:
-    lda OBJECT_VEL_Y,x                      // Grow vertical speed first when both components are equal.
+    lda OBJECT_TARGET_VEL_Y,x               // Grow vertical speed first when both components are equal.
     cmp #ENEMY_MAX_PATH_SPEED
     bcs !done+
-    inc OBJECT_VEL_Y,x
+    inc OBJECT_TARGET_VEL_Y,x
 
     lda PATH_ABS_X                          // A purely vertical vector has |vx|=0 and was handled by BCC above.
     cmp #ENEMY_MAX_PATH_SPEED
     bcs !done+
-    lda OBJECT_VEL_X,x
+    lda OBJECT_TARGET_VEL_X,x
     bmi !accelerateBothLeft+
-    inc OBJECT_VEL_X,x
+    inc OBJECT_TARGET_VEL_X,x
     rts
 !accelerateBothLeft:
-    dec OBJECT_VEL_X,x
+    dec OBJECT_TARGET_VEL_X,x
     rts
 
 !reset:
@@ -3302,8 +3437,12 @@ startRandomWave:
     lda attackAddY,y                        // Read signed vertical offset between members.
     sta WAVE_ADD_Y_VALUE                    // Side entries deliberately stagger Y to avoid raster-line walls.
 
-    lda attackPathId,y                      // Read the movement path assigned to this curated attack.
-    sta WAVE_PATTERN_ID                     // Each spawned object retains this path ID.
+    lda attackIngressId,y                   // Read the ingress fragment assigned to this curated attack.
+    sta WAVE_INGRESS_ID                      // Each spawned object begins on this fragment.
+    lda attackManoeuvreId,y                 // Read the manoeuvre fragment chained after ingress.
+    sta WAVE_MANOEUVRE_ID
+    lda attackEgressId,y                    // Read the egress fragment chained after manoeuvre.
+    sta WAVE_EGRESS_ID
 
     lda #0                                  // A new attack has not spawned any members yet.
     sta WAVE_SPAWNED                        // Reset successful member count.
@@ -3367,15 +3506,30 @@ spawnEnemy:
 
     inc WAVE_SPRITE_INDEX                   // Advance only after a successful allocation/spawn.
 
-    lda WAVE_PATTERN_ID                     // Read the movement pattern selected for this wave.
-    sta OBJECT_PATTERN,x                    // Retain the pattern number for gameplay/debugging.
-    tay                                     // Y = pattern number while X remains the allocated object slot.
-    lda patternStartOffset,y                // Convert pattern number to its master-table byte offset.
-    sta OBJECT_PATH_STEP,x                  // Begin this object at the selected pattern's first segment.
+    lda WAVE_ATTACK_ID                      // Read the curated attack selected for this wave.
+    sta OBJECT_PATTERN,x                    // Retain the attack number for gameplay/debugging.
+
+    lda #STAGE_INGRESS                      // Every enemy begins life on its ingress fragment.
+    sta OBJECT_STAGE,x
+
+    ldy WAVE_INGRESS_ID                     // Y = this attack's ingress fragment ID.
+    lda ingressStartOffset,y                // Convert fragment ID to its byte offset in ingressFragments.
+    sta OBJECT_PATH_STEP,x                  // Begin this object at the selected ingress fragment's first segment.
+
+    ldy WAVE_MANOEUVRE_ID                   // Precompute where to jump once ingress finishes.
+    lda manoeuvreStartOffset,y
+    sta OBJECT_MANOEUVRE_STEP,x
+
+    ldy WAVE_EGRESS_ID                      // Precompute where to jump once the manoeuvre finishes.
+    lda egressStartOffset,y
+    sta OBJECT_EGRESS_STEP,x
+
     lda #0                                  // Zero forces the first segment duration to load next update.
     sta OBJECT_PATH_TIMER,x                 // Reset movement path timer.
     sta OBJECT_VEL_X,x                      // Reused slots must not inherit velocity from a previous enemy.
     sta OBJECT_VEL_Y,x                      // Start stationary until the first path segment loads its vector.
+    sta OBJECT_TARGET_VEL_X,x               // Target starts at zero too so the first segment's ease has a clean base.
+    sta OBJECT_TARGET_VEL_Y,x
     sta OBJECT_ACCEL_TIMER,x                // Fresh enemy begins a new acceleration cadence.
 
     lda #1                                  // Mark object active only after every field is initialised.
@@ -3519,11 +3673,16 @@ SORTED_OBJECTS:        .fill MAX_OBJECTS, $ff
 SORTED_COUNT:          .byte 0
 
 OBJECT_PATTERN:        .fill MAX_OBJECTS, 0
-OBJECT_PATH_STEP:      .fill MAX_OBJECTS, 0
+OBJECT_PATH_STEP:      .fill MAX_OBJECTS, 0     // Byte offset into the CURRENT stage's fragment table.
 OBJECT_PATH_TIMER:     .fill MAX_OBJECTS, 0
-OBJECT_VEL_X:          .fill MAX_OBJECTS, 0     // Signed current horizontal path velocity.
-OBJECT_VEL_Y:          .fill MAX_OBJECTS, 0     // Signed current vertical path velocity.
+OBJECT_VEL_X:          .fill MAX_OBJECTS, 0     // Signed current (ramped) horizontal path velocity.
+OBJECT_VEL_Y:          .fill MAX_OBJECTS, 0     // Signed current (ramped) vertical path velocity.
 OBJECT_ACCEL_TIMER:    .fill MAX_OBJECTS, 0     // Frames accumulated while descending before the next speed increase.
+OBJECT_STAGE:          .fill MAX_OBJECTS, 0     // STAGE_INGRESS/MANOEUVRE/EGRESS: which fragment table OBJECT_PATH_STEP indexes.
+OBJECT_MANOEUVRE_STEP: .fill MAX_OBJECTS, 0     // Precomputed manoeuvreFragments start offset, applied when ingress finishes.
+OBJECT_EGRESS_STEP:    .fill MAX_OBJECTS, 0     // Precomputed egressFragments start offset, applied when manoeuvre finishes.
+OBJECT_TARGET_VEL_X:   .fill MAX_OBJECTS, 0     // Signed horizontal velocity a segment/acceleration is easing towards.
+OBJECT_TARGET_VEL_Y:   .fill MAX_OBJECTS, 0     // Signed vertical velocity a segment/acceleration is easing towards.
 
 ENEMY_FIRE_TIMER:      .byte 0                  // Global cadence until another enemy may attempt to fire.
 ENEMY_BULLET_COUNT:    .byte 0                  // Hard cap is MAX_ENEMY_BULLETS.
@@ -3543,7 +3702,9 @@ WAVE_SPAWN_Y:          .byte 0
 WAVE_ADD_X_VALUE:      .byte 0
 WAVE_ADD_Y_VALUE:      .byte 0
 WAVE_ATTACK_ID:        .byte 0              // Curated attack currently being emitted.
-WAVE_PATTERN_ID:       .byte 0              // Path ID copied into each spawned enemy.
+WAVE_INGRESS_ID:       .byte 0              // Ingress fragment ID copied into each spawned enemy.
+WAVE_MANOEUVRE_ID:     .byte 0              // Manoeuvre fragment ID copied into each spawned enemy.
+WAVE_EGRESS_ID:        .byte 0              // Egress fragment ID copied into each spawned enemy.
 WAVE_SPRITE_INDEX:     .byte 0              // Current entry in the attack's visual sequence.
 PATH_ABS_X:           .byte 0              // Main-thread scratch used by directional enemy acceleration.
 
@@ -3939,50 +4100,97 @@ enemyBulletSprite:
 //     horizontal raster band while entering.
 //   * Side-entry attacks currently use addX = 0, but the runtime supports a
 //     signed 9-bit X offset if we want it later.
-//   * Path geometry remains duration/dx/dy data below, so turn rates and speed
-//     can be tuned independently without rewriting movement code.
+//   * Movement geometry is no longer one full path per attack: each attack
+//     instead names an ingress fragment, a manoeuvre fragment and an egress
+//     fragment (see "Segmented movement fragments" below), chained at
+//     runtime by moveEnemyPath.  Attacks 0-8 are the original families
+//     re-expressed on the new fragments; 9-11 are new combinations built
+//     from the very same fragment data, demonstrating the reuse the
+//     segmented architecture exists for.
 //
 // IDs:
-// 0 top -> dive -> turn -> exit left
-// 1 top -> dive -> turn -> exit right
-// 2 top -> dive -> loop -> exit left
-// 3 top -> dive -> loop -> exit right
-// 4 top -> dive -> loop -> exit top
-// 5 upper-left  -> cross screen -> smooth U-turn -> exit upper-left
-// 6 upper-right -> cross screen -> smooth U-turn -> exit upper-right
-// 7 upper-left  -> cross screen -> smooth U-turn -> exit lower-left
-// 8 upper-right -> cross screen -> smooth U-turn -> exit lower-right
+// 0  top -> dive -> turn -> exit upper-left
+// 1  top -> dive -> turn -> exit upper-right
+// 2  top -> dive -> loop -> exit left
+// 3  top -> dive -> loop -> exit right
+// 4  top -> dive -> loop -> exit top
+// 5  upper-left  -> cross screen -> smooth U-turn -> exit upper-left
+// 6  upper-right -> cross screen -> smooth U-turn -> exit upper-right
+// 7  upper-left  -> cross screen -> smooth U-turn -> exit lower-left
+// 8  upper-right -> cross screen -> smooth U-turn -> exit lower-right
+// 9  top -> long dive (loop ingress) -> turn -> exit upper-right
+// 10 upper-left  -> shallow cross (down-turn ingress) -> sharp up-turn -> exit
+// 11 upper-right -> shallow cross (down-turn ingress) -> sharp up-turn -> exit
 
 // attackEnemyCount and attackSpriteStart are declared as assembler lists so the
 // compile-time guard further down can bounds-check every entry against the
 // 8-entries-per-visual-set enemySpriteSequence layout.  The emitted bytes are
 // identical to a plain .byte row.
-.var attackEnemyCountData  = List().add(6, 6, 5, 5, 6, 6, 6, 5, 5)
-.var attackSpriteStartData = List().add(0, 8, 16, 24, 0, 8, 16, 24, 0)
+.var attackEnemyCountData  = List().add(6, 6, 5, 5, 6, 6, 6, 5, 5, 6, 5, 5)
+.var attackSpriteStartData = List().add(0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24)
 
 attackEnemyCount:
     .fill attackEnemyCountData.size(), attackEnemyCountData.get(i)
 
 attackInterval:
-    .byte 18,18,16,16,18,15,15,17,17
+    .byte 18,18,16,16,18,15,15,17,17,18,16,16
 
 attackStartXLo:
-    .byte 150,150,164,136,150,12,$4a,12,$4a // $014a = 330 for right-side entry.
+    .byte 150,150,164,136,150,12,$4a,12,$4a,150,12,$4a // $014a = 330 for right-side entry.
 
 attackStartXMsb:
-    .byte 0,0,0,0,0,0,1,0,1
+    .byte 0,0,0,0,0,0,1,0,1,0,0,1
 
 attackStartY:
-    .byte 38,38,38,38,38,58,58,58,58
+    .byte 38,38,38,38,38,58,58,58,58,38,58,58
 
 attackAddX:
-    .byte 0,0,$04,$fc,0,0,0,0,0            // Top loop pair fans by +/-4; $fc = -4.
+    .byte 0,0,$04,$fc,0,0,0,0,0,0,0,0       // Top loop pair fans by +/-4; $fc = -4.
 
 attackAddY:
-    .byte 0,0,0,0,0,7,7,9,9                // NEVER stagger top entry in Y.
+    .byte 0,0,0,0,0,7,7,9,9,0,7,7           // NEVER stagger top entry in Y.
 
-attackPathId:
-    .byte 0,1,2,3,4,5,6,7,8
+// Each attack names its ingress/manoeuvre/egress fragment IDs (see the
+// *_ID consts alongside their fragment tables below) rather than a single
+// monolithic path ID.  Declared as assembler lists (like attackEnemyCountData
+// above) so the fragment-join compatibility guard further down can walk the
+// exact same data used to emit these bytes, instead of a second hand-copied
+// list that could silently drift out of sync.
+.var attackIngressIdData = List().add(
+    INGRESS_TOP_STRAIGHT_SHORT, INGRESS_TOP_STRAIGHT_SHORT,
+    INGRESS_TOP_STRAIGHT_LONG,  INGRESS_TOP_STRAIGHT_LONG,  INGRESS_TOP_STRAIGHT_LONG,
+    INGRESS_LEFT_DIAG_CROSS_UP, INGRESS_RIGHT_DIAG_CROSS_UP,
+    INGRESS_LEFT_DIAG_CROSS_DOWN, INGRESS_RIGHT_DIAG_CROSS_DOWN,
+    INGRESS_TOP_STRAIGHT_LONG,                                     // 9: reused long ingress ...
+    INGRESS_LEFT_DIAG_CROSS_DOWN, INGRESS_RIGHT_DIAG_CROSS_DOWN)    // 10/11: reused shallow-cross ingress ...
+
+.var attackManoeuvreIdData = List().add(
+    MANOEUVRE_TURN_LEFT, MANOEUVRE_TURN_RIGHT,
+    MANOEUVRE_LOOP_LEFT, MANOEUVRE_LOOP_RIGHT, MANOEUVRE_LOOP_TOP,
+    MANOEUVRE_UTURN_UP_LEFT, MANOEUVRE_UTURN_UP_RIGHT,
+    MANOEUVRE_UTURN_DOWN_LEFT, MANOEUVRE_UTURN_DOWN_RIGHT,
+    MANOEUVRE_TURN_RIGHT,                                     // 9: ... feeding the tight turn-right manoeuvre.
+    MANOEUVRE_UTURN_UP_LEFT, MANOEUVRE_UTURN_UP_RIGHT)        // 10/11: ... feeding the sharper up-turn manoeuvre.
+
+.var attackEgressIdData = List().add(
+    EGRESS_UPPER_LEFT, EGRESS_UPPER_RIGHT,
+    EGRESS_COAST, EGRESS_COAST, EGRESS_COAST,
+    EGRESS_UPPER_LEFT, EGRESS_UPPER_RIGHT,                    // 5/6: U-turn-up manoeuvres end on only a shallow
+                                                               // (-1,-1)/(1,-1) tangent - the shaped egress reasserts
+                                                               // the stronger (-2,-1)/(2,-1) diagonal used by the top
+                                                               // turns, so both "exit upper-left/right" families leave
+                                                               // the screen at the same speed instead of this one
+                                                               // visibly crawling off at ~70% of the other's rate.
+    EGRESS_COAST, EGRESS_COAST,
+    EGRESS_UPPER_RIGHT,                                       // 9
+    EGRESS_COAST, EGRESS_COAST)                               // 10/11
+
+attackIngressId:
+    .fill attackIngressIdData.size(), attackIngressIdData.get(i)
+attackManoeuvreId:
+    .fill attackManoeuvreIdData.size(), attackManoeuvreIdData.get(i)
+attackEgressId:
+    .fill attackEgressIdData.size(), attackEgressIdData.get(i)
 
 // Four reusable visual palettes.  Attack geometry and visuals remain separate
 // so stage data can later swap either independently.
@@ -4014,19 +4222,19 @@ enemyColourSequence:
     .byte 7,14, 7,10,14, 7,10, 2
 enemyColourSequenceEnd:
 
-// Cheap mapping from a four-bit CIA timer sample to nine attack IDs.
+// Cheap mapping from a four-bit CIA timer sample to twelve attack IDs.
 // Uneven distribution is intentional/irrelevant for the temporary chaos
 // director; real stages will choose attacks explicitly.
 randomAttackMap:
-    .byte 0,1,2,3,4,5,6,7,8,0,2,4,6,8,1,5
+    .byte 0,1,2,3,4,5,6,7,8,9,10,11,0,4,9,7
 
 // --- Compile-time bounds guard: curated attack visual sequences -----------
 // spawnEnemy reads attackEnemyCount[id] consecutive entries from
 // enemySpriteSequence / enemyColourSequence, starting at attackSpriteStart[id]
 // and advancing WAVE_SPRITE_INDEX once per spawn.  A visual set is 8 entries;
-// the whole sequence is 4 sets = 32 entries.  These checks mirror the existing
-// enemyPatterns size guard so tuning data can never silently walk off the end
-// of these parallel tables at runtime.
+// the whole sequence is 4 sets = 32 entries.  These checks mirror the
+// fragment-table size guards below so tuning data can never silently walk
+// off the end of these parallel tables at runtime.
 .const ENEMY_SPRITE_SEQUENCE_LEN = 32
 
 .if ((enemySpriteSequenceEnd - enemySpriteSequence) != ENEMY_SPRITE_SEQUENCE_LEN) {
@@ -4048,51 +4256,161 @@ randomAttackMap:
     }
 }
 
-// --- Movement pattern offsets ----------------------------------------------
-// Each object stores a byte offset into enemyPatterns as OBJECT_PATH_STEP.
-// Nine complete paths fit comfortably inside one 256-byte indexed table.
-patternStartOffset:
-    .byte patternTopTurnLeft-enemyPatterns
-    .byte patternTopTurnRight-enemyPatterns
-    .byte patternTopLoopLeft-enemyPatterns
-    .byte patternTopLoopRight-enemyPatterns
-    .byte patternTopLoopTop-enemyPatterns
-    .byte patternLeftUTurnUp-enemyPatterns
-    .byte patternRightUTurnUp-enemyPatterns
-    .byte patternLeftUTurnDown-enemyPatterns
-    .byte patternRightUTurnDown-enemyPatterns
-
-// --- Enemy movement patterns ------------------------------------------------
-// Segment format: duration, signed base vx, signed base vy.
-// Finite segments load a new velocity; descending motion can accelerate it.
-// $ff duration is a momentum coast: its following two bytes are placeholders and
-// the enemy retains the velocity reached during the preceding manoeuvre.
-// Every number here is intentionally exposed for easy tuning.
+// ============================================================================
+// Segmented movement fragments: ingress / manoeuvre / egress
+// ============================================================================
+// Every enemy attack chains three independently-reusable fragments instead of
+// one monolithic canned path:
+//   ingress   - how the formation enters the playfield.
+//   manoeuvre - the interesting on-screen motion.
+//   egress    - how the enemy leaves.
+// Each stage lives in its own byte-indexed table (ingressFragments,
+// manoeuvreFragments, egressFragments), so each table gets its own 256-byte
+// budget instead of all paths sharing one - the old ~252/256-byte ceiling on
+// total attack variety no longer applies.
 //
-// These are first-pass geometries rather than sacred values: the purpose of
-// this build is to watch each family, then adjust durations/deltas by feel.
-enemyPatterns:
+// Segment format is unchanged: duration, signed vx, signed vy (3 bytes).
+// Ingress/manoeuvre fragments end with a 0,0,0 terminator: duration zero now
+// means "this fragment is finished", and moveEnemyPath hands the object off
+// to its next stage (ingress->manoeuvre->egress) rather than despawning it.
+// Egress fragments are still terminal and end in the original $ff coast
+// marker (placeholder vx/vy, momentum preserved), exactly as before; reaching
+// duration zero there (which should not normally happen) still despawns.
+//
+// Compatibility metadata: every fragment that can end a stage declares an
+// "exit class" (which way it's travelling when it finishes) and every
+// fragment that can start manoeuvre/egress declares an "entry mask" (which
+// exit classes it accepts).  DIR_UP/DOWN/LEFT/RIGHT bitmasks (see near
+// ATTACK_COUNT) are combined for diagonals.  A compile-time guard below
+// verifies every curated attack's chain actually joins cleanly - this is
+// the "cheap representation suitable for a 6502" the join-compatibility
+// concept needed, with zero runtime cost, and it's the same metadata a
+// future runtime director could reuse for player-aware/weighted selection.
 
-patternTopTurnLeft:
+// --- Ingress fragments -------------------------------------------------------
+// (INGRESS_* IDs are declared in the top constants block.)
+ingressStartOffset:
+    .byte ingressTopStraightShort-ingressFragments
+    .byte ingressTopStraightLong-ingressFragments
+    .byte ingressLeftDiagonalCrossUp-ingressFragments
+    .byte ingressRightDiagonalCrossUp-ingressFragments
+    .byte ingressLeftDiagonalCrossDown-ingressFragments
+    .byte ingressRightDiagonalCrossDown-ingressFragments
+
+// Direction the enemy is travelling when each ingress fragment hands off.
+// Declared as an assembler list, like the attack tables above, so the
+// fragment-join compatibility guard further down can walk this exact data
+// instead of a second hand-copied copy that could drift out of sync.
+.var ingressExitClassData = List().add(
+    DIR_DOWN,                    // ingressTopStraightShort
+    DIR_DOWN,                    // ingressTopStraightLong
+    DIR_DOWN | DIR_RIGHT,        // ingressLeftDiagonalCrossUp
+    DIR_DOWN | DIR_LEFT,         // ingressRightDiagonalCrossUp
+    DIR_RIGHT,                   // ingressLeftDiagonalCrossDown
+    DIR_LEFT)                    // ingressRightDiagonalCrossDown
+
+ingressExitClass:
+    .fill ingressExitClassData.size(), ingressExitClassData.get(i)
+
+ingressFragments:
+
+ingressTopStraightShort:
     .byte 48,  0,  2                       // Straight dive from common top entry Y.
+    .byte  0,  0,  0                       // End of fragment: hand off to the manoeuvre stage.
+
+ingressTopStraightLong:
+    .byte 30,  0,  2                       // Enter higher so a larger manoeuvre (loop) stays clear of respawn Y.
+    .byte  0,  0,  0
+
+ingressLeftDiagonalCrossUp:
+    .byte 30,  2,  1                       // Enter from upper-left and cross toward the right half.
+    .byte 24,  2,  2                       // Dive through centre, giving the player a useful firing window.
+    .byte 18,  2,  1                       // Flatten as the formation approaches its turn point.
+    .byte  0,  0,  0
+
+ingressRightDiagonalCrossUp:
+    .byte 30,$fe,  1                       // Enter from upper-right and cross toward the left half.
+    .byte 24,$fe,  2                       // Dive through centre, mirroring the left-entry attack.
+    .byte 18,$fe,  1                       // Flatten as the formation approaches its turn point.
+    .byte  0,  0,  0
+
+ingressLeftDiagonalCrossDown:
+    .byte 28,  2,  1                       // Enter from upper-left and cross toward the right half.
+    .byte 22,  2,  1                       // Keep this variant shallower before the turn.
+    .byte 16,  2,  0                       // Level out near the far side.
+    .byte  0,  0,  0
+
+ingressRightDiagonalCrossDown:
+    .byte 28,$fe,  1                       // Enter from upper-right and cross toward the left half.
+    .byte 22,$fe,  1                       // Keep this mirrored variant shallower before the turn.
+    .byte 16,$fe,  0                       // Level out near the far side.
+    .byte  0,  0,  0
+
+ingressFragmentsEnd:
+.if ((ingressFragmentsEnd - ingressFragments) > 256) {
+    .error "ingressFragments exceeds one-byte OBJECT_PATH_STEP range"
+}
+
+// --- Manoeuvre fragments -----------------------------------------------------
+// (MANOEUVRE_* IDs are declared in the top constants block.)
+manoeuvreStartOffset:
+    .byte manoeuvreTurnLeft-manoeuvreFragments
+    .byte manoeuvreTurnRight-manoeuvreFragments
+    .byte manoeuvreLoopLeft-manoeuvreFragments
+    .byte manoeuvreLoopRight-manoeuvreFragments
+    .byte manoeuvreLoopTop-manoeuvreFragments
+    .byte manoeuvreUTurnUpLeft-manoeuvreFragments
+    .byte manoeuvreUTurnUpRight-manoeuvreFragments
+    .byte manoeuvreUTurnDownLeft-manoeuvreFragments
+    .byte manoeuvreUTurnDownRight-manoeuvreFragments
+
+// Which ingress exit classes each manoeuvre can cleanly continue from, and
+// which direction it's travelling when it hands off to egress.  Declared as
+// assembler lists for the same reason as ingressExitClassData above.
+.var manoeuvreEntryMaskData = List().add(
+    DIR_DOWN,                    // manoeuvreTurnLeft
+    DIR_DOWN,                    // manoeuvreTurnRight
+    DIR_DOWN,                    // manoeuvreLoopLeft
+    DIR_DOWN,                    // manoeuvreLoopRight
+    DIR_DOWN,                    // manoeuvreLoopTop
+    DIR_DOWN | DIR_RIGHT,        // manoeuvreUTurnUpLeft
+    DIR_DOWN | DIR_LEFT,         // manoeuvreUTurnUpRight
+    DIR_RIGHT,                   // manoeuvreUTurnDownLeft
+    DIR_LEFT)                    // manoeuvreUTurnDownRight
+
+.var manoeuvreExitClassData = List().add(
+    DIR_UP | DIR_LEFT,           // manoeuvreTurnLeft
+    DIR_UP | DIR_RIGHT,          // manoeuvreTurnRight
+    DIR_UP | DIR_LEFT,           // manoeuvreLoopLeft
+    DIR_UP | DIR_RIGHT,          // manoeuvreLoopRight
+    DIR_UP,                      // manoeuvreLoopTop
+    DIR_UP | DIR_LEFT,           // manoeuvreUTurnUpLeft
+    DIR_UP | DIR_RIGHT,          // manoeuvreUTurnUpRight
+    DIR_DOWN | DIR_LEFT,         // manoeuvreUTurnDownLeft
+    DIR_DOWN | DIR_RIGHT)        // manoeuvreUTurnDownRight
+
+manoeuvreEntryMask:
+    .fill manoeuvreEntryMaskData.size(), manoeuvreEntryMaskData.get(i)
+manoeuvreExitClass:
+    .fill manoeuvreExitClassData.size(), manoeuvreExitClassData.get(i)
+
+manoeuvreFragments:
+
+manoeuvreTurnLeft:
     .byte  7,$ff,  2                       // Begin curving down-left.
     .byte  7,$fe,  1                       // Increase horizontal component.
     .byte  7,$fe,  0                       // Level out.
     .byte  5,$fe,$ff                       // Hook upward through the turn.
-    .byte  6,$fe,$ff                       // Leave on a shallow up-left tangent rather than a flat row.
-    .byte $ff, 0,  0                       // Coast on that inherited up-left exit vector.
+    .byte  0,  0,  0
 
-patternTopTurnRight:
-    .byte 48,  0,  2                       // Straight dive from common top entry Y.
+manoeuvreTurnRight:
     .byte  7,  1,  2                       // Begin curving down-right.
     .byte  7,  2,  1                       // Increase horizontal component.
     .byte  7,  2,  0                       // Level out.
     .byte  5,  2,$ff                       // Hook upward through the turn.
-    .byte  6,  2,$ff                       // Leave on a shallow up-right tangent rather than a flat row.
-    .byte $ff, 0,  0                       // Coast on that inherited up-right exit vector.
+    .byte  0,  0,  0
 
-patternTopLoopLeft:
-    .byte 30,  0,  2                       // Enter the loop higher so its larger lower arc stays clear of respawn Y.
+manoeuvreLoopLeft:
     .byte  9,  2,  1                       // First loop: arc down-right.
     .byte  9,  2,  0                       // First loop: right.
     .byte  9,  1,$fe                       // First loop: arc up-right.
@@ -4105,10 +4423,9 @@ patternTopLoopLeft:
     .byte  9,  2,  0                       // Carry around the right-hand side.
     .byte  9,  1,$fe                       // Climb through the upper-right quadrant.
     .byte  9,$ff,$fe                       // Finish roughly 1.5 loops later on a natural up-left tangent.
-    .byte $ff, 0,  0                       // Coast up-left using the velocity already established by the loop.
+    .byte  0,  0,  0
 
-patternTopLoopRight:
-    .byte 30,  0,  2                       // Enter the mirrored loop higher so the larger lower arc stays clear.
+manoeuvreLoopRight:
     .byte  9,$fe,  1                       // First loop: arc down-left.
     .byte  9,$fe,  0                       // First loop: left.
     .byte  9,$ff,$fe                       // First loop: arc up-left.
@@ -4121,10 +4438,9 @@ patternTopLoopRight:
     .byte  9,$fe,  0                       // Carry around the left-hand side.
     .byte  9,$ff,$fe                       // Climb through the upper-left quadrant.
     .byte  9,  1,$fe                       // Finish roughly 1.5 loops later on a natural up-right tangent.
-    .byte $ff, 0,  0                       // Coast up-right using the velocity already established by the loop.
+    .byte  0,  0,  0
 
-patternTopLoopTop:
-    .byte 30,  0,  2                       // Enter the loop higher so the extended arc stays clear of respawn Y.
+manoeuvreLoopTop:
     .byte  9,  2,  1                       // First loop: arc down-right.
     .byte  9,  2,  0                       // First loop: right.
     .byte  9,  1,$fe                       // First loop: arc up-right.
@@ -4137,48 +4453,96 @@ patternTopLoopTop:
     .byte  9,  2,  0                       // Carry around the right-hand side.
     .byte  9,  1,$fe                       // Climb through the upper-right quadrant.
     .byte  9,  0,$fe                       // Ease onto a vertical upward tangent rather than snapping to it.
-    .byte $ff, 0,  0                       // Coast straight up on the velocity established by the final arc.
+    .byte  0,  0,  0
 
-patternLeftUTurnUp:
-    .byte 30,  2,  1                       // Enter from upper-left and cross toward the right half.
-    .byte 24,  2,  2                       // Dive through centre, giving the player a useful firing window.
-    .byte 18,  2,  1                       // Flatten as the formation approaches its turn point.
+manoeuvreUTurnUpLeft:
     .byte  8,  2,  0                       // Begin the near-180 turn while still travelling right.
     .byte  8,  1,$ff                       // Arc upward and bleed off horizontal speed.
-    .byte 10,$ff,$ff                       // Complete the reversal onto a shallow up-left tangent.
-    .byte $ff, 0,  0                       // Coast back off the left side with inherited momentum.
+    .byte 10,$fe,$ff                       // Complete the reversal onto the same-speed up-left tangent the top-turn
+                                            // family exits on ($fe,$ff = -2,-1); held for a full 10 frames, not just
+                                            // the ~1 frame the egress ease would otherwise need to catch up from -1.
+    .byte  0,  0,  0
 
-patternRightUTurnUp:
-    .byte 30,$fe,  1                       // Enter from upper-right and cross toward the left half.
-    .byte 24,$fe,  2                       // Dive through centre, mirroring the left-entry attack.
-    .byte 18,$fe,  1                       // Flatten as the formation approaches its turn point.
+manoeuvreUTurnUpRight:
     .byte  8,$fe,  0                       // Begin the near-180 turn while still travelling left.
     .byte  8,$ff,$ff                       // Arc upward and bleed off horizontal speed.
-    .byte 10,  1,$ff                       // Complete the reversal onto a shallow up-right tangent.
-    .byte $ff, 0,  0                       // Coast back off the right side with inherited momentum.
+    .byte 10,  2,$ff                       // Mirror: same-speed up-right tangent (2,-1), held for the full 10 frames.
+    .byte  0,  0,  0
 
-patternLeftUTurnDown:
-    .byte 28,  2,  1                       // Enter from upper-left and cross toward the right half.
-    .byte 22,  2,  1                       // Keep this variant shallower before the turn.
-    .byte 16,  2,  0                       // Level out near the far side.
+manoeuvreUTurnDownLeft:
     .byte  8,  2,  0                       // Hold the outward tangent briefly before curving back.
     .byte  8,  1,  1                       // Arc downward while shedding horizontal speed.
     .byte 10,$ff,  1                       // Reverse onto a shallow down-left tangent.
-    .byte $ff, 0,  0                       // Coast left and down; shallow angle should clear the side first.
+    .byte  0,  0,  0
 
-patternRightUTurnDown:
-    .byte 28,$fe,  1                       // Enter from upper-right and cross toward the left half.
-    .byte 22,$fe,  1                       // Keep this mirrored variant shallower before the turn.
-    .byte 16,$fe,  0                       // Level out near the far side.
+manoeuvreUTurnDownRight:
     .byte  8,$fe,  0                       // Hold the outward tangent briefly before curving back.
     .byte  8,$ff,  1                       // Arc downward while shedding horizontal speed.
     .byte 10,  1,  1                       // Reverse onto a shallow down-right tangent.
-    .byte $ff, 0,  0                       // Coast right and down; shallow angle should clear the side first.
+    .byte  0,  0,  0
 
+manoeuvreFragmentsEnd:
+.if ((manoeuvreFragmentsEnd - manoeuvreFragments) > 256) {
+    .error "manoeuvreFragments exceeds one-byte OBJECT_PATH_STEP range"
+}
 
-ENEMY_PATTERNS_END:
-.if ((ENEMY_PATTERNS_END - enemyPatterns) > 256) {
-    .error "Enemy movement pattern table exceeds one-byte OBJECT_PATH_STEP range"
+// --- Egress fragments --------------------------------------------------------
+// (EGRESS_* IDs are declared in the top constants block.)
+egressStartOffset:
+    .byte egressCoast-egressFragments
+    .byte egressUpperLeft-egressFragments
+    .byte egressUpperRight-egressFragments
+
+// Which manoeuvre exit classes each egress can cleanly continue from.
+// Declared as an assembler list for the same reason as ingressExitClassData.
+.var egressEntryMaskData = List().add(
+    DIR_ANY,                     // egressCoast: momentum-only, joins from anywhere.
+    DIR_UP | DIR_LEFT,           // egressUpperLeft
+    DIR_UP | DIR_RIGHT)          // egressUpperRight
+
+egressEntryMask:
+    .fill egressEntryMaskData.size(), egressEntryMaskData.get(i)
+
+egressFragments:
+
+egressCoast:
+    .byte $ff, 0,  0                       // Coast on the velocity already established by the manoeuvre.
+
+egressUpperLeft:
+    .byte  6,$fe,$ff                       // Leave on a shallow up-left tangent rather than a flat row.
+    .byte $ff, 0,  0                       // Coast on that inherited up-left exit vector.
+
+egressUpperRight:
+    .byte  6,  2,$ff                       // Leave on a shallow up-right tangent rather than a flat row.
+    .byte $ff, 0,  0                       // Coast on that inherited up-right exit vector.
+
+egressFragmentsEnd:
+.if ((egressFragmentsEnd - egressFragments) > 256) {
+    .error "egressFragments exceeds one-byte OBJECT_PATH_STEP range"
+}
+
+// --- Compile-time bounds guard: fragment-join compatibility ----------------
+// Verifies every curated attack's ingress->manoeuvre->egress chain actually
+// joins cleanly (exit class shares a bit with the next fragment's entry
+// mask), so a bad hand-authored combination fails the build instead of
+// merely looking wrong at runtime.  Reuses the exact *Data lists that emitted
+// the runtime tables above, rather than a second hand-copied list.
+.for (var a = 0; a < ATTACK_COUNT; a++) {
+    .var ingressId = attackIngressIdData.get(a)
+    .var manoeuvreId = attackManoeuvreIdData.get(a)
+    .var egressId = attackEgressIdData.get(a)
+
+    .var ingressExit = ingressExitClassData.get(ingressId)
+    .var manoeuvreEntry = manoeuvreEntryMaskData.get(manoeuvreId)
+    .var manoeuvreExit = manoeuvreExitClassData.get(manoeuvreId)
+    .var egressEntry = egressEntryMaskData.get(egressId)
+
+    .if ((ingressExit & manoeuvreEntry) == 0) {
+        .error "attack " + toIntString(a) + ": ingress " + toIntString(ingressId) + " does not join manoeuvre " + toIntString(manoeuvreId)
+    }
+    .if ((manoeuvreExit & egressEntry) == 0) {
+        .error "attack " + toIntString(a) + ": manoeuvre " + toIntString(manoeuvreId) + " does not join egress " + toIntString(egressId)
+    }
 }
 
 // --- Private per-object health-bar sprite RAM -------------------------------

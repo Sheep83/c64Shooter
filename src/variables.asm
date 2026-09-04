@@ -39,4 +39,7 @@
 // C64 (no KERNAL/BASIC use) while this program owns the machine.
 .var TEXT_SRC                 = $fb
 .var TEXT_DST                 = $fd
+// $f9/$fa are likewise free while this program owns the machine; used as the
+// indirect pointer to whichever movement-fragment table is currently active.
+.var FRAG_PTR                 = $f9
 .const BACKGROUND_COLOUR      = $D021
