@@ -1,11 +1,16 @@
 # Background / stage engine — design notes
 
-Status: scrolling logic confirmed correct and continuous. The coarse-step
-implementation is currently a deliberately unoptimised "brute-force" fix
-(see below) with a known, not-yet-addressed performance cost - that is
-the next problem, tracked separately from the correctness bug this
-section used to describe. Placeholder art and a placeholder test map
-throughout; the *mechanism* is intended to be final.
+Status: scrolling is logically correct (confirmed both by memory-level
+diagnostic and by human playtesting - it genuinely scrolls now, no more
+snap-back). **Confirmed by human playtesting: heavy glitching every few
+frames.** This is "problem B" below - the unoptimised brute-force
+coarse-step cost - manifesting exactly as predicted once played for real
+rather than sampled via cycle-limited screenshots. This is the open
+problem on this branch: making the coarse transition raster-safe/cheap
+enough not to glitch, without redesigning the HUD split, sprite
+multiplexer, or LIVE/BUILD render-plan architecture. Placeholder art and
+a placeholder test map throughout; the *mechanism* is intended to be
+final once this is resolved.
 
 ## RESOLVED — the "snap back" scrolling bug was a live/shadow sync bug, not a raster-timing bug
 
@@ -49,13 +54,41 @@ separated from the correctness fix above):** blitting all 24 rows costs
 roughly 23,000 extra cycles on top of the existing ~24,000-cycle shadow
 shift, i.e. a coarse-step frame now costs on the order of 50-55k cycles -
 about 2.5-3x a normal 19,656-cycle PAL frame. No visual tearing was
-observed in testing (the existing LIVE/BUILD double-buffered render-plan
-swap means this heavy work happens during background-plan construction,
-before the next presented frame, so the effect is a pacing stutter rather
-than a mid-scan corruption), and the FREE-cycle debug HUD stayed positive
-throughout, but this has not been measured under sustained real-time play
-and is exactly the kind of cost the original raster-timing/optimisation
-work should target next, informed by profiling with the FREE-cycle HUD.
+observed in cycle-limited screenshot testing (the existing LIVE/BUILD
+double-buffered render-plan swap means this heavy work happens during
+background-plan construction, before the next presented frame, so the
+effect was expected to be a pacing stutter rather than a mid-scan
+corruption), and the FREE-cycle debug HUD stayed positive throughout -
+but that testing never watched sustained real-time play, only sampled
+single frames far apart. Human playtesting has since confirmed **heavy
+glitching every few frames**, i.e. this cost is real and visible in
+practice, not just a theoretical rolling-minimum concern.
+
+## OPEN — coarse-step cost needs to come down (or be scheduled safely)
+
+Next steps for whoever picks this up, roughly in order of how cheap they
+are to try:
+
+- Profile properly first: use the existing FREE-cycle HUD specifically on
+  coarse-step frames (it currently reports a 50-frame rolling minimum,
+  which blends heavy and light frames together - instrument it, or add a
+  one-off counter, to isolate the coarse-step frame's own cost rather than
+  inferring it from the blended minimum).
+- The 23k-cycle live-sync blit (`blitShadowRowToLive` x24 in
+  `advanceCoarseRow`) is the part added by the brute-force fix and the
+  most obviously wasteful: every coarse step re-copies 23 rows whose
+  content didn't actually change relative to the *previous* frame's live
+  screen, just moved down one row. A shift-in-place of the 23 unchanged
+  live rows (mirroring what `shiftShadowRowsDown` already does for the
+  shadow buffers, applied to `$0400`/`$D800` too) only needs a single
+  extra full-row blit (the new row 1) rather than 24 - roughly the same
+  saving `shiftShadowRowsDown` already gets over a naive full re-render.
+- Only after that: consider whether the remaining cost needs to be spread
+  across several frames (double-buffering the live screen via a second
+  `$D018`-selected screen, as discussed and deliberately deferred earlier
+  in this document) or scheduled around a raster-safe window. Do not reach
+  for either without first re-measuring the cost of the simpler shift-in-
+  place version above - it may already be enough on its own.
 
 ## Why fine-Y hardware scroll + a live coarse row-shift
 
