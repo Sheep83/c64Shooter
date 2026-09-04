@@ -42,4 +42,11 @@
 // $f9/$fa are likewise free while this program owns the machine; used as the
 // indirect pointer to whichever movement-fragment table is currently active.
 .var FRAG_PTR                 = $f9
+// $37/$38, $39/$3a are BASIC's "top of memory" / "current line number"
+// pointers - dormant and safe to reuse while this program owns the machine
+// (the KERNAL IRQ handler we still chain through never touches them).
+// Used by the background engine's coarse row-shift as a source/dest pointer
+// pair while it copies shadow-buffer rows.
+.var SCROLL_SRC               = $37
+.var SCROLL_DST               = $39
 .const BACKGROUND_COLOUR      = $D021

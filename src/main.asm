@@ -32,6 +32,48 @@
 .const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
 .const STAR_GLYPH_BYTES = 96
 
+// ============================================================================
+// BACKGROUND / STAGE ENGINE - shared constants.
+// Full design rationale: docs/background-engine.md. Resident engine code and
+// state live from $4000 (see BACKGROUND_ENGINE_START below); stage-package
+// data (charset additions, metatiles, map, entities) lives separately from
+// $6000 so a future multiload can replace only that block.
+// ============================================================================
+.const STAGE_CHAR_BASE  = 224                       // Placeholder background glyphs, codes 224-239.
+.const STAGE_GLYPH_BYTES = 16 * 8                   // 16 characters x 8 bytes each.
+.const BG_CHAR_SKY = 32                             // Screen code for "open sky" - ordinary space.
+
+.const BG_META_SIZE = 4                             // Metatiles are 4x4 characters (32x32 px).
+.const BG_MAP_COLS  = 40 / BG_META_SIZE             // 40-column playfield = 10 metatiles wide.
+.const BG_MAP_ROWS  = 80                            // Test-map length in metatile rows (320 char rows).
+
+.const BG_CHAR_BASE   = $4400                       // Shadow "true background" screen codes (1000 bytes).
+.const BG_COLOUR_BASE = $4800                       // Shadow "true background" colours (1000 bytes).
+// Row 0 of each shadow buffer is unused filler: HUD row 0 is never touched by
+// the background system. Both buffers share screen RAM's low-byte alignment
+// ($x400/$x800, low byte $00), so a shadow address is always "screen address
+// with a constant added to the high byte" - the same idiom the star code
+// already uses for colour RAM (+$d4).
+.const BG_CHAR_HI_DELTA   = >BG_CHAR_BASE   - >$0400
+.const BG_COLOUR_HI_DELTA = >BG_COLOUR_BASE - >$0400
+
+.const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N frames.
+.const HUD_SPLIT_RASTER = 58                        // First scanline of character row 1 (empirically tuned).
+
+.const STAGE_STATE_RUNNING  = 0
+.const STAGE_STATE_COMPLETE = 1
+
+.const TURRET_POOL_SIZE = 4                         // Active (near-viewport) turret slots.
+.const TURRET_START_HEALTH = 3
+.const TURRET_FIRE_INTERVAL = 110                   // Conservative cadence: ~2.2s between shots.
+.const TURRET_AIM_INTERVAL = 6                      // Re-aim at most every 6 frames.
+.const TURRET_ACTIVATE_ROWS = 8                     // Activation window ahead of the viewport, in metatile rows.
+.const TURRET_STAGE_STRIDE = 4                      // stageTurrets record size: metaRow, subRow, col, type.
+.const STAGE_TURRET_COUNT = 4                       // Placements in stageTurrets (declared here: used by code
+                                                     // above the stage-data block; kept in sync with the .byte
+                                                     // rows in stageTurrets by the STAGE_TURRET_COUNT*4 size
+                                                     // guard next to that table).
+
 .const ATTACK_TOP_TURN_LEFT       = 0
 .const ATTACK_TOP_TURN_RIGHT      = 1
 .const ATTACK_TOP_LOOP_LEFT       = 2
@@ -255,6 +297,8 @@ startGame:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
+    jsr buildInitialBackground              // Reset stage scroll position/entities and paint the first view.
+
     lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
     sta GAME_STATE
     rts
@@ -290,8 +334,9 @@ mainLoop:
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr resetHudScroll                      // Force YSCROL=0 before row 0 (HUD) is scanned this frame.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
-    jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr armScrollSplit                      // Arm the HUD/scroll raster split, then the sprite batches.
 
 !frameLoop:
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
@@ -309,6 +354,8 @@ gameLoop:
 
     jsr updateSpawner                       // Periodically create a new enemy.
     jsr updateStarfield                     // Scroll and twinkle the character background.
+    jsr updateBackgroundScroll              // Advance the scrolling landscape (fine + coarse row advance).
+    jsr updateTurrets                       // Aim/fire/decay every active background turret.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
@@ -316,9 +363,10 @@ gameLoop:
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr resetHudScroll                      // Force YSCROL=0 before row 0 (HUD) is scanned this frame.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
-    jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr armScrollSplit                      // Arm the HUD/scroll raster split, then the sprite batches.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
 
 // --- Routine: endGame ---------------------------------------------------
@@ -1030,6 +1078,14 @@ setupStarfieldCharset:
     inx
     cpx #STAR_GLYPH_BYTES
     bne !copyStarGlyphs-
+
+    ldx #0                                  // Placeholder stage/background glyphs, codes 224-239.
+!copyStageGlyphs:                           // See docs/background-engine.md for the CharPad replacement path.
+    lda testStageGlyphData,x
+    sta STAR_CHARSET + (STAGE_CHAR_BASE * 8),x
+    inx
+    cpx #STAGE_GLYPH_BYTES
+    bne !copyStageGlyphs-
     rts
 
 // --- Routine: setupStarfield ------------------------------------------------
@@ -1134,24 +1190,54 @@ updateStarfield:
     rts
 
 // --- Routine: eraseOneStar --------------------------------------------------
-// X = logical star index. Erase just that star's current screen cell.
+// X = logical star index. Restore whatever background character/colour truly
+// belongs in this cell (BACKGROUND ENGINE integration: no longer a blind
+// space - the shadow buffer BG_CHAR/BG_COLOUR is the source of truth so
+// scrolling terrain is never damaged by a star moving away).
 eraseOneStar:
     ldy STAR_Y,x
     lda starRowLo,y
     clc
     adc STAR_X,x
     sta starEraseStore + 1
+    sta starEraseColourStore + 1
+    sta starEraseBgCharLoad + 1
+    sta starEraseBgColourLoad + 1
+
     lda starRowHi,y
     adc #0
-    sta starEraseStore + 2
+    sta starEraseStore + 2                  // Screen RAM page.
 
-    lda #32                                 // Screen code for space.
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta starEraseBgCharLoad + 2             // BG_CHAR shadow page.
+
+    lda starEraseStore + 2                  // Recover the plain screen-RAM high byte.
+    clc
+    adc #$d4
+    sta starEraseColourStore + 2            // Colour RAM page.
+
+    lda starEraseStore + 2
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta starEraseBgColourLoad + 2           // BG_COLOUR shadow page.
+
+starEraseBgCharLoad:
+    lda $ffff                               // True background character for this cell.
 starEraseStore:
+    sta $ffff
+starEraseBgColourLoad:
+    lda $ffff                               // True background colour for this cell.
+starEraseColourStore:
     sta $ffff
     rts
 
 // --- Routine: drawOneStar ---------------------------------------------------
 // X = logical star index. Draw its current glyph and normal/twinkle colour.
+// BACKGROUND ENGINE integration: only draws when the shadow buffer says this
+// cell is open sky. Over solid terrain the star's position/phase still
+// advances as normal in updateStarfield - it just stays invisible until it
+// next moves over sky, so scrolling scenery always wins immediately.
 drawOneStar:
     ldy STAR_Y,x
     lda starRowLo,y
@@ -1159,13 +1245,24 @@ drawOneStar:
     adc STAR_X,x
     sta starDrawScreen + 1
     sta starDrawColour + 1
+    sta starBgCheck + 1
 
     lda starRowHi,y
     adc #0
     sta starDrawScreen + 2
+    pha                                     // Keep the screen-RAM high byte to derive both shadow pages.
     clc
     adc #$d4                                // Matching colour RAM page.
     sta starDrawColour + 2
+    pla
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta starBgCheck + 2
+
+starBgCheck:
+    lda $ffff                               // BG_CHAR shadow value for this cell.
+    cmp #BG_CHAR_SKY
+    bne !suppressed+                        // Solid terrain occupies this cell: leave the star undrawn.
 
     lda STAR_STYLE,x
     and #%00000011
@@ -1196,6 +1293,7 @@ starDrawScreen:
     lda STAR_DRAW_COLOUR
 starDrawColour:
     sta $ffff
+!suppressed:
     rts
 
 // --- Routine: drawStarfield -------------------------------------------------
@@ -1211,36 +1309,63 @@ drawStarfield:
 
 // --- Routine: setOneStarTwinkleColour --------------------------------------
 // X = logical star index. Change colour RAM only; glyph/screen RAM is untouched.
+// BACKGROUND ENGINE integration: guarded the same way as drawOneStar, since a
+// star that was suppressed over terrain must not have its cosmetic twinkle
+// repaint that terrain's colour.
 setOneStarTwinkleColour:
     ldy STAR_Y,x
     lda starRowLo,y
     clc
     adc STAR_X,x
     sta starTwinkleStore + 1
+    sta starTwinkleBgCheck + 1
     lda starRowHi,y
     adc #0
+    pha
     clc
     adc #$d4
     sta starTwinkleStore + 2
+    pla
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta starTwinkleBgCheck + 2
+
+starTwinkleBgCheck:
+    lda $ffff
+    cmp #BG_CHAR_SKY
+    bne !skip+
 
     lda #7
 starTwinkleStore:
     sta $ffff
+!skip:
     rts
 
 // --- Routine: setOneStarNormalColour ---------------------------------------
 // X = logical star index. Restore the colour appropriate to this depth layer.
+// Same sky guard as setOneStarTwinkleColour, for the same reason.
 setOneStarNormalColour:
     ldy STAR_Y,x
     lda starRowLo,y
     clc
     adc STAR_X,x
     sta starNormalColourStore + 1
+    sta starNormalBgCheck + 1
     lda starRowHi,y
     adc #0
+    pha
     clc
     adc #$d4
     sta starNormalColourStore + 2
+    pla
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta starNormalBgCheck + 2
+
+starNormalBgCheck:
+    lda $ffff
+    cmp #BG_CHAR_SKY
+    bne !skip+
 
     lda STAR_STYLE,x
     and #%00000011
@@ -1248,6 +1373,7 @@ setOneStarNormalColour:
     lda starBaseColour,y
 starNormalColourStore:
     sta $ffff
+!skip:
     rts
 
 // Three sizes, each with four vertical phases spaced two pixels apart.
@@ -1450,8 +1576,13 @@ updatePlayerFire:
     adc #0
     sta HITSCAN_X_MSB
     jsr tracePlayerCannon                   // X = nearest intersected enemy when carry is clear.
-    bcs !rightCannon+
+    bcs !leftTurret+
     jsr hitEnemyFromLeft                    // Left-side impact kicks the enemy slightly right/down.
+    jmp !rightCannon+
+!leftTurret:
+    jsr traceTurretHit                      // No enemy: does this ray hit a background turret instead?
+    bcs !rightCannon+
+    jsr damageTurret
 
 !rightCannon:
     lda OBJECT_X                            // Build the right-cannon 9-bit world X coordinate.
@@ -1462,8 +1593,13 @@ updatePlayerFire:
     adc #0
     sta HITSCAN_X_MSB
     jsr tracePlayerCannon
-    bcs !done+
+    bcs !rightTurret+
     jsr hitEnemyFromRight                   // Right-side impact kicks the enemy slightly left/down.
+    jmp !done+
+!rightTurret:
+    jsr traceTurretHit
+    bcs !done+
+    jsr damageTurret
 
 !done:
     rts
@@ -4554,4 +4690,1566 @@ healthSpritePool:
 HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
+}
+
+// ============================================================================
+// BACKGROUND / STAGE ENGINE - resident code and state.
+//
+// Physically placed at $4000+ because the original $0801-$1f00 code segment
+// had only ~275 bytes of headroom left after the movement-fragment work;
+// this is a placement decision, not a redesign of anything above. See
+// docs/background-engine.md for the full design rationale.
+//
+// Stage-package data (placeholder charset, metatiles, map, turret
+// placements) lives separately from $6000 - see BACKGROUND ENGINE: STAGE
+// DATA below - so a future multiload can replace only that block.
+// ============================================================================
+* = $4000
+BACKGROUND_ENGINE_START:
+
+// --- Resident state ---------------------------------------------------------
+SCROLL_FRAME_COUNT:    .byte 0         // Counts up to SCROLL_FRAME_DIVIDER.
+SCROLL_FINE:           .byte 0         // Current YSCROL applied below the HUD split, 0-7.
+SCROLL_SUB_ROW:        .byte 0         // Which of a metatile row's 4 character rows is at screen row 1.
+SCROLL_META_ROW:       .byte 0         // Which metatile-map row screen row 1 currently starts within.
+STAGE_STATE:           .byte 0         // STAGE_STATE_RUNNING / STAGE_STATE_COMPLETE.
+
+BG_META_ROW:           .byte 0         // Scratch: metatile row being rendered.
+BG_SUB_ROW:            .byte 0         // Scratch: sub-row (0-3) being rendered.
+BG_DEST_ROW:           .byte 0         // Scratch: destination shadow/screen row (1-24).
+BG_ROW_META_OFFSET:    .byte 0         // Scratch: BG_SUB_ROW*4, byte offset into a 16-byte metatile block.
+BG_MAP_ROW_LO:         .byte 0         // Scratch pointer: stageMap + BG_META_ROW*BG_MAP_COLS.
+BG_MAP_ROW_HI:         .byte 0
+BG_SCRATCH:            .byte 0
+BG_SCRATCH2:           .byte 0
+BG_STAMP_CHAR:         .byte 0
+BG_STAMP_COLOUR:       .byte 0
+
+BG_TURRET_SCAN_IDX:    .byte 0         // Scratch: index into stageTurrets during activateTurrets.
+BG_TURRET_POOL_IDX:    .byte 0         // Scratch: which ACTIVE_TURRET_* slot a helper is working on.
+BG_TURRET_HEAD_ROW:    .byte 0         // Scratch/output of computeTurretScreenRows.
+BG_TURRET_BASE_ROW:    .byte 0
+HITSCAN_TARGET_TURRET: .byte $ff       // Pool slot selected by traceTurretHit; $ff = none.
+
+// Active-turret pool: the handful of stage turrets near/on the viewport.
+// ACTIVE_TURRET_STAGE_IDX = $ff marks a free slot.
+ACTIVE_TURRET_STAGE_IDX:  .fill TURRET_POOL_SIZE, $ff
+ACTIVE_TURRET_HEALTH:     .fill TURRET_POOL_SIZE, 0
+ACTIVE_TURRET_DESTROYED:  .fill TURRET_POOL_SIZE, 0
+ACTIVE_TURRET_FIRE_TIMER: .fill TURRET_POOL_SIZE, 0
+ACTIVE_TURRET_AIM_TIMER:  .fill TURRET_POOL_SIZE, 0
+ACTIVE_TURRET_AIM:        .fill TURRET_POOL_SIZE, 1     // 0=left,1=centre,2=right; default centre.
+ACTIVE_TURRET_MUZZLE:     .fill TURRET_POOL_SIZE, 0      // Frames of muzzle-flash glyph remaining.
+ACTIVE_TURRET_HIT_TIMER:  .fill TURRET_POOL_SIZE, 0       // Frames of hit-flash colour remaining.
+ACTIVE_TURRET_COL:        .fill TURRET_POOL_SIZE, 0        // Cached character column, 0-39.
+ACTIVE_TURRET_X_LO:       .fill TURRET_POOL_SIZE, 0         // Cached 9-bit pixel X (col*8).
+ACTIVE_TURRET_X_MSB:      .fill TURRET_POOL_SIZE, 0
+
+// --- Routine: resetHudScroll -------------------------------------------
+// Force YSCROL to 0 for the top of the frame (row 0/HUD) so the raster split
+// (scrollSplitIRQ) only ever reveals the real scroll value below row 0.
+// Called once per frame, immediately after waitForFrameStart, well before
+// HUD_SPLIT_RASTER is reached.
+resetHudScroll:
+    sei
+    lda VIC_CONTROL_1
+    and #%11111000
+    sta VIC_CONTROL_1
+    cli
+    rts
+
+// --- Routine: armScrollSplit ---------------------------------------------
+// Replaces the plain armFirstBatch call in gameLoop while background
+// scrolling is active. Arms a raster IRQ at HUD_SPLIT_RASTER (scrollSplitIRQ)
+// which reveals SCROLL_FINE for row 1 downward, then itself arms the
+// existing, unmodified sprite-multiplex batches. armFirstBatch/multiplexIRQ
+// and all batch data are untouched.
+armScrollSplit:
+    sei
+    lda IRQ_ENABLE
+    and #%11111110
+    sta IRQ_ENABLE
+
+    lda VIC_CONTROL_1
+    and #%01111111
+    sta VIC_CONTROL_1               // Raster compare below 256 (same convention as armFirstBatch).
+
+    lda #<scrollSplitIRQ
+    sta IRQ_VECTOR
+    lda #>scrollSplitIRQ
+    sta IRQ_VECTOR + 1
+
+    lda #HUD_SPLIT_RASTER
+    sta RASTER
+
+    lda #%00000001
+    sta IRQ_STATUS
+    lda IRQ_ENABLE
+    ora #%00000001
+    sta IRQ_ENABLE
+    cli
+    rts
+
+// --- Routine: scrollSplitIRQ ---------------------------------------------
+// PLAIN ENGLISH: fires once per frame at the exact scanline where the HUD
+// row ends and the scrolling landscape begins. It flips on the actual scroll
+// offset for everything below that line, so the HUD above it never wobbles.
+// Immediately hands off to the same sprite-recycling setup armFirstBatch
+// would have done - that part is untouched, just duplicated here (not
+// jsr'd) because armFirstBatch's own cli would re-enable interrupts mid-IRQ.
+scrollSplitIRQ:
+    lda IRQ_ENABLE
+    and #%00000001
+    beq !notOurs+
+    lda IRQ_STATUS
+    and #%00000001
+    beq !notOurs+
+
+    lda VIC_CONTROL_1
+    and #%11111000
+    ora SCROLL_FINE
+    sta VIC_CONTROL_1
+    lda #%00000001
+    sta IRQ_STATUS
+
+    // --- inline equivalent of armFirstBatch's !hasBatch check, no sei/cli ---
+    ldy LIVE_PLAN
+    lda BATCH_COUNT,y
+    beq !noBatch+
+
+    lda #0
+    sta BATCH_INDEX
+    lda #<multiplexIRQ
+    sta IRQ_VECTOR
+    lda #>multiplexIRQ
+    sta IRQ_VECTOR + 1
+    lda VIC_CONTROL_1
+    and #%01111111
+    sta VIC_CONTROL_1
+    ldy LIVE_PLAN
+    lda BATCH_RASTER,y
+    sta RASTER
+    lda #%00000001
+    sta IRQ_STATUS
+    lda IRQ_ENABLE
+    ora #%00000001
+    sta IRQ_ENABLE
+    jmp $ea31
+
+!noBatch:
+    lda #%00000001
+    sta IRQ_STATUS
+    jmp $ea31
+
+!notOurs:
+    jmp $ea31
+
+// --- Routine: updateBackgroundScroll -------------------------------------
+// Advances fine scroll by one frame's worth; on an 8px wrap, performs one
+// coarse row advance. Called once per frame during PLAYING only.
+updateBackgroundScroll:
+    lda STAGE_STATE
+    bne !done+                          // STAGE_STATE_COMPLETE: stage has ended, freeze scrolling.
+
+    inc SCROLL_FRAME_COUNT
+    lda SCROLL_FRAME_COUNT
+    cmp #SCROLL_FRAME_DIVIDER
+    bcc !done+
+    lda #0
+    sta SCROLL_FRAME_COUNT
+
+    inc SCROLL_FINE
+    lda SCROLL_FINE
+    cmp #8
+    bcc !done+
+    lda #0
+    sta SCROLL_FINE
+    jsr advanceCoarseRow
+!done:
+    rts
+
+// --- Routine: advanceCoarseRow -------------------------------------------
+// One character row's worth of world advances: bump the sub-row/meta-row
+// counters (or complete the stage), shift the shadow buffer, render the
+// freshly-revealed top row, stamp any turrets into it, and re-scan turret
+// pool membership.
+advanceCoarseRow:
+    inc SCROLL_SUB_ROW
+    lda SCROLL_SUB_ROW
+    cmp #4
+    bcc !haveRow+
+    lda #0
+    sta SCROLL_SUB_ROW
+    inc SCROLL_META_ROW
+    lda SCROLL_META_ROW
+    cmp #BG_MAP_ROWS
+    bcc !haveRow+
+
+    lda #(BG_MAP_ROWS - 1)               // Clamp to the final metatile row and stop scrolling.
+    sta SCROLL_META_ROW
+    lda #STAGE_STATE_COMPLETE
+    sta STAGE_STATE
+    rts
+
+!haveRow:
+    jsr shiftShadowRowsDown
+
+    jsr activateTurrets
+
+    lda SCROLL_META_ROW
+    sta BG_META_ROW
+    lda SCROLL_SUB_ROW
+    sta BG_SUB_ROW
+    lda #1
+    sta BG_DEST_ROW
+    jsr renderMapRowIntoShadow
+    jsr stampTurretsIntoRow
+
+    ldx #1
+    jsr blitShadowRowToLive
+    rts
+
+// --- Routine: shiftShadowRowsDown -----------------------------------------
+// Shift shadow rows 1-23 down into rows 2-24 (screen-row numbering), for
+// both the character and colour planes. Runs live, in place, once per
+// coarse step; timed to complete well before those rows are next raster-
+// scanned (the scrolling landscape moves at most one row every
+// SCROLL_FRAME_DIVIDER*8 frames, so this has an entire frame's slack). See
+// docs/background-engine.md for why this was chosen over double-buffering.
+shiftShadowRowsDown:
+    ldx #24                              // Destination row, working from the bottom up.
+!rowLoop:
+    lda starRowLo,x
+    sta shiftCharDst + 1
+    sta shiftColourDst + 1
+    lda starRowLo - 1,x
+    sta shiftCharSrc + 1
+    sta shiftColourSrc + 1
+
+    lda starRowHi,x
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta shiftCharDst + 2
+    lda starRowHi - 1,x
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta shiftCharSrc + 2
+
+    lda starRowHi,x
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta shiftColourDst + 2
+    lda starRowHi - 1,x
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta shiftColourSrc + 2
+
+    ldy #39
+!charByte:
+shiftCharSrc:
+    lda $ffff,y
+shiftCharDst:
+    sta $ffff,y
+    dey
+    bpl !charByte-
+
+    ldy #39
+!colourByte:
+shiftColourSrc:
+    lda $ffff,y
+shiftColourDst:
+    sta $ffff,y
+    dey
+    bpl !colourByte-
+
+    dex
+    cpx #1
+    bne !rowLoop-
+    rts
+
+// --- Routine: computeStageMapRowPtr ---------------------------------------
+// BG_MAP_ROW_LO/HI = stageMap + BG_META_ROW*BG_MAP_COLS. Not hot (runs at
+// most once per coarse step, or a handful of times during the initial
+// static render), so a plain add-in-a-loop is simple and fast enough.
+computeStageMapRowPtr:
+    lda #<stageMap
+    sta BG_MAP_ROW_LO
+    lda #>stageMap
+    sta BG_MAP_ROW_HI
+    ldx BG_META_ROW
+    beq !done+
+!addLoop:
+    lda BG_MAP_ROW_LO
+    clc
+    adc #BG_MAP_COLS
+    sta BG_MAP_ROW_LO
+    lda BG_MAP_ROW_HI
+    adc #0
+    sta BG_MAP_ROW_HI
+    dex
+    bne !addLoop-
+!done:
+    rts
+
+// --- Routine: renderMapRowIntoShadow --------------------------------------
+// Render metatile-row BG_META_ROW's sub-row BG_SUB_ROW into shadow buffer
+// row BG_DEST_ROW (1-24). Used both for the one-time initial static render
+// and for each coarse step's freshly-revealed row.
+renderMapRowIntoShadow:
+    jsr computeStageMapRowPtr
+    lda BG_MAP_ROW_LO
+    sta SCROLL_SRC
+    lda BG_MAP_ROW_HI
+    sta SCROLL_SRC + 1
+
+    lda BG_SUB_ROW
+    asl
+    asl
+    sta BG_ROW_META_OFFSET           // 0,4,8,12: this sub-row's base offset in a 16-byte metatile block.
+
+    ldx BG_DEST_ROW
+    lda starRowLo,x
+    sta shadowCharRow + 1
+    sta shadowColourRow + 1
+    lda starRowHi,x
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta shadowCharRow + 2
+    lda starRowHi,x
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta shadowColourRow + 2
+
+    ldx #0                            // Destination character column, 0-39.
+!colLoop:
+    txa
+    lsr
+    lsr                                // A = destCol/4 = stageMap column (0-9).
+    tay
+    lda (SCROLL_SRC),y
+    tay                                // Y = metatile ID.
+
+    lda metaCharPtrLo,y
+    sta metaCharByte + 1
+    lda metaCharPtrHi,y
+    sta metaCharByte + 2
+    lda metaColourPtrLo,y
+    sta metaColourByte + 1
+    lda metaColourPtrHi,y
+    sta metaColourByte + 2
+
+    txa
+    and #%00000011                    // A = destCol mod 4 = column within this metatile (0-3).
+    clc
+    adc BG_ROW_META_OFFSET
+    tay                                // Y = index 0-15 into the metatile's 16-byte block.
+
+metaCharByte:
+    lda $ffff,y
+shadowCharRow:
+    sta $ffff,x
+metaColourByte:
+    lda $ffff,y
+shadowColourRow:
+    sta $ffff,x
+
+    inx
+    cpx #40
+    bne !colLoop-
+    rts
+
+// --- Routine: blitShadowRowToLive -----------------------------------------
+// Entry: X = row (1-24). Copies shadow char/colour for that row straight
+// into live screen/colour RAM.
+blitShadowRowToLive:
+    lda starRowLo,x
+    sta liveCharRow + 1
+    sta liveColourRow + 1
+    sta shadowCharRowR + 1
+    sta shadowColourRowR + 1
+    lda starRowHi,x
+    sta liveCharRow + 2
+    clc
+    adc #$d4
+    sta liveColourRow + 2
+    lda starRowHi,x
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta shadowCharRowR + 2
+    lda starRowHi,x
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta shadowColourRowR + 2
+
+    ldy #39
+!byteLoop:
+shadowCharRowR:
+    lda $ffff,y
+liveCharRow:
+    sta $ffff,y
+shadowColourRowR:
+    lda $ffff,y
+liveColourRow:
+    sta $ffff,y
+    dey
+    bpl !byteLoop-
+    rts
+
+// --- Routine: buildInitialBackground --------------------------------------
+// One-time (per new game) full static render of the visible 24-row
+// playfield from the stage map, starting at the top of the stage. Runs
+// entirely during startGame's setup, before the frame loop begins, so its
+// cost (spread over 24 rows) is not a per-frame concern.
+buildInitialBackground:
+    lda #0
+    sta SCROLL_FRAME_COUNT
+    sta SCROLL_FINE
+    sta SCROLL_SUB_ROW
+    sta SCROLL_META_ROW
+    sta STAGE_STATE
+
+    ldx #0
+!clearTurretPool:
+    lda #$ff
+    sta ACTIVE_TURRET_STAGE_IDX,x
+    inx
+    cpx #TURRET_POOL_SIZE
+    bne !clearTurretPool-
+
+    jsr activateTurrets
+
+    lda #0
+    sta BG_META_ROW
+    sta BG_SUB_ROW
+    ldx #1                             // Screen row, 1-24.
+!rowLoop:
+    stx BG_DEST_ROW
+    jsr renderMapRowIntoShadow
+    jsr stampTurretsIntoRow
+    ldx BG_DEST_ROW
+    jsr blitShadowRowToLive
+
+    inc BG_SUB_ROW
+    lda BG_SUB_ROW
+    cmp #4
+    bcc !noWrap+
+    lda #0
+    sta BG_SUB_ROW
+    inc BG_META_ROW
+!noWrap:
+    ldx BG_DEST_ROW
+    inx
+    cpx #25
+    bne !rowLoop-
+    rts
+
+// --- Routine: activateTurrets ---------------------------------------------
+// Scans the (short) stageTurrets list once and moves pool membership as
+// each turret's metatile row enters/leaves the activation window ahead of
+// the viewport. Cheap: at most STAGE_TURRET_COUNT comparisons.
+activateTurrets:
+    ldx #0
+!scanLoop:
+    cpx #STAGE_TURRET_COUNT
+    beq !allDone+
+    stx BG_TURRET_SCAN_IDX
+
+    txa
+    asl
+    asl
+    tay
+    lda stageTurrets,y
+    sec
+    sbc SCROLL_META_ROW
+    bmi !wantInactive+
+    cmp #TURRET_ACTIVATE_ROWS
+    bcs !wantInactive+
+
+    jsr activateOneTurret
+    jmp !nextTurret+
+!wantInactive:
+    jsr deactivateOneTurret
+!nextTurret:
+    ldx BG_TURRET_SCAN_IDX
+    inx
+    jmp !scanLoop-
+!allDone:
+    rts
+
+// --- Routine: activateOneTurret --------------------------------------------
+// Entry: BG_TURRET_SCAN_IDX = stage-turret index confirmed within range.
+// A no-op if that turret is already tracked; otherwise claims a free pool
+// slot and initialises its state.
+activateOneTurret:
+    lda BG_TURRET_SCAN_IDX
+    sta BG_SCRATCH
+    ldy #0
+!checkActive:
+    lda ACTIVE_TURRET_STAGE_IDX,y
+    cmp BG_SCRATCH
+    beq !already+
+    iny
+    cpy #TURRET_POOL_SIZE
+    bne !checkActive-
+
+    ldy #0
+!findFree:
+    lda ACTIVE_TURRET_STAGE_IDX,y
+    cmp #$ff
+    beq !haveFree+
+    iny
+    cpy #TURRET_POOL_SIZE
+    bne !findFree-
+    rts                                  // Pool full: shouldn't happen with 4 slots + this activation window.
+
+!haveFree:
+    lda BG_SCRATCH
+    sta ACTIVE_TURRET_STAGE_IDX,y
+    lda #TURRET_START_HEALTH
+    sta ACTIVE_TURRET_HEALTH,y
+    lda #0
+    sta ACTIVE_TURRET_DESTROYED,y
+    sta ACTIVE_TURRET_FIRE_TIMER,y
+    sta ACTIVE_TURRET_AIM_TIMER,y
+    sta ACTIVE_TURRET_MUZZLE,y
+    sta ACTIVE_TURRET_HIT_TIMER,y
+    lda #1
+    sta ACTIVE_TURRET_AIM,y
+
+    lda BG_TURRET_SCAN_IDX
+    asl
+    asl
+    tax
+    lda stageTurrets + 2,x               // Column byte (offset 2 within the 4-byte record).
+    sta ACTIVE_TURRET_COL,y
+    asl
+    asl
+    asl                                   // col*8 low byte (top bit(s) dropped; recovered below).
+    sta ACTIVE_TURRET_X_LO,y
+    lda ACTIVE_TURRET_COL,y
+    lsr
+    lsr
+    lsr
+    lsr
+    lsr                                    // col>>5 = 0 or 1, since col < 64 always.
+    sta ACTIVE_TURRET_X_MSB,y
+!already:
+    rts
+
+// --- Routine: deactivateOneTurret ------------------------------------------
+// Frees this stage turret's pool slot if it holds one. Its glyphs already
+// live permanently in the shadow buffer, so nothing visual needs undoing.
+deactivateOneTurret:
+    lda BG_TURRET_SCAN_IDX
+    sta BG_SCRATCH
+    ldy #0
+!find:
+    lda ACTIVE_TURRET_STAGE_IDX,y
+    cmp BG_SCRATCH
+    bne !next+
+    lda #$ff
+    sta ACTIVE_TURRET_STAGE_IDX,y
+    rts
+!next:
+    iny
+    cpy #TURRET_POOL_SIZE
+    bne !find-
+    rts
+
+// --- Routine: stampTurretsIntoRow ------------------------------------------
+// Entry: BG_META_ROW/BG_SUB_ROW/BG_DEST_ROW describe the row just rendered
+// by renderMapRowIntoShadow. Overwrites that row's terrain with an active
+// turret's head or base glyph wherever one of its two cells falls here.
+stampTurretsIntoRow:
+    ldx BG_DEST_ROW
+    lda starRowLo,x
+    sta stampCharStore + 1
+    sta stampColourStore + 1
+    lda starRowHi,x
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta stampCharStore + 2
+    lda starRowHi,x
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta stampColourStore + 2
+
+    ldx #0                               // Pool slot index.
+!poolLoop:
+    stx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_STAGE_IDX,x
+    cmp #$ff
+    bne !haveIdx+
+    jmp !nextSlot+                        // Long: !nextSlot exceeds branch range from here.
+!haveIdx:
+
+    asl
+    asl
+    tay
+    lda stageTurrets,y                   // metaRow
+    cmp BG_META_ROW
+    beq !metaMatch+
+    jmp !nextSlot+
+!metaMatch:
+    lda stageTurrets + 1,y                // head sub-row
+    cmp BG_SUB_ROW
+    beq !isHead+
+    clc
+    adc #1                                 // base sub-row = head+1
+    cmp BG_SUB_ROW
+    beq !isBase+
+    jmp !nextSlot+
+!isBase:
+
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_HIT_TIMER,x
+    bne !flashBase+
+    lda ACTIVE_TURRET_DESTROYED,x
+    bne !wreckBase+
+    lda ACTIVE_TURRET_HEALTH,x
+    cmp #2
+    bcs !normalBase+
+    lda #235
+    jmp !haveBaseChar+
+!normalBase:
+    lda #230
+    jmp !haveBaseChar+
+!wreckBase:
+    lda #236
+!haveBaseChar:
+    sta BG_STAMP_CHAR
+    lda #5
+    sta BG_STAMP_COLOUR
+    jmp !doStamp+
+!flashBase:
+    lda ACTIVE_TURRET_DESTROYED,x
+    beq !flashBaseAlive+
+    lda #236
+    jmp !flashBaseChar+
+!flashBaseAlive:
+    lda #230
+!flashBaseChar:
+    sta BG_STAMP_CHAR
+    lda #1
+    sta BG_STAMP_COLOUR
+    jmp !doStamp+
+
+!isHead:
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_HIT_TIMER,x
+    bne !flashHead+
+    lda ACTIVE_TURRET_DESTROYED,x
+    bne !wreckHead+
+    lda ACTIVE_TURRET_MUZZLE,x
+    bne !muzzleHead+
+    lda ACTIVE_TURRET_AIM,x
+    clc
+    adc #231
+    jmp !haveHeadChar+
+!muzzleHead:
+    lda #234
+    jmp !haveHeadChar+
+!wreckHead:
+    lda #236
+!haveHeadChar:
+    sta BG_STAMP_CHAR
+    lda #1
+    sta BG_STAMP_COLOUR
+    jmp !doStamp+
+!flashHead:
+    lda ACTIVE_TURRET_DESTROYED,x
+    beq !flashHeadAlive+
+    lda #236
+    jmp !flashHeadChar+
+!flashHeadAlive:
+    lda ACTIVE_TURRET_AIM,x
+    clc
+    adc #231
+!flashHeadChar:
+    sta BG_STAMP_CHAR
+    lda #1
+    sta BG_STAMP_COLOUR
+
+!doStamp:
+    ldy BG_TURRET_POOL_IDX
+    ldx ACTIVE_TURRET_COL,y
+    lda BG_STAMP_CHAR
+stampCharStore:
+    sta $ffff,x
+    lda BG_STAMP_COLOUR
+stampColourStore:
+    sta $ffff,x
+
+!nextSlot:
+    ldx BG_TURRET_POOL_IDX
+    inx
+    cpx #TURRET_POOL_SIZE
+    beq !allDone+
+    jmp !poolLoop-
+!allDone:
+    rts
+
+// --- Routine: computeTurretScreenRows --------------------------------------
+// Entry: BG_TURRET_POOL_IDX. Exit: BG_TURRET_HEAD_ROW/BG_TURRET_BASE_ROW hold
+// this turret's current screen rows. Callers must range-check against 1-24
+// (two's-complement wraparound makes a plain unsigned cmp#1/cmp#25 correct
+// even when the turret is currently off-screen in either direction).
+computeTurretScreenRows:
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_STAGE_IDX,x
+    asl
+    asl
+    tay
+    lda stageTurrets,y                    // metaRow
+    sec
+    sbc SCROLL_META_ROW                   // Small-magnitude signed delta, metatile rows.
+    asl
+    asl                                    // *4 -> character rows.
+    clc
+    adc stageTurrets + 1,y                 // + head sub-row.
+    sec
+    sbc SCROLL_SUB_ROW
+    clc
+    adc #1                                  // screenRow = 1 + delta.
+    sta BG_TURRET_HEAD_ROW
+    clc
+    adc #1
+    sta BG_TURRET_BASE_ROW
+    rts
+
+// --- Routine: restampActiveTurret ------------------------------------------
+// Entry: X = pool slot. Re-stamps this turret's head/base glyphs directly
+// into shadow+live at its current screen row(s), if on-screen. Used when its
+// aim, muzzle flash or damage state changes after its row was first rendered.
+restampActiveTurret:
+    stx BG_TURRET_POOL_IDX
+    jsr computeTurretScreenRows
+
+    lda BG_TURRET_HEAD_ROW
+    cmp #1
+    bcc !skipHead+
+    cmp #25
+    bcs !skipHead+
+    ldx BG_TURRET_HEAD_ROW
+    jsr restampHeadAtRow
+!skipHead:
+    lda BG_TURRET_BASE_ROW
+    cmp #1
+    bcc !skipBase+
+    cmp #25
+    bcs !skipBase+
+    ldx BG_TURRET_BASE_ROW
+    jsr restampBaseAtRow
+!skipBase:
+    rts
+
+// --- Routine: restampHeadAtRow ---------------------------------------------
+// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot.
+restampHeadAtRow:
+    lda starRowLo,x
+    sta rsHeadShadowChar + 1
+    sta rsHeadShadowColour + 1
+    sta rsHeadLiveChar + 1
+    sta rsHeadLiveColour + 1
+    lda starRowHi,x
+    pha
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta rsHeadShadowChar + 2
+    pla
+    pha
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta rsHeadShadowColour + 2
+    pla
+    pha
+    sta rsHeadLiveChar + 2
+    pla
+    clc
+    adc #$d4
+    sta rsHeadLiveColour + 2
+
+    ldy BG_TURRET_POOL_IDX
+    ldx ACTIVE_TURRET_COL,y
+
+    lda ACTIVE_TURRET_HIT_TIMER,y
+    bne !flash+
+    lda ACTIVE_TURRET_DESTROYED,y
+    bne !wreck+
+    lda ACTIVE_TURRET_MUZZLE,y
+    bne !muzzle+
+    lda ACTIVE_TURRET_AIM,y
+    clc
+    adc #231
+    jmp !have+
+!muzzle:
+    lda #234
+    jmp !have+
+!wreck:
+    lda #236
+    jmp !have+
+!flash:
+    lda ACTIVE_TURRET_DESTROYED,y
+    beq !flashAlive+
+    lda #236
+    jmp !have+
+!flashAlive:
+    lda ACTIVE_TURRET_AIM,y
+    clc
+    adc #231
+!have:
+rsHeadShadowChar:
+    sta $ffff,x
+rsHeadLiveChar:
+    sta $ffff,x
+    lda #1                              // Head is always white; state is conveyed by the glyph itself.
+rsHeadShadowColour:
+    sta $ffff,x
+rsHeadLiveColour:
+    sta $ffff,x
+    rts
+
+// --- Routine: restampBaseAtRow ---------------------------------------------
+// Entry: X = screen row (1-24), BG_TURRET_POOL_IDX = pool slot.
+restampBaseAtRow:
+    lda starRowLo,x
+    sta rsBaseShadowChar + 1
+    sta rsBaseShadowColour + 1
+    sta rsBaseLiveChar + 1
+    sta rsBaseLiveColour + 1
+    lda starRowHi,x
+    pha
+    clc
+    adc #BG_CHAR_HI_DELTA
+    sta rsBaseShadowChar + 2
+    pla
+    pha
+    clc
+    adc #BG_COLOUR_HI_DELTA
+    sta rsBaseShadowColour + 2
+    pla
+    pha
+    sta rsBaseLiveChar + 2
+    pla
+    clc
+    adc #$d4
+    sta rsBaseLiveColour + 2
+
+    ldy BG_TURRET_POOL_IDX
+    ldx ACTIVE_TURRET_COL,y
+
+    lda ACTIVE_TURRET_HIT_TIMER,y
+    bne !flash+
+    lda ACTIVE_TURRET_DESTROYED,y
+    bne !wreck+
+    lda ACTIVE_TURRET_HEALTH,y
+    cmp #2
+    bcs !normal+
+    lda #235
+    jmp !have+
+!normal:
+    lda #230
+    jmp !have+
+!wreck:
+    lda #236
+    jmp !have+
+!flash:
+    lda ACTIVE_TURRET_DESTROYED,y
+    beq !flashAlive+
+    lda #236
+    jmp !have+
+!flashAlive:
+    lda #230
+!have:
+rsBaseShadowChar:
+    sta $ffff,x
+rsBaseLiveChar:
+    sta $ffff,x
+    lda #5
+rsBaseShadowColour:
+    sta $ffff,x
+rsBaseLiveColour:
+    sta $ffff,x
+    rts
+
+// --- Routine: updateTurrets -------------------------------------------------
+// Per-frame driver for every active turret: decays hit-flash and muzzle
+// timers, re-aims periodically, and attempts fire on its own cadence.
+// Deliberately re-loads BG_TURRET_POOL_IDX from memory before every array
+// access rather than trusting X across the various jsr calls below.
+updateTurrets:
+    lda #0
+    sta BG_TURRET_POOL_IDX
+!loop:
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_STAGE_IDX,x
+    cmp #$ff
+    beq !next+
+    lda ACTIVE_TURRET_DESTROYED,x
+    bne !next+
+
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_HIT_TIMER,x
+    beq !noHitDecay+
+    dec ACTIVE_TURRET_HIT_TIMER,x
+    bne !noHitDecay+
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret             // Flash just ended: restore the normal glyph/colour.
+!noHitDecay:
+
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_MUZZLE,x
+    beq !noMuzzleDecay+
+    dec ACTIVE_TURRET_MUZZLE,x
+    bne !noMuzzleDecay+
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret
+!noMuzzleDecay:
+
+    ldx BG_TURRET_POOL_IDX
+    inc ACTIVE_TURRET_AIM_TIMER,x
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_AIM_TIMER,x
+    cmp #TURRET_AIM_INTERVAL
+    bcc !noAim+
+    ldx BG_TURRET_POOL_IDX
+    lda #0
+    sta ACTIVE_TURRET_AIM_TIMER,x
+    ldx BG_TURRET_POOL_IDX
+    jsr recomputeTurretAim
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret
+!noAim:
+
+    ldx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_FIRE_TIMER,x
+    beq !tryFire+
+    ldx BG_TURRET_POOL_IDX
+    dec ACTIVE_TURRET_FIRE_TIMER,x
+    jmp !next+
+!tryFire:
+    ldx BG_TURRET_POOL_IDX
+    lda #TURRET_FIRE_INTERVAL
+    sta ACTIVE_TURRET_FIRE_TIMER,x
+    ldx BG_TURRET_POOL_IDX
+    jsr fireTurretIfPossible
+
+!next:
+    inc BG_TURRET_POOL_IDX
+    lda BG_TURRET_POOL_IDX
+    cmp #TURRET_POOL_SIZE
+    beq !allDone+
+    jmp !loop-                          // Long loop transfer: body exceeds branch range.
+!allDone:
+    rts
+
+// --- Routine: recomputeTurretAim -------------------------------------------
+// Entry: X = pool slot. Coarse three-sector aim toward the player's current
+// X, mirroring spawnEnemyBullet's signed 9-bit delta handling.
+recomputeTurretAim:
+    stx BG_TURRET_POOL_IDX
+    lda OBJECT_X
+    sec
+    sbc ACTIVE_TURRET_X_LO,x
+    sta BG_SCRATCH
+    lda OBJECT_X_MSB
+    sbc ACTIVE_TURRET_X_MSB,x
+    beq !checkRight+
+    cmp #$ff
+    beq !checkLeft+
+    bmi !aimLeft+
+    jmp !aimRight+
+
+!checkRight:
+    lda BG_SCRATCH
+    cmp #16
+    bcc !aimCentre+
+    jmp !aimRight+
+
+!checkLeft:
+    lda BG_SCRATCH
+    eor #$ff
+    clc
+    adc #1
+    cmp #16
+    bcc !aimCentre+
+
+!aimLeft:
+    ldx BG_TURRET_POOL_IDX
+    lda #0
+    sta ACTIVE_TURRET_AIM,x
+    rts
+!aimCentre:
+    ldx BG_TURRET_POOL_IDX
+    lda #1
+    sta ACTIVE_TURRET_AIM,x
+    rts
+!aimRight:
+    ldx BG_TURRET_POOL_IDX
+    lda #2
+    sta ACTIVE_TURRET_AIM,x
+    rts
+
+// --- Routine: fireTurretIfPossible ------------------------------------------
+// Entry: X = pool slot. Respects the existing global enemy-bullet budget; a
+// turret whose fire request finds no budget simply defers to its next cadence.
+fireTurretIfPossible:
+    lda ENEMY_BULLET_COUNT
+    cmp #MAX_ENEMY_BULLETS
+    bcc !haveBudget+
+    rts
+!haveBudget:
+    jsr spawnTurretBullet
+    bcs !done+                            // Off-screen or no free logical object slot: nothing fired.
+    ldx BG_TURRET_POOL_IDX
+    lda #4
+    sta ACTIVE_TURRET_MUZZLE,x
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret
+!done:
+    rts
+
+// --- Routine: spawnTurretBullet ---------------------------------------------
+// Entry: X = pool slot. Duplicates only the origin-lookup part of
+// spawnEnemyBullet (turrets have no logical object to read X/Y from);
+// otherwise reuses the same findFreeObject allocator and the same
+// chooseEnemyBulletSlope aim quantiser as every other enemy shot, and
+// increments the same ENEMY_BULLET_COUNT. Exit: carry set on failure.
+spawnTurretBullet:
+    stx BG_TURRET_POOL_IDX
+    jsr computeTurretScreenRows
+    lda BG_TURRET_BASE_ROW
+    cmp #1
+    bcs !onScreenLo+
+    jmp !failed+                          // Long: !failed exceeds branch range from here.
+!onScreenLo:
+    cmp #25
+    bcc !onScreen+
+    jmp !failed+
+!onScreen:
+
+    jsr findFreeObject
+    bcc !allocated+
+    jmp !failed+
+!allocated:
+    stx BG_SCRATCH2
+
+    ldy BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_X_LO,y
+    ldx BG_SCRATCH2
+    sta OBJECT_X,x
+    ldy BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_X_MSB,y
+    ldx BG_SCRATCH2
+    sta OBJECT_X_MSB,x
+
+    lda BG_TURRET_BASE_ROW                // Approximate world Y: 58 + (row-1)*8 + 4.
+    sec
+    sbc #1
+    asl
+    asl
+    asl
+    clc
+    adc #62
+    ldx BG_SCRATCH2
+    sta OBJECT_Y,x
+
+    lda #TYPE_ENEMY_BULLET
+    sta OBJECT_TYPE,x
+    lda #enemyBulletSprite / 64
+    sta OBJECT_SPRITE,x
+    sta OBJECT_BASE_SPRITE,x
+    lda #ENEMY_BULLET_COLOUR
+    sta OBJECT_COLOUR,x
+    sta OBJECT_BASE_COLOUR,x
+
+    lda #0
+    sta OBJECT_HEALTH,x
+    sta OBJECT_HIT_TIMER,x
+    sta OBJECT_DEATH_TIMER,x
+    sta OBJECT_PATH_TIMER,x
+    sta OBJECT_PATH_STEP,x
+    sta OBJECT_ACCEL_TIMER,x
+    sta OBJECT_VEL_X,x
+    lda #ENEMY_BULLET_SPEED_Y
+    sta OBJECT_VEL_Y,x
+
+    lda OBJECT_X                           // Aim toward the player, same quantised slope as enemies.
+    sec
+    sbc OBJECT_X,x
+    sta ENEMY_AIM_DELTA_LO
+    lda OBJECT_X_MSB
+    sbc OBJECT_X_MSB,x
+    beq !targetRight+
+    cmp #$ff
+    beq !targetLeft+
+    bmi !farLeft+
+    lda #2
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+!farLeft:
+    lda #$fe
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+!targetRight:
+    lda ENEMY_AIM_DELTA_LO
+    jsr chooseEnemyBulletSlope
+    sta OBJECT_VEL_X,x
+    jmp !activate+
+!targetLeft:
+    lda ENEMY_AIM_DELTA_LO
+    eor #$ff
+    clc
+    adc #1
+    jsr chooseEnemyBulletSlope
+    beq !activate+
+    eor #$ff
+    clc
+    adc #1
+    sta OBJECT_VEL_X,x
+
+!activate:
+    lda #1
+    sta OBJECT_ACTIVE,x
+    inc ENEMY_BULLET_COUNT
+    clc
+    rts
+
+!failed:
+    sec
+    rts
+
+// --- Routine: traceTurretHit -------------------------------------------
+// Entry: HITSCAN_X_LO/HITSCAN_X_MSB set (as tracePlayerCannon uses). Cheap
+// 8px-wide character-cell rectangle test against every on-screen active
+// turret. Exit: HITSCAN_TARGET_TURRET = pool slot and carry clear on hit,
+// carry set on miss. Called from updatePlayerFire only after the normal
+// enemy trace has already missed.
+traceTurretHit:
+    lda #$ff
+    sta HITSCAN_TARGET_TURRET
+    ldx #0
+!scan:
+    stx BG_TURRET_POOL_IDX
+    lda ACTIVE_TURRET_STAGE_IDX,x
+    cmp #$ff
+    beq !next+
+    lda ACTIVE_TURRET_DESTROYED,x
+    bne !next+
+
+    jsr computeTurretScreenRows
+    lda BG_TURRET_HEAD_ROW
+    cmp #1
+    bcc !next+
+    cmp #25
+    bcs !next+
+
+    ldx BG_TURRET_POOL_IDX
+    lda HITSCAN_X_LO
+    sec
+    sbc ACTIVE_TURRET_X_LO,x
+    sta BG_SCRATCH
+    lda HITSCAN_X_MSB
+    sbc ACTIVE_TURRET_X_MSB,x
+    bne !next+
+    lda BG_SCRATCH
+    cmp #8
+    bcs !next+
+
+    ldx BG_TURRET_POOL_IDX
+    stx HITSCAN_TARGET_TURRET
+    clc
+    rts
+
+!next:
+    ldx BG_TURRET_POOL_IDX
+    inx
+    cpx #TURRET_POOL_SIZE
+    bne !scan-
+    sec
+    rts
+
+// --- Routine: damageTurret ---------------------------------------------
+// Entry: HITSCAN_TARGET_TURRET = pool slot. One hit removes 1 HP; at 0 HP
+// the turret stops tracking/firing and becomes a permanent wreck.
+damageTurret:
+    lda HITSCAN_TARGET_TURRET
+    sta BG_TURRET_POOL_IDX
+    tax
+    lda ACTIVE_TURRET_HEALTH,x
+    beq !done+
+    dec ACTIVE_TURRET_HEALTH,x
+    bne !flash+
+
+    lda #1
+    sta ACTIVE_TURRET_DESTROYED,x
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret
+    rts
+!flash:
+    lda #4
+    sta ACTIVE_TURRET_HIT_TIMER,x
+    ldx BG_TURRET_POOL_IDX
+    jsr restampActiveTurret
+!done:
+    rts
+
+BACKGROUND_ENGINE_END:
+.if (BACKGROUND_ENGINE_END > $6000) {
+    .error "Background engine resident code/state exceeds its $4000-$6000 budget"
+}
+
+// ============================================================================
+// BACKGROUND ENGINE: STAGE DATA.
+//
+// Everything from here to STAGE_DATA_END is the "stage package" - the part a
+// future multiload would replace between stages while the resident engine
+// above stays loaded. See docs/background-engine.md for the expected
+// CharPad-derived binary format this would eventually become.
+// ============================================================================
+* = $6000
+STAGE_DATA_START:
+
+// --- Placeholder stage/background characters --------------------------
+// Codes 224-239. Stars remain 240-251. Deliberately crude engineering/test
+// graphics - see docs/background-engine.md for the CharPad replacement path.
+testStageGlyphData:
+    // 224 - dense rocky ground
+    .byte %11111111
+    .byte %11011011
+    .byte %10111101
+    .byte %11100111
+    .byte %11011011
+    .byte %10111101
+    .byte %11100111
+    .byte %11111111
+
+    // 225 - sparse rocky ground
+    .byte %10000001
+    .byte %00100100
+    .byte %01000010
+    .byte %00011000
+    .byte %10000001
+    .byte %00100100
+    .byte %01000010
+    .byte %00000000
+
+    // 226 - technological floor / grid
+    .byte %11111111
+    .byte %10000001
+    .byte %10100101
+    .byte %10000001
+    .byte %11111111
+    .byte %10000001
+    .byte %10100101
+    .byte %10000001
+
+    // 227 - vertical wall/edge
+    .byte %11100000
+    .byte %10100000
+    .byte %11100000
+    .byte %10100000
+    .byte %11100000
+    .byte %10100000
+    .byte %11100000
+    .byte %10100000
+
+    // 228 - horizontal seam / runway stripe
+    .byte %00000000
+    .byte %00000000
+    .byte %11111111
+    .byte %10101010
+    .byte %11111111
+    .byte %00000000
+    .byte %00000000
+    .byte %00000000
+
+    // 229 - crater / broken terrain
+    .byte %00000000
+    .byte %00111100
+    .byte %01000010
+    .byte %10011001
+    .byte %10100101
+    .byte %01000010
+    .byte %00111100
+    .byte %00000000
+
+    // 230 - turret base
+    .byte %00000000
+    .byte %00111100
+    .byte %01111110
+    .byte %11111111
+    .byte %11111111
+    .byte %10111101
+    .byte %11111111
+    .byte %01111110
+
+    // 231 - turret head/barrel pointing left-ish
+    .byte %00000000
+    .byte %00000000
+    .byte %11100000
+    .byte %00111100
+    .byte %00111110
+    .byte %00111100
+    .byte %00000000
+    .byte %00000000
+
+    // 232 - turret head/barrel centred/up
+    .byte %00011000
+    .byte %00011000
+    .byte %00011000
+    .byte %00111100
+    .byte %01111110
+    .byte %00111100
+    .byte %00000000
+    .byte %00000000
+
+    // 233 - turret head/barrel pointing right-ish
+    .byte %00000000
+    .byte %00000000
+    .byte %00000111
+    .byte %00111100
+    .byte %01111100
+    .byte %00111100
+    .byte %00000000
+    .byte %00000000
+
+    // 234 - turret firing / muzzle-flash indicator
+    .byte %00011000
+    .byte %01011010
+    .byte %00111100
+    .byte %11111111
+    .byte %00111100
+    .byte %01011010
+    .byte %00011000
+    .byte %00000000
+
+    // 235 - damaged turret base
+    .byte %00000000
+    .byte %00110100
+    .byte %01101110
+    .byte %11011101
+    .byte %11110111
+    .byte %10101101
+    .byte %11011111
+    .byte %01110110
+
+    // 236 - destroyed turret / wreck
+    .byte %00000000
+    .byte %00000000
+    .byte %01000010
+    .byte %00100100
+    .byte %01111110
+    .byte %10100101
+    .byte %11011011
+    .byte %01111110
+
+    // 237 - small terrain detail
+    .byte %00000000
+    .byte %00000000
+    .byte %00010000
+    .byte %00111000
+    .byte %01111100
+    .byte %00111000
+    .byte %00010000
+    .byte %00000000
+
+    // 238 - alternate structural panel
+    .byte %11111111
+    .byte %10011001
+    .byte %10111101
+    .byte %10100101
+    .byte %10100101
+    .byte %10111101
+    .byte %10011001
+    .byte %11111111
+
+    // 239 - reserved/test marker
+    .byte %10000001
+    .byte %01000010
+    .byte %00100100
+    .byte %00011000
+    .byte %00011000
+    .byte %00100100
+    .byte %01000010
+    .byte %10000001
+TEST_STAGE_GLYPH_DATA_END:
+.if ((TEST_STAGE_GLYPH_DATA_END - testStageGlyphData) != STAGE_GLYPH_BYTES) {
+    .error "testStageGlyphData is not exactly 16 characters"
+}
+
+// --- Metatile definitions -----------------------------------------------
+// Each metatile is 4x4 characters (32x32 px), row-major, top-left first.
+// Metatile colour tables are the same shape, one VIC colour value per cell.
+// ID order below matches metaCharPtrLo/Hi / metaColourPtrLo/Hi.
+
+// Meta 0: completely empty sky.
+bgMetaSky:
+    .byte 32,32,32,32
+    .byte 32,32,32,32
+    .byte 32,32,32,32
+    .byte 32,32,32,32
+bgMetaSkyColour:
+    .byte 0,0,0,0
+    .byte 0,0,0,0
+    .byte 0,0,0,0
+    .byte 0,0,0,0
+
+// Meta 1: solid rough ground.
+bgMetaRock:
+    .byte 224,225,224,225
+    .byte 225,224,225,224
+    .byte 224,224,225,224
+    .byte 225,224,224,225
+bgMetaRockColour:
+    .byte 9,9,9,9
+    .byte 9,9,9,9
+    .byte 9,9,9,9
+    .byte 9,9,9,9
+
+// Meta 2: technological/grid area.
+bgMetaTech:
+    .byte 226,226,228,226
+    .byte 226,238,238,226
+    .byte 228,238,238,228
+    .byte 226,226,228,226
+bgMetaTechColour:
+    .byte 3,3,3,3
+    .byte 3,3,3,3
+    .byte 3,3,3,3
+    .byte 3,3,3,3
+
+// Meta 3: rocky edge with sky/open cells on the right.
+bgMetaBrokenEdgeR:
+    .byte 224,225,32,32
+    .byte 225,224,225,32
+    .byte 224,225,224,32
+    .byte 225,224,224,225
+bgMetaBrokenEdgeRColour:
+    .byte 9,9,0,0
+    .byte 9,9,9,0
+    .byte 9,9,9,0
+    .byte 9,9,9,9
+
+// Meta 4: crater/detail.
+bgMetaCrater:
+    .byte 224,225,224,225
+    .byte 225,229,229,224
+    .byte 224,229,229,225
+    .byte 225,224,225,224
+bgMetaCraterColour:
+    .byte 9,9,9,9
+    .byte 9,8,8,9
+    .byte 9,8,8,9
+    .byte 9,9,9,9
+
+// Meta 5: rocky edge with sky/open cells on the left (mirror of meta 3).
+bgMetaBrokenEdgeL:
+    .byte 32,32,225,224
+    .byte 32,225,224,225
+    .byte 32,224,225,224
+    .byte 225,224,224,225
+bgMetaBrokenEdgeLColour:
+    .byte 0,0,9,9
+    .byte 0,9,9,9
+    .byte 0,9,9,9
+    .byte 9,9,9,9
+
+// Meta 6: rock band sinking into open sky below (a coastline landmark).
+bgMetaRockSkyHalf:
+    .byte 224,225,224,225
+    .byte 225,224,225,224
+    .byte 32,32,32,32
+    .byte 32,32,32,32
+bgMetaRockSkyHalfColour:
+    .byte 9,9,9,9
+    .byte 9,9,9,9
+    .byte 0,0,0,0
+    .byte 0,0,0,0
+
+// Meta 7: mirror of meta 6 - sky above, rock band below.
+bgMetaSkyRockHalf:
+    .byte 32,32,32,32
+    .byte 32,32,32,32
+    .byte 224,225,224,225
+    .byte 225,224,225,224
+bgMetaSkyRockHalfColour:
+    .byte 0,0,0,0
+    .byte 0,0,0,0
+    .byte 9,9,9,9
+    .byte 9,9,9,9
+
+metaCharPtrLo:
+    .byte <bgMetaSky, <bgMetaRock, <bgMetaTech, <bgMetaBrokenEdgeR
+    .byte <bgMetaCrater, <bgMetaBrokenEdgeL, <bgMetaRockSkyHalf, <bgMetaSkyRockHalf
+metaCharPtrHi:
+    .byte >bgMetaSky, >bgMetaRock, >bgMetaTech, >bgMetaBrokenEdgeR
+    .byte >bgMetaCrater, >bgMetaBrokenEdgeL, >bgMetaRockSkyHalf, >bgMetaSkyRockHalf
+metaColourPtrLo:
+    .byte <bgMetaSkyColour, <bgMetaRockColour, <bgMetaTechColour, <bgMetaBrokenEdgeRColour
+    .byte <bgMetaCraterColour, <bgMetaBrokenEdgeLColour, <bgMetaRockSkyHalfColour, <bgMetaSkyRockHalfColour
+metaColourPtrHi:
+    .byte >bgMetaSkyColour, >bgMetaRockColour, >bgMetaTechColour, >bgMetaBrokenEdgeRColour
+    .byte >bgMetaCraterColour, >bgMetaBrokenEdgeLColour, >bgMetaRockSkyHalfColour, >bgMetaSkyRockHalfColour
+.const META_COUNT = 8
+
+// --- Test stage map -------------------------------------------------------
+// BG_MAP_ROWS (80) metatile rows x BG_MAP_COLS (10), row-major. Built from
+// one 16-row deterministic "phrase" repeated 5 times (5*16=80): open sky,
+// a rising/falling rock island, a floating tech island with a symmetric
+// landmark row, two separated rock outcrops (an irregular coastline), and a
+// tech strip with a gap - repetition is deliberate so any wrap/corruption
+// bug shows up as a broken cycle rather than hiding in one screen's worth
+// of unique content.
+.var stagePhrase = List()
+.eval stagePhrase.add(0,0,0,0,0,0,0,0,0,0)
+.eval stagePhrase.add(0,0,6,1,1,1,1,6,0,0)
+.eval stagePhrase.add(0,5,1,1,4,1,1,1,3,0)
+.eval stagePhrase.add(0,5,1,1,1,1,1,1,3,0)
+.eval stagePhrase.add(0,7,1,1,1,1,1,1,7,0)
+.eval stagePhrase.add(0,0,0,0,0,0,0,0,0,0)
+.eval stagePhrase.add(0,0,0,2,2,2,2,0,0,0)
+.eval stagePhrase.add(0,0,5,2,2,2,2,3,0,0)
+.eval stagePhrase.add(0,0,0,7,2,2,7,0,0,0)          // Landmark row: symmetric floating tech island.
+.eval stagePhrase.add(0,0,0,0,0,0,0,0,0,0)
+.eval stagePhrase.add(0,1,1,0,0,0,0,1,1,0)
+.eval stagePhrase.add(5,1,1,1,0,0,1,1,1,3)
+.eval stagePhrase.add(0,0,0,0,0,0,0,0,0,0)
+.eval stagePhrase.add(2,2,3,0,0,0,5,2,2,2)
+.eval stagePhrase.add(2,2,2,2,0,0,2,2,2,2)
+.eval stagePhrase.add(0,0,0,0,0,0,0,0,0,0)
+
+stageMap:
+.for (var rep = 0; rep < 5; rep++) {
+    .for (var row = 0; row < 16; row++) {
+        .for (var col = 0; col < 10; col++) {
+            .byte stagePhrase.get(row * 10 + col)
+        }
+    }
+}
+STAGE_MAP_END:
+.if ((STAGE_MAP_END - stageMap) != (BG_MAP_ROWS * BG_MAP_COLS)) {
+    .error "stageMap size does not match BG_MAP_ROWS * BG_MAP_COLS"
+}
+
+// --- Stage turret placements -----------------------------------------------
+// One record per placement: metatile row, head sub-row (0-2, base = +1),
+// fixed screen column (0-39 - there is no horizontal scroll), type (reserved
+// for future entity variants). Four placements deliberately spread across
+// the map, one per repeat of the phrase's rock band, to exercise the full
+// TURRET_POOL_SIZE pool and confirm multiple turrets never corrupt each
+// other's state.
+stageTurrets:
+    .byte  2, 1, 4, 0
+    .byte 18, 1, 1, 0
+    .byte 34, 1, 8, 0
+    .byte 66, 1, 4, 0
+STAGE_TURRETS_END:
+.if ((STAGE_TURRETS_END - stageTurrets) != (STAGE_TURRET_COUNT * TURRET_STAGE_STRIDE)) {
+    .error "stageTurrets size does not match STAGE_TURRET_COUNT"
+}
+
+STAGE_DATA_END:
+.if (STAGE_DATA_END > $A000) {
+    .error "Stage package data runs into the BASIC ROM shadow at $A000"
 }
