@@ -16,6 +16,11 @@
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
+.const DEBUG_PLAYER_INVULNERABLE = 1          // 0 = normal: collisions can kill the player.
+                                               // 1 = development: capturePlayerCollision still reads/clears
+                                               // $D01E and runs every overlap test, but never sets PLAYER_HIT,
+                                               // so unattended scrolling tests can run indefinitely. Compile-
+                                               // time only - see the !hit branch in capturePlayerCollision.
 .const SCORE_SCREEN = $0400 + 29              // Top row, right-aligned: "SCORE 00000".
 .const SCORE_COLOUR = $d800 + 29
 .const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
@@ -26,6 +31,45 @@
 .const GAME_OVER_HOLD_FRAMES = 180                 // ~3.6 PAL seconds on the GAME OVER screen.
 .const HEALTH_SPRITE_BASE = $3000                // Private per-object sprite copies live at $3000-$33ff.
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
+
+// ============================================================================
+// MINIMAL scrolling-background prototype.
+// Deliberately narrow goal: prove a vertically scrolling character
+// background can coexist cleanly with the existing sprite multiplexer,
+// without touching its own scheduling. See docs/background-engine.md for
+// the milestone plan. No raster split, second screen or double buffering:
+// all 25 rows at $0400 scroll. Two diagnostic character patches compensate
+// for that motion; see docs/hud-architecture.md. Explicitly NOT here: starfield-
+// during-PLAYING (see startGame), turrets, entities, hitscan-vs-scenery,
+// per-cell colour, stage completion, CharPad, multiload, compression.
+// ============================================================================
+.const BG_SCREEN_A = $0400
+.const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
+                                                     // colour RAM work at all, scrolling or otherwise.
+.const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
+
+// 4x4 character metatile stage (stage_test.asm): a metatile stage row is
+// METATILES_PER_ROW IDs wide (one screen width); a metatile stage row
+// expands to METATILE_H character rows. Declared here (not in
+// stage_test.asm) because decodeStageCharacterRow, below, references
+// these before that file is imported.
+.const METATILE_W = 4
+.const METATILE_H = 4
+.const METATILES_PER_ROW = 10                       // 40 / METATILE_W: metatiles spanning one screen width.
+.const METATILE_DEF_COUNT = 12                       // Distinct 4x4 tile definitions in the test stage.
+.const STAGE_METATILE_ROWS = 20                      // Metatile rows in the test stage (80 character rows -
+                                                      // well past the 25 visible, so multiple coarse
+                                                      // transitions occur before the stage wraps).
+.const STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H // Total logical character rows (80).
+.if (METATILES_PER_ROW * METATILE_W != 40) {
+    .error "METATILES_PER_ROW * METATILE_W must tile the 40-column screen exactly"
+}
+.if (METATILE_DEF_COUNT > 16) {
+    .error "METATILE_DEF_COUNT > 16: id*16 no longer fits an 8-bit metatileDefs offset"
+}
+.if (STAGE_METATILE_ROWS * METATILES_PER_ROW > 256) {
+    .error "stageMetatileRows table no longer fits an 8-bit index"
+}
 
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
@@ -182,6 +226,17 @@ init:
     ora #%00001110                          // Character set at $3800 within VIC bank 0.
     sta VIC_MEMORY_SETUP
 
+    // Permanent 24-row display. KERNAL reset leaves $D011 = $1B (RSEL=1);
+    // clearing RSEL fixes the visible aperture at raster 55..246, which lies
+    // wholly inside fetched terrain for every fine phase and so hides both the
+    // top and bottom scroll-edge artefacts (docs/scroll-edge-investigation.md).
+    // DEN, YSCROL and the raster-compare MSB are left as the KERNAL set them;
+    // every later $D011 write (applyFineScroll, armFirstBatch, endGame) masks
+    // bit 3, so RSEL stays 0 for the whole run.
+    lda VIC_CONTROL_1
+    and #%11110111
+    sta VIC_CONTROL_1
+
     lda #0
     sta BORDER_COLOUR                       // Black border.
     sta BACKGROUND_COLOUR                   // Black playfield.
@@ -201,7 +256,10 @@ init:
 startGame:
     lda #147                                // Wipe any menu / high-score text from screen RAM.
     jsr $ffd2
-    jsr drawStarfield                       // Repaint every star over the freshly cleared screen.
+    // Starfield deliberately NOT repainted here: it is disabled for the
+    // duration of PLAYING while the scrolling background is prototyped
+    // (see docs/background-engine.md, minimal-prototype milestones). Menu
+    // and GAME OVER still call drawStarfield/updateStarfield as before.
 
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
@@ -255,6 +313,8 @@ startGame:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
+    jsr initBackground                      // Paint the diagnostic background in the single $0400 matrix.
+
     lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
     sta GAME_STATE
     rts
@@ -290,8 +350,12 @@ mainLoop:
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment. No raster
+                                             // split, no IRQ: the whole 25-row screen scrolls together.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr drawHudDiagnostic                  // Four character cells; never takes ownership of a hardware sprite.
+    jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
 
 !frameLoop:
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
@@ -308,17 +372,22 @@ gameLoop:
 !stillPlaying:
 
     jsr updateSpawner                       // Periodically create a new enemy.
-    jsr updateStarfield                     // Scroll and twinkle the character background.
+    // updateStarfield deliberately not called during PLAYING - see startGame.
+    jsr updateBackgroundScroll              // Prepare the next fine phase; request a coarse transition on wrap.
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
+    jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
 
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
+    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr drawHudDiagnostic                  // Publish phase-compensated markers before row 3 is fetched.
+    jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
 
 // --- Routine: endGame ---------------------------------------------------
@@ -343,6 +412,11 @@ endGame:
     lda #0
     sta SPRITE_ENABLE                       // Hide every hardware sprite.
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
+
+    lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
+    and #%11111000                          // OVER/menu - applyFineScroll (PLAYING only) may have
+    ora #3                                  // left this at any of 0-7. Bit 3 (RSEL) is preserved,
+    sta VIC_CONTROL_1                       // so the 24-row mode set in init stays in effect.
 
     lda #GAME_STATE_GAME_OVER
     sta GAME_STATE
@@ -2619,6 +2693,11 @@ setupLivesDisplay:
 // Current design only needs a single decimal digit; later upgrades/continues
 // can replace this if we ever allow more than nine ships.
 displayLives:
+    lda GAME_STATE                          // The diagnostic background owns every character during PLAYING.
+    cmp #GAME_STATE_PLAYING
+    bne !draw+
+    rts
+!draw:
     lda PLAYER_LIVES
     clc
     adc #48
@@ -2675,6 +2754,11 @@ awardKillScore:
 // Convert the 16-bit binary score to five decimal digits at SCORE_SCREEN+6.
 // The existing decimal divisor table is shared with the FREE-cycle display.
 displayScore:
+    lda GAME_STATE                          // Keep scoring, but leave the scrolling matrix alone.
+    cmp #GAME_STATE_PLAYING
+    bne !draw+
+    rts
+!draw:
     lda SCORE_LO
     sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
     lda SCORE_HI
@@ -2744,7 +2828,8 @@ updateCycleDebug:
     cmp #DEBUG_FRAMES                       // Has roughly one PAL second elapsed?
     bne !sample+                            // If not, skip the relatively expensive decimal display update.
 
-    jsr displayCycleMinimum                 // Display the worst free-cycle figure from the previous interval.
+    // No displayCycleMinimum during PLAYING: retain the RAM measurement,
+    // but the diagnostic background owns the entire screen (no fixed HUD).
     lda #0                                  // Begin a fresh 50-frame interval.
     sta DEBUG_FRAME_COUNT                   // Reset the frame counter.
     lda #$ff                                // Reset the rolling minimum to the largest possible 16-bit value.
@@ -2952,6 +3037,7 @@ renderSprites:
     sta SPRITE_OVERFLOW_REGISTER            // A is already zero
     rts                                     // Return to the calling routine.
 
+
 // --- Routine: armFirstBatch -------------------------------------------------
 // Install/arm LIVE_PLAN's first raster batch, if one exists.
 armFirstBatch:
@@ -3101,6 +3187,7 @@ multiplexIRQ:
     sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
     jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
 
+
 // --- Routine: capturePlayerCollision ---------------------------------------
 // $d01e remains the cheap hardware broad phase.  If the player's current VIC
 // slot participated, scan logical gameplay objects and let compact helper
@@ -3141,9 +3228,12 @@ capturePlayerCollision:
     jsr checkBulletPlayerOverlap            // Carry set means the small projectile box overlaps the player.
     bcc !next+
 
-!hit:
+!hit:                                        // $D01E is already consumed and every overlap test above still
+                                              // ran; only the final state change is compile-time suppressed.
+.if (DEBUG_PLAYER_INVULNERABLE == 0) {
     lda #1
     sta PLAYER_HIT
+}
     rts
 
 !next:
@@ -3711,6 +3801,34 @@ PATH_ABS_X:           .byte 0              // Main-thread scratch used by direct
 BATCH_COUNT:           .fill 16, 0
 BATCH_INDEX:           .byte 0
 BATCH_RASTER:          .fill 16, 0
+
+// --- Minimal background-scroll state -------------------------------------
+// No raster split or second screen. The HUD compensates in character data.
+// $D011 bits 0-2 (YSCROL) are written once per presented frame from the main loop -
+// no IRQ of any kind is armed for the background. The sprite multiplexer
+// (armFirstBatch/multiplexIRQ, above) is untouched, byte-for-byte
+// identical to the pre-background baseline.
+SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
+SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the WHOLE screen.
+SCROLL_ROW:            .byte 0          // Logical stage row index (0..STAGE_LOGICAL_ROWS-1) currently
+                                         // shown at screen row 0. See renderStageRowToScreen below.
+BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
+BG_CROSSING_ROW:       .fill 40, 0      // 40-byte holding buffer for the one row (old 12 -> new 13)
+                                         // that crosses the upper/lower coarse-copy split. Generic:
+                                         // holds whatever bytes were actually on screen, not an ID.
+                                         // Physical/already-visible data only - never aliased with
+                                         // BG_INCOMING_ROW (declared below, near BG_COARSE_PENDING;
+                                         // this tight $2000-$2400 block had no room left for another
+                                         // 40 bytes, so only this routine's small scratch bytes live here).
+BG_LOGICAL_ROW:        .byte 0          // Entry param for decodeStageCharacterRow: absolute logical
+                                         // stage row to decode (0..STAGE_LOGICAL_ROWS-1).
+BG_TILE_ROW_OFS:       .byte 0          // Scratch: (logical row mod METATILE_H) * METATILE_W.
+BG_METATILE_ROW:       .byte 0          // Scratch: logical row / METATILE_H.
+BG_ROW_BASE:           .byte 0          // Scratch: BG_METATILE_ROW * METATILES_PER_ROW (stageMetatileRows
+                                         // index of this logical row's column 0).
+BG_COL:                .byte 0          // Scratch: metatile column counter (0..METATILES_PER_ROW-1).
+BG_DEF_BASE:           .byte 0          // Scratch: metatileDefs offset of the current column's 4-byte slice.
+BG_OUT_BASE:           .byte 0          // Scratch: BG_INCOMING_ROW offset of the current column.
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
 ASSIGN_SLOT:           .fill 16, $ff
@@ -4554,4 +4672,445 @@ healthSpritePool:
 HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
+}
+
+// ============================================================================
+// Single-screen diagnostic scrolling. Ordinary main-loop work only; no
+// screen flip, colour scroll, background IRQ, shadow or temporary row buffer.
+// Two in-place portions straddle presentation; see docs/background-engine.md.
+// Control fits in the existing gap below health sprites; unrolled copies
+// live outside VIC bank 0, where there is room to keep the cycle count simple.
+// ============================================================================
+* = $2920
+
+// --- Routine: applyFineScroll -----------------------------------------------
+// Writes SCROLL_FINE into $D011 bits 0-2, retaining the display mode bits.
+// $D011 bit 7 reads current raster high, but writes IRQ compare high.
+// This read/write is safe here because the call is at
+// raster 0, so the read high bit equals the scheduler's below-256 compare
+// high bit. It would NOT preserve that compare bit at arbitrary rasters.
+// Called once per presented frame from gameLoop. This
+// is the only background write to $D011 - no split, no second
+// value, no IRQ of any kind armed for it.
+applyFineScroll:
+    sei
+    lda VIC_CONTROL_1
+    and #%11111000
+    ora SCROLL_FINE
+    sta VIC_CONTROL_1
+    cli
+    rts
+
+// --- Routine: initBackground -----------------------------------------------
+// Fill one screen and fixed colour RAM from the 4x4 metatile test stage
+// (metatileDefs/stageMetatileRows, stage_test.asm) via renderStageRowToScreen
+// - the same routine consumed later by the scroller, so the initial screen
+// and the scrolled-in rows are never two different representations.
+initBackground:
+    jsr initHudDiagnostic
+    lda #0
+    sta SCROLL_FRAME_COUNT
+    sta SCROLL_FINE
+    sta BG_COARSE_PENDING
+    sta BG_COARSE_FINISH
+    sta BG_COARSE_DEFERRED
+    lda #0
+    sta SCROLL_ROW                           // Initial stage position: logical row 0 begins at screen row 0.
+
+    ldx #15                                 // Two unused glyphs in the existing RAM charset, reused
+!glyphLoop:                                 // as rail/diagonal glyphs by the metatile test stage.
+    lda bgDiagnosticGlyphs,x
+    sta STAR_CHARSET + 224 * 8,x
+    dex
+    bpl !glyphLoop-
+
+    ldx #0
+!colourFill:
+    lda #TERRAIN_COLOUR
+    sta $d800,x
+    sta $d800 + 250,x
+    sta $d800 + 500,x
+    sta $d800 + 750,x
+    inx
+    cpx #250
+    bne !colourFill-
+
+    ldx #0
+!rowLoop:
+    stx BG_DEST_ROW
+    jsr renderStageRowToScreen
+    ldx BG_DEST_ROW
+    inx
+    cpx #25
+    bne !rowLoop-
+    lda #0                                   // SCROLL_ROW always identifies the logical row at row 0;
+    sta SCROLL_ROW                           // unchanged by the fill above, exactly like renderStageRowToScreen expects.
+    rts
+
+// --- Routine: renderStageRowToScreen -----------------------------------------
+// Entry: BG_DEST_ROW (0-24) = destination screen row.
+//        SCROLL_ROW (0..STAGE_LOGICAL_ROWS-1) = logical stage row currently
+//        shown at screen row 0. The source row is (SCROLL_ROW + BG_DEST_ROW)
+//        mod STAGE_LOGICAL_ROWS - the same SCROLL_ROW + BG_DEST_ROW
+//        addressing the old raw-row provider used, just now resolving a
+//        logical row to decode instead of a table row to copy directly. The
+//        sum never exceeds 2*STAGE_LOGICAL_ROWS-1, so a single conditional
+//        subtraction is a complete modulo. Same entry contract as the old
+//        copyStageRowToScreen it replaces.
+renderStageRowToScreen:
+    lda SCROLL_ROW
+    clc
+    adc BG_DEST_ROW
+    cmp #STAGE_LOGICAL_ROWS
+    bcc !noWrapSrc+
+    sbc #STAGE_LOGICAL_ROWS                 // Carry is set here (CMP just confirmed A >= STAGE_LOGICAL_ROWS).
+!noWrapSrc:
+    sta BG_LOGICAL_ROW
+    jsr decodeStageCharacterRow             // Expand the metatile stage into BG_INCOMING_ROW.
+    jsr copyIncomingRowToScreen              // Then copy that generic 40-byte buffer to screen.
+    rts
+
+// --- Routine: decodeStageCharacterRow -----------------------------------------
+// Entry: BG_LOGICAL_ROW (0..STAGE_LOGICAL_ROWS-1) = absolute logical
+//        character row to expand. Exit: BG_INCOMING_ROW holds 40 generic
+//        character bytes. Does not touch screen RAM, colour RAM, $D011,
+//        raster IRQs or sprite state - only BG_INCOMING_ROW and its own
+//        scratch variables.
+//
+// STAGE_METATILE_ROWS*METATILE_H == STAGE_LOGICAL_ROWS exactly (see the
+// .const block above), so plain / and mod by METATILE_H (a power of two)
+// select the metatile row and internal row with no separate wrap case:
+// logical row 0 -> metatile row 0 internal row 0; STAGE_LOGICAL_ROWS-1 ->
+// the last metatile row, internal row METATILE_H-1.
+//
+// Both lookup tables are guarded to fit an 8-bit index (see .const block),
+// so plain absolute,X/Y addressing replaces a runtime multiply throughout:
+// metatileRow*METATILES_PER_ROW selects this row's 10 metatile IDs directly
+// out of stageMetatileRows, and id*METATILE_W*METATILE_H (+ internal-row
+// offset) selects a definition's 4-byte slice directly out of metatileDefs.
+decodeStageCharacterRow:
+    lda BG_LOGICAL_ROW
+    and #METATILE_H - 1
+    asl
+    asl
+    sta BG_TILE_ROW_OFS                      // (logical row mod METATILE_H) * METATILE_W
+
+    lda BG_LOGICAL_ROW
+    lsr
+    lsr
+    sta BG_METATILE_ROW                      // logical row / METATILE_H
+    asl
+    sta BG_ROW_BASE                          // metatileRow * 2
+    lda BG_METATILE_ROW
+    asl
+    asl
+    asl                                      // metatileRow * 8
+    clc
+    adc BG_ROW_BASE
+    sta BG_ROW_BASE                          // metatileRow*8 + metatileRow*2 = metatileRow*METATILES_PER_ROW
+
+    lda #0
+    sta BG_COL
+!colLoop:
+    lda BG_ROW_BASE
+    clc
+    adc BG_COL
+    tax
+    lda stageMetatileRows,x                  // This column's metatile ID (0..METATILE_DEF_COUNT-1).
+    asl
+    asl
+    asl
+    asl                                      // id * (METATILE_W * METATILE_H) = id * 16.
+    clc
+    adc BG_TILE_ROW_OFS
+    sta BG_DEF_BASE                          // metatileDefs offset of this tile's internal-row slice.
+
+    lda BG_COL
+    asl
+    asl
+    sta BG_OUT_BASE                          // BG_INCOMING_ROW offset for this column (col * METATILE_W).
+
+    ldy BG_DEF_BASE
+    ldx BG_OUT_BASE
+    .for (var s = 0; s < METATILE_W; s++) {
+        lda metatileDefs,y
+        sta BG_INCOMING_ROW,x
+        .if (s < METATILE_W - 1) {
+            iny
+            inx
+        }
+    }
+
+    inc BG_COL
+    lda BG_COL
+    cmp #METATILES_PER_ROW
+    bne !colLoop-
+    rts
+
+// --- Routine: copyIncomingRowToScreen -----------------------------------------
+// Entry: BG_DEST_ROW (0-24) = destination screen row. Copies the generic
+// 40-byte BG_INCOMING_ROW (already decoded by decodeStageCharacterRow) to
+// that screen row. Only screen RAM is written; neither colour RAM nor
+// sprite pointers change. This routine has no idea what the bytes mean or
+// where they came from.
+copyIncomingRowToScreen:
+    ldy BG_DEST_ROW
+    lda starRowLo,y
+    sta TEXT_DST
+    lda starRowHi,y
+    sta TEXT_DST + 1
+
+    ldy #39
+!copyLoop:
+    lda BG_INCOMING_ROW,y
+    sta (TEXT_DST),y
+    dey
+    bpl !copyLoop-
+    rts
+
+bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) glyph bitmaps, reused by
+    .byte $18,$18,$18,$18,$18,$18,$18,$18   // the metatile test stage below.
+    .byte $80,$40,$20,$10,$08,$04,$02,$01
+
+// --- Routine: updateBackgroundScroll ---------------------------------------
+// Advance 1px every SCROLL_FRAME_DIVIDER frames. A wrap is only published
+// after prepareBackgroundCoarse has updated the upper matrix behind the beam.
+updateBackgroundScroll:
+    inc SCROLL_FRAME_COUNT
+    lda SCROLL_FRAME_COUNT
+    cmp #SCROLL_FRAME_DIVIDER
+    bcc !done+
+    lda #0
+    sta SCROLL_FRAME_COUNT
+    lda SCROLL_FINE
+    cmp #7
+    beq !coarse+
+    inc SCROLL_FINE
+    rts
+!coarse:
+    lda #1
+    sta BG_COARSE_PENDING
+!done:
+    rts
+
+// --- Routine: prepareBackgroundCoarse --------------------------------------
+// At YSCROL=7 the VIC fetches row 12 on line 151. From line 152 onward,
+// rows 0-12 can change without affecting this frame (the VIC caches row 12).
+// Keep the old lower rows until the NEXT frame. Their one crossing row (old
+// row 12) is physically saved into BG_CROSSING_ROW before shiftBackgroundUpper
+// overwrites it, so the bytes need not be reproducible from any formula.
+// Called AFTER BUILD preparation, before the unchanged frame-start wait.
+prepareBackgroundCoarse:
+    lda BG_COARSE_PENDING
+    beq !done+
+    lda #0
+    sta BG_COARSE_PENDING
+
+    lda VIC_CONTROL_1                       // Do not start late and run over sprite presentation at line 0.
+    bmi !defer+
+    lda RASTER
+    cmp #200
+    bcs !defer+
+!waitRead:
+    lda RASTER
+    cmp #152
+    bcc !waitRead-
+
+    jsr restoreHudTerrain                  // HUD rows have been fetched; copy only the original terrain.
+    jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
+    jsr shiftBackgroundUpper
+bgUpperCopied:
+    lda SCROLL_ROW                          // New scenery enters ABOVE the previous top row: step the
+    bne !stageNoWrap+                       // logical stage position back one row, wrapping 0 ->
+    lda #STAGE_LOGICAL_ROWS                 // STAGE_LOGICAL_ROWS-1 (same direction as the original
+!stageNoWrap:                               // mod-256 diagnostic decrement, just bounded to the
+    sec                                     // metatile-expanded stage's actual logical height).
+    sbc #1
+    sta SCROLL_ROW
+    lda #0
+    sta BG_DEST_ROW
+    jsr renderStageRowToScreen
+bgUpperReady:
+    lda #0
+    sta SCROLL_FINE                         // Published by applyFineScroll at the next raster 0.
+    lda #1
+    sta BG_COARSE_FINISH
+!done:
+    rts
+!defer:
+    inc BG_COARSE_DEFERRED                  // Diagnostic counter: preserve a whole old frame if overloaded.
+    lda #SCROLL_FRAME_DIVIDER - 1
+    sta SCROLL_FRAME_COUNT                  // Retry next frame; no matrix or VIC phase has changed.
+    rts
+
+// --- Routine: finishBackgroundCoarse ---------------------------------------
+// Called immediately AFTER armFirstBatch. Fine 0 is already set. The VIC
+// will not fetch row 13 until line 152, leaving ample time for this half.
+// Move rows 23->24 down through 13->14 (this reads old row 13 as the source
+// for new row 14, so it must run BEFORE row 13 is overwritten below), then
+// restore the row 12 bytes saved by prepareBackgroundCoarse into row 13.
+finishBackgroundCoarse:
+    lda BG_COARSE_FINISH
+    beq !done+
+    lda #0
+    sta BG_COARSE_FINISH
+    jsr shiftBackgroundLower
+    jsr restoreCrossingRow
+bgLowerReady:
+!done:
+    rts
+
+// Two static character markers at raster 80..87, columns 2 and 31.
+// All 25 rows still scroll normally. Pre-shifted glyphs cancel their phase;
+// saved cells keep the in-place coarse copy free of HUD trails. No IRQ,
+// VIC register, colour RAM, score or lives changes. Sprites can cover them.
+// Ownership/timing model: docs/hud-architecture.md.
+.const HUD_GLYPH_BASE = 128
+.var hudCells = List().add(BG_SCREEN_A + 3*40 + 2, BG_SCREEN_A + 4*40 + 2,
+                          BG_SCREEN_A + 3*40 + 31, BG_SCREEN_A + 4*40 + 31)
+initHudDiagnostic:
+    lda #0
+    sta HUD_PATCHED
+    ldx #0
+!glyphs:
+    lda hudDiagnosticGlyphs,x
+    sta STAR_CHARSET + HUD_GLYPH_BASE*8,x
+    inx
+    bne !glyphs-
+    rts
+
+drawHudDiagnostic:
+    lda HUD_PATCHED
+    bne !draw+
+    .for (var cell = 0; cell < hudCells.size(); cell++) {
+        lda hudCells.get(cell)
+        sta HUD_TERRAIN + cell
+    }
+    lda #1
+    sta HUD_PATCHED
+!draw:
+    lda SCROLL_FINE
+    asl
+    clc
+    adc #HUD_GLYPH_BASE
+    sta hudCells.get(0)
+    adc #1                                  // Codes stay below 256; carry remains clear throughout.
+    sta hudCells.get(1)
+    adc #15
+    sta hudCells.get(2)
+    adc #1
+    sta hudCells.get(3)
+hudDiagnosticReady:
+    rts
+
+restoreHudTerrain:
+    lda HUD_PATCHED
+    beq !done+
+    .for (var cell = 0; cell < hudCells.size(); cell++) {
+        lda HUD_TERRAIN + cell
+        sta hudCells.get(cell)
+    }
+    lda #0
+    sta HUD_PATCHED
+!done:
+    rts
+
+HUD_PATCHED: .byte 0
+HUD_TERRAIN: .fill 4, 0
+
+BG_COARSE_PENDING:     .byte 0
+BG_COARSE_FINISH:      .byte 0
+BG_COARSE_DEFERRED:    .byte 0
+BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data not yet on screen:
+                                         // decodeStageCharacterRow expands one logical stage row here;
+                                         // copyIncomingRowToScreen then copies it to a screen row. Never
+                                         // touched by the crossing-row save/restore mechanism (that
+                                         // buffer, BG_CROSSING_ROW, lives separately near SCROLL_ROW).
+BACKGROUND_CONTROL_END:
+.if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
+    .error "Background control code overlaps health sprite RAM"
+}
+
+// Code only, outside VIC bank 0. Plenty of RAM: absolute LDA/STA pairs make
+// each copied byte exactly 8 CPU cycles, with no indexed page penalties.
+// Interrupts remain enabled. Neither copy reaches $07e8-$07ff / sprite pointers.
+* = $4000
+shiftBackgroundUpper:
+    .for (var row = 12; row >= 1; row--) {
+        .for (var col = 0; col < 40; col++) {
+            lda BG_SCREEN_A + (row - 1) * 40 + col
+            sta BG_SCREEN_A + row * 40 + col
+        }
+    }
+    rts                                     // 480 bytes: 3840 cycles + RTS.
+shiftBackgroundLower:
+    .for (var row = 24; row >= 14; row--) {
+        .for (var col = 0; col < 40; col++) {
+            lda BG_SCREEN_A + (row - 1) * 40 + col
+            sta BG_SCREEN_A + row * 40 + col
+        }
+    }
+    rts                                     // 440 bytes: 3520 cycles + RTS.
+
+// Generic crossing-row preservation: the one row that straddles the
+// upper/lower coarse-copy split (old row 12 -> new row 13) is saved and
+// restored as plain bytes instead of being regenerated from SCROLL_ROW, so
+// arbitrary screen content (not just the diagnostic pattern) survives a
+// coarse transition unchanged.
+saveCrossingRow:
+    .for (var col = 0; col < 40; col++) {
+        lda BG_SCREEN_A + 12 * 40 + col
+        sta BG_CROSSING_ROW + col
+    }
+    rts                                     // 40 bytes: 320 cycles + RTS.
+restoreCrossingRow:
+    .for (var col = 0; col < 40; col++) {
+        lda BG_CROSSING_ROW + col
+        sta BG_SCREEN_A + 13 * 40 + col
+    }
+    rts                                     // 40 bytes: 320 cycles + RTS.
+BACKGROUND_CODE_END:
+.if (BACKGROUND_CODE_END > $a000) {
+    .error "Background copy code overlaps BASIC ROM"
+}
+
+// Metatile stage assets (metatileDefs, stageMetatileRows - literal data
+// only). Placed immediately after the unrolled copy code so they cannot
+// collide with $3000-$33ff (health sprites), $3800-$3fff (charset), screen
+// RAM or sprite pointers. No address-lookup tables are needed here (unlike
+// the raw-row provider this replaces): both tables are guarded above to fit
+// an 8-bit index, so decodeStageCharacterRow addresses them directly.
+#import "stage_test.asm"
+.if (METATILE_DEFS_END - metatileDefs != METATILE_DEF_COUNT * METATILE_W * METATILE_H) {
+    .error "metatileDefs size does not match METATILE_DEF_COUNT * METATILE_W * METATILE_H"
+}
+.if (STAGE_METATILE_ROWS_END - stageMetatileRows != STAGE_METATILE_ROWS * METATILES_PER_ROW) {
+    .error "stageMetatileRows size does not match STAGE_METATILE_ROWS * METATILES_PER_ROW"
+}
+
+STAGE_TEST_END:
+.if (STAGE_TEST_END > $a000) {
+    .error "Test stage assets overlap BASIC ROM"
+}
+
+// Two deliberately plain bitmaps, eight phases, two glyphs per phase.
+// Codes 128..159 are unused by the current stage; copying them at game start
+// does not replace the existing terrain glyphs (32, 35, 42, 224, 225).
+hudDiagnosticGlyphs:
+.var hudMarkerPixels = List().add($3c,$42,$81,$81,$81,$81,$42,$3c,
+                                 $81,$42,$24,$18,$18,$24,$42,$81)
+.for (var marker = 0; marker < 2; marker++) {
+    .for (var phase = 0; phase < 8; phase++) {
+        .for (var line = 0; line < 16; line++) {
+            .var sourceLine = line - (8 - phase)
+            .if (sourceLine >= 0 && sourceLine < 8) {
+                .byte hudMarkerPixels.get(marker*8 + sourceLine)
+            } else {
+                .byte 0
+            }
+        }
+    }
+}
+.if (* > $a000) {
+    .error "HUD diagnostic glyphs overlap BASIC ROM"
 }
