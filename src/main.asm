@@ -3769,6 +3769,9 @@ SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the W
 SCROLL_ROW:            .byte 0          // Diagnostic row ID at screen row 0 (wraps modulo 256).
 BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
 BG_STAMP_CHAR:         .byte 0          // Scratch: source row ID used by the diagnostic renderer.
+BG_CROSSING_ROW:       .fill 40, 0      // 40-byte holding buffer for the one row (old 12 -> new 13)
+                                         // that crosses the upper/lower coarse-copy split. Generic:
+                                         // holds whatever bytes were actually on screen, not an ID.
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
 ASSIGN_SLOT:           .fill 16, $ff
@@ -4765,8 +4768,9 @@ updateBackgroundScroll:
 // --- Routine: prepareBackgroundCoarse --------------------------------------
 // At YSCROL=7 the VIC fetches row 12 on line 151. From line 152 onward,
 // rows 0-12 can change without affecting this frame (the VIC caches row 12).
-// Keep the old lower rows until the NEXT frame. Their one crossing source
-// row (old row 12) is reproducible from its ID, so no row/screen shadow exists.
+// Keep the old lower rows until the NEXT frame. Their one crossing row (old
+// row 12) is physically saved into BG_CROSSING_ROW before shiftBackgroundUpper
+// overwrites it, so the bytes need not be reproducible from any formula.
 // Called AFTER BUILD preparation, before the unchanged frame-start wait.
 prepareBackgroundCoarse:
     lda BG_COARSE_PENDING
@@ -4784,6 +4788,7 @@ prepareBackgroundCoarse:
     cmp #152
     bcc !waitRead-
 
+    jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
     jsr shiftBackgroundUpper
 bgUpperCopied:
     dec SCROLL_ROW                          // New scenery enters ABOVE the previous top row.
@@ -4806,17 +4811,16 @@ bgUpperReady:
 // --- Routine: finishBackgroundCoarse ---------------------------------------
 // Called immediately AFTER armFirstBatch. Fine 0 is already set. The VIC
 // will not fetch row 13 until line 152, leaving ample time for this half.
-// Move rows 23->24 down through 13->14, then reproduce old row 12 at row 13.
-// SCROLL_ROW+13 = old top ID+12. This is an existing row, not another advance.
+// Move rows 23->24 down through 13->14 (this reads old row 13 as the source
+// for new row 14, so it must run BEFORE row 13 is overwritten below), then
+// restore the row 12 bytes saved by prepareBackgroundCoarse into row 13.
 finishBackgroundCoarse:
     lda BG_COARSE_FINISH
     beq !done+
     lda #0
     sta BG_COARSE_FINISH
     jsr shiftBackgroundLower
-    lda #13
-    sta BG_DEST_ROW
-    jsr renderRawRowIntoScreenA
+    jsr restoreCrossingRow
 bgLowerReady:
 !done:
     rts
@@ -4849,6 +4853,24 @@ shiftBackgroundLower:
         }
     }
     rts                                     // 440 bytes: 3520 cycles + RTS.
+
+// Generic crossing-row preservation: the one row that straddles the
+// upper/lower coarse-copy split (old row 12 -> new row 13) is saved and
+// restored as plain bytes instead of being regenerated from SCROLL_ROW, so
+// arbitrary screen content (not just the diagnostic pattern) survives a
+// coarse transition unchanged.
+saveCrossingRow:
+    .for (var col = 0; col < 40; col++) {
+        lda BG_SCREEN_A + 12 * 40 + col
+        sta BG_CROSSING_ROW + col
+    }
+    rts                                     // 40 bytes: 320 cycles + RTS.
+restoreCrossingRow:
+    .for (var col = 0; col < 40; col++) {
+        lda BG_CROSSING_ROW + col
+        sta BG_SCREEN_A + 13 * 40 + col
+    }
+    rts                                     // 40 bytes: 320 cycles + RTS.
 BACKGROUND_CODE_END:
 .if (BACKGROUND_CODE_END > $a000) {
     .error "Background copy code overlaps BASIC ROM"
