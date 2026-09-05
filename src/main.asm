@@ -226,6 +226,17 @@ init:
     ora #%00001110                          // Character set at $3800 within VIC bank 0.
     sta VIC_MEMORY_SETUP
 
+    // Permanent 24-row display. KERNAL reset leaves $D011 = $1B (RSEL=1);
+    // clearing RSEL fixes the visible aperture at raster 55..246, which lies
+    // wholly inside fetched terrain for every fine phase and so hides both the
+    // top and bottom scroll-edge artefacts (docs/scroll-edge-investigation.md).
+    // DEN, YSCROL and the raster-compare MSB are left as the KERNAL set them;
+    // every later $D011 write (applyFineScroll, armFirstBatch, endGame) masks
+    // bit 3, so RSEL stays 0 for the whole run.
+    lda VIC_CONTROL_1
+    and #%11110111
+    sta VIC_CONTROL_1
+
     lda #0
     sta BORDER_COLOUR                       // Black border.
     sta BACKGROUND_COLOUR                   // Black playfield.
@@ -402,10 +413,10 @@ endGame:
     sta SPRITE_ENABLE                       // Hide every hardware sprite.
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
 
-    lda VIC_CONTROL_1                       // Restore the normal (non-scrolling) 25-row YSCROL=3
-    and #%11111000                          // position for GAME OVER/menu - applyFineScroll (PLAYING
-    ora #3                                  // only) may have left this at any of 0-7.
-    sta VIC_CONTROL_1
+    lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
+    and #%11111000                          // OVER/menu - applyFineScroll (PLAYING only) may have
+    ora #3                                  // left this at any of 0-7. Bit 3 (RSEL) is preserved,
+    sta VIC_CONTROL_1                       // so the 24-row mode set in init stays in effect.
 
     lda #GAME_STATE_GAME_OVER
     sta GAME_STATE
