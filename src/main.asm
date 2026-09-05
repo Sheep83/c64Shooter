@@ -37,9 +37,9 @@
 // Deliberately narrow goal: prove a vertically scrolling character
 // background can coexist cleanly with the existing sprite multiplexer,
 // without touching its own scheduling. See docs/background-engine.md for
-// the milestone plan. No fixed HUD, no raster split, no second screen, no
-// double buffering (there is only one screen - $0400 - and the whole
-// 25-row screen scrolls, HUD included). Explicitly NOT here: starfield-
+// the milestone plan. No raster split, second screen or double buffering:
+// all 25 rows at $0400 scroll. Two diagnostic character patches compensate
+// for that motion; see docs/hud-architecture.md. Explicitly NOT here: starfield-
 // during-PLAYING (see startGame), turrets, entities, hitscan-vs-scenery,
 // per-cell colour, stage completion, CharPad, multiload, compression.
 // ============================================================================
@@ -339,10 +339,11 @@ mainLoop:
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
     jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
-    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment. No HUD, no
+    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment. No raster
                                              // split, no IRQ: the whole 25-row screen scrolls together.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr drawHudDiagnostic                  // Four character cells; never takes ownership of a hardware sprite.
     jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
 
 !frameLoop:
@@ -374,6 +375,7 @@ gameLoop:
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
+    jsr drawHudDiagnostic                  // Publish phase-compensated markers before row 3 is fetched.
     jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
 
@@ -3790,8 +3792,8 @@ BATCH_INDEX:           .byte 0
 BATCH_RASTER:          .fill 16, 0
 
 // --- Minimal background-scroll state -------------------------------------
-// No HUD, no raster split, no second screen. $D011 bits 0-2 (YSCROL) are
-// are written once per presented frame from the main loop -
+// No raster split or second screen. The HUD compensates in character data.
+// $D011 bits 0-2 (YSCROL) are written once per presented frame from the main loop -
 // no IRQ of any kind is armed for the background. The sprite multiplexer
 // (armFirstBatch/multiplexIRQ, above) is untouched, byte-for-byte
 // identical to the pre-background baseline.
@@ -4694,6 +4696,7 @@ applyFineScroll:
 // - the same routine consumed later by the scroller, so the initial screen
 // and the scrolled-in rows are never two different representations.
 initBackground:
+    jsr initHudDiagnostic
     lda #0
     sta SCROLL_FRAME_COUNT
     sta SCROLL_FINE
@@ -4902,6 +4905,7 @@ prepareBackgroundCoarse:
     cmp #152
     bcc !waitRead-
 
+    jsr restoreHudTerrain                  // HUD rows have been fetched; copy only the original terrain.
     jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
     jsr shiftBackgroundUpper
 bgUpperCopied:
@@ -4944,6 +4948,64 @@ finishBackgroundCoarse:
 bgLowerReady:
 !done:
     rts
+
+// Two static character markers at raster 80..87, columns 2 and 31.
+// All 25 rows still scroll normally. Pre-shifted glyphs cancel their phase;
+// saved cells keep the in-place coarse copy free of HUD trails. No IRQ,
+// VIC register, colour RAM, score or lives changes. Sprites can cover them.
+// Ownership/timing model: docs/hud-architecture.md.
+.const HUD_GLYPH_BASE = 128
+.var hudCells = List().add(BG_SCREEN_A + 3*40 + 2, BG_SCREEN_A + 4*40 + 2,
+                          BG_SCREEN_A + 3*40 + 31, BG_SCREEN_A + 4*40 + 31)
+initHudDiagnostic:
+    lda #0
+    sta HUD_PATCHED
+    ldx #0
+!glyphs:
+    lda hudDiagnosticGlyphs,x
+    sta STAR_CHARSET + HUD_GLYPH_BASE*8,x
+    inx
+    bne !glyphs-
+    rts
+
+drawHudDiagnostic:
+    lda HUD_PATCHED
+    bne !draw+
+    .for (var cell = 0; cell < hudCells.size(); cell++) {
+        lda hudCells.get(cell)
+        sta HUD_TERRAIN + cell
+    }
+    lda #1
+    sta HUD_PATCHED
+!draw:
+    lda SCROLL_FINE
+    asl
+    clc
+    adc #HUD_GLYPH_BASE
+    sta hudCells.get(0)
+    adc #1                                  // Codes stay below 256; carry remains clear throughout.
+    sta hudCells.get(1)
+    adc #15
+    sta hudCells.get(2)
+    adc #1
+    sta hudCells.get(3)
+hudDiagnosticReady:
+    rts
+
+restoreHudTerrain:
+    lda HUD_PATCHED
+    beq !done+
+    .for (var cell = 0; cell < hudCells.size(); cell++) {
+        lda HUD_TERRAIN + cell
+        sta hudCells.get(cell)
+    }
+    lda #0
+    sta HUD_PATCHED
+!done:
+    rts
+
+HUD_PATCHED: .byte 0
+HUD_TERRAIN: .fill 4, 0
 
 BG_COARSE_PENDING:     .byte 0
 BG_COARSE_FINISH:      .byte 0
@@ -5018,4 +5080,26 @@ BACKGROUND_CODE_END:
 STAGE_TEST_END:
 .if (STAGE_TEST_END > $a000) {
     .error "Test stage assets overlap BASIC ROM"
+}
+
+// Two deliberately plain bitmaps, eight phases, two glyphs per phase.
+// Codes 128..159 are unused by the current stage; copying them at game start
+// does not replace the existing terrain glyphs (32, 35, 42, 224, 225).
+hudDiagnosticGlyphs:
+.var hudMarkerPixels = List().add($3c,$42,$81,$81,$81,$81,$42,$3c,
+                                 $81,$42,$24,$18,$18,$24,$42,$81)
+.for (var marker = 0; marker < 2; marker++) {
+    .for (var phase = 0; phase < 8; phase++) {
+        .for (var line = 0; line < 16; line++) {
+            .var sourceLine = line - (8 - phase)
+            .if (sourceLine >= 0 && sourceLine < 8) {
+                .byte hudMarkerPixels.get(marker*8 + sourceLine)
+            } else {
+                .byte 0
+            }
+        }
+    }
+}
+.if (* > $a000) {
+    .error "HUD diagnostic glyphs overlap BASIC ROM"
 }

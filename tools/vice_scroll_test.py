@@ -87,7 +87,7 @@ def main():
     if args.trace:
         mon.cmd(f'logname "{out / "timing.log"}"')
         mon.cmd('log on')
-        for name in ('armFirstBatch', 'multiplexIRQ', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady'):
+        for name in ('armFirstBatch', 'multiplexIRQ', 'hudDiagnosticReady', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady'):
             if name in sym:
                 mon.cmd(f'trace exec {sym[name]:04x}')
     physical_break = None
