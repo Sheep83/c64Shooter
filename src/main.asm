@@ -42,6 +42,9 @@
 .const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
                                                      // colour RAM work at all, scrolling or otherwise.
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
+.const TEST_STAGE_ROWS = 48                         // Row count of the raw test-stage table
+                                                     // (stage_test.asm); referenced before that file
+                                                     // is imported, so it is declared here instead.
 
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
@@ -3766,9 +3769,9 @@ BATCH_RASTER:          .fill 16, 0
 // identical to the pre-background baseline.
 SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
 SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the WHOLE screen.
-SCROLL_ROW:            .byte 0          // Diagnostic row ID at screen row 0 (wraps modulo 256).
+SCROLL_ROW:            .byte 0          // Stage row index (0..TEST_STAGE_ROWS-1) currently shown at
+                                         // screen row 0. See copyStageRowToScreen (stage_test.asm).
 BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
-BG_STAMP_CHAR:         .byte 0          // Scratch: source row ID used by the diagnostic renderer.
 BG_CROSSING_ROW:       .fill 40, 0      // 40-byte holding buffer for the one row (old 12 -> new 13)
                                          // that crosses the upper/lower coarse-copy split. Generic:
                                          // holds whatever bytes were actually on screen, not an ID.
@@ -4645,8 +4648,10 @@ applyFineScroll:
     rts
 
 // --- Routine: initBackground -----------------------------------------------
-// Fill one screen and fixed colour RAM. The diagnostic has hexadecimal row
-// IDs, two vertical rails and a diagonal crossing successive row boundaries.
+// Fill one screen and fixed colour RAM from the raw test-stage data
+// (testStageData, stage_test.asm) - the same source consumed later by
+// copyStageRowToScreen, so the initial screen and the scrolled-in rows are
+// never two different representations of the background.
 initBackground:
     lda #0
     sta SCROLL_FRAME_COUNT
@@ -4654,11 +4659,11 @@ initBackground:
     sta BG_COARSE_PENDING
     sta BG_COARSE_FINISH
     sta BG_COARSE_DEFERRED
-    lda #$80
-    sta SCROLL_ROW
+    lda #0
+    sta SCROLL_ROW                           // Initial stage position: stage row 0 begins at screen row 0.
 
-    ldx #15                                 // Two unused glyphs in the existing RAM charset.
-!glyphLoop:
+    ldx #15                                 // Two unused glyphs in the existing RAM charset, reused
+!glyphLoop:                                 // as rail/diagonal glyphs by the raw test-stage data.
     lda bgDiagnosticGlyphs,x
     sta STAR_CHARSET + 224 * 8,x
     dex
@@ -4678,70 +4683,60 @@ initBackground:
     ldx #0
 !rowLoop:
     stx BG_DEST_ROW
-    jsr renderRawRowIntoScreenA
+    jsr copyStageRowToScreen
     ldx BG_DEST_ROW
     inx
     cpx #25
     bne !rowLoop-
-    lda #$80                                // SCROLL_ROW always identifies the top matrix row.
-    sta SCROLL_ROW
+    lda #0                                   // SCROLL_ROW always identifies the stage row at row 0;
+    sta SCROLL_ROW                           // unchanged by the fill above, exactly like copyStageRowToScreen expects.
     rts
 
-// --- Routine: renderRawRowIntoScreenA ---------------------------------------
-// Entry: BG_DEST_ROW (0-24), SCROLL_ROW (8-bit ID at the TOP of the matrix).
-// Only screen RAM is written; neither colour RAM nor sprite pointers change.
-renderRawRowIntoScreenA:
-    lda SCROLL_ROW                          // Reproducible source: top row ID + destination row.
+// --- Routine: copyStageRowToScreen -------------------------------------------
+// Entry: BG_DEST_ROW (0-24) = destination screen row.
+//        SCROLL_ROW (0..TEST_STAGE_ROWS-1) = stage row index currently shown
+//        at screen row 0. The source row is (SCROLL_ROW + BG_DEST_ROW) mod
+//        TEST_STAGE_ROWS - the same SCROLL_ROW + BG_DEST_ROW addressing the
+//        old diagnostic renderer used, just now naming a table row instead
+//        of feeding a formula. The sum never exceeds 2*TEST_STAGE_ROWS-1, so
+//        a single conditional subtraction is a complete modulo.
+// Generic: a literal 40-byte copy from testStageData (stage_test.asm) via the
+// stageRowLo/stageRowHi address table - no per-row source addresses are
+// hard-coded. Only screen RAM is written; neither colour RAM nor sprite
+// pointers change. This routine has no idea what the bytes mean; a later
+// metatile/compressed stage format can replace testStageData without
+// touching it.
+copyStageRowToScreen:
+    lda SCROLL_ROW
     clc
     adc BG_DEST_ROW
-    sta BG_STAMP_CHAR
-    ldx BG_DEST_ROW
-    lda starRowLo,x
+    cmp #TEST_STAGE_ROWS
+    bcc !noWrapSrc+
+    sbc #TEST_STAGE_ROWS                    // Carry is set here (CMP just confirmed A >= TEST_STAGE_ROWS).
+!noWrapSrc:
+    tax
+
+    ldy BG_DEST_ROW
+    lda starRowLo,y
     sta TEXT_DST
-    lda starRowHi,x
+    lda starRowHi,y
     sta TEXT_DST + 1
 
-    lda #32
+    lda stageRowLo,x
+    sta STAGE_SRC
+    lda stageRowHi,x
+    sta STAGE_SRC + 1
+
     ldy #39
-!fillLoop:
+!copyLoop:
+    lda (STAGE_SRC),y
     sta (TEXT_DST),y
     dey
-    bpl !fillLoop-
-
-    lda #224                                // Continuous vertical rails.
-    ldy #6
-    sta (TEXT_DST),y
-    ldy #33
-    sta (TEXT_DST),y
-
-    lda BG_STAMP_CHAR
-    lsr
-    lsr
-    lsr
-    lsr
-    tax
-    lda bgHexDigits,x
-    ldy #1
-    sta (TEXT_DST),y
-    lda BG_STAMP_CHAR
-    and #15
-    tax
-    lda bgHexDigits,x
-    iny
-    sta (TEXT_DST),y
-
-    txa
-    clc
-    adc #8
-    tay
-    lda #225                                // One diagonal glyph; adjacent rows continue its slope.
-    sta (TEXT_DST),y
+    bpl !copyLoop-
     rts
 
-bgHexDigits:
-    .byte 48,49,50,51,52,53,54,55,56,57,1,2,3,4,5,6
-bgDiagnosticGlyphs:
-    .byte $18,$18,$18,$18,$18,$18,$18,$18
+bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) glyph bitmaps, reused by
+    .byte $18,$18,$18,$18,$18,$18,$18,$18   // the raw test-stage data below.
     .byte $80,$40,$20,$10,$08,$04,$02,$01
 
 // --- Routine: updateBackgroundScroll ---------------------------------------
@@ -4791,10 +4786,16 @@ prepareBackgroundCoarse:
     jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
     jsr shiftBackgroundUpper
 bgUpperCopied:
-    dec SCROLL_ROW                          // New scenery enters ABOVE the previous top row.
+    lda SCROLL_ROW                          // New scenery enters ABOVE the previous top row: step the
+    bne !stageNoWrap+                       // stage position back one row, wrapping 0 -> TEST_STAGE_ROWS-1
+    lda #TEST_STAGE_ROWS                    // (same direction as the old mod-256 diagnostic decrement,
+!stageNoWrap:                               // just bounded to the raw test-stage's actual row count).
+    sec
+    sbc #1
+    sta SCROLL_ROW
     lda #0
     sta BG_DEST_ROW
-    jsr renderRawRowIntoScreenA
+    jsr copyStageRowToScreen
 bgUpperReady:
     lda #0
     sta SCROLL_FINE                         // Published by applyFineScroll at the next raster 0.
@@ -4874,4 +4875,31 @@ restoreCrossingRow:
 BACKGROUND_CODE_END:
 .if (BACKGROUND_CODE_END > $a000) {
     .error "Background copy code overlaps BASIC ROM"
+}
+
+// Raw test-stage data (testStageData, literal rows only). Placed immediately
+// after the unrolled copy code so it cannot collide with $3000-$33ff (health
+// sprites), $3800-$3fff (charset), screen RAM or sprite pointers.
+#import "stage_test.asm"
+.if (TEST_STAGE_DATA_END - testStageData != TEST_STAGE_ROWS * 40) {
+    .error "testStageData size does not match TEST_STAGE_ROWS * 40"
+}
+
+// Row-index -> row-address lookup, exactly mirroring the existing
+// starRowLo/starRowHi screen-row tables. copyStageRowToScreen (above) uses
+// this instead of a runtime index*40 multiply. Generated at assemble time
+// from testStageData's own (build-dependent) address; the emitted bytes are
+// still a literal table, not a runtime computation.
+stageRowLo:
+    .for (var i = 0; i < TEST_STAGE_ROWS; i++) {
+        .byte <(testStageData + i * 40)
+    }
+stageRowHi:
+    .for (var i = 0; i < TEST_STAGE_ROWS; i++) {
+        .byte >(testStageData + i * 40)
+    }
+
+STAGE_TEST_END:
+.if (STAGE_TEST_END > $a000) {
+    .error "Test stage assets overlap BASIC ROM"
 }

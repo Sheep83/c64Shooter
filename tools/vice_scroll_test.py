@@ -129,6 +129,11 @@ def main():
     (out / 'frames.json').write_text(json.dumps(records, indent=2))
     (out / 'symbols.json').write_text(json.dumps(sym, indent=2))
     mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
+    # Raw ground truth for the checker: the literal stage-row bytes actually
+    # assembled into the program, dumped from the running emulator rather
+    # than retyped in Python. Row count is derived from this range's size,
+    # not hard-coded, so the checker never assumes TEST_STAGE_ROWS's value.
+    mon.cmd(f'bsave "{out / "stagedata.bin"}" 0 {sym["testStageData"]:04x} {sym["TEST_STAGE_DATA_END"]-1:04x}')
     mon.cmd('log off')
     mon.cmd('delete')
     mon.sock.sendall(b'x\n')
