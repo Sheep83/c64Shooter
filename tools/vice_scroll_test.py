@@ -129,11 +129,13 @@ def main():
     (out / 'frames.json').write_text(json.dumps(records, indent=2))
     (out / 'symbols.json').write_text(json.dumps(sym, indent=2))
     mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
-    # Raw ground truth for the checker: the literal stage-row bytes actually
-    # assembled into the program, dumped from the running emulator rather
-    # than retyped in Python. Row count is derived from this range's size,
-    # not hard-coded, so the checker never assumes TEST_STAGE_ROWS's value.
-    mon.cmd(f'bsave "{out / "stagedata.bin"}" 0 {sym["testStageData"]:04x} {sym["TEST_STAGE_DATA_END"]-1:04x}')
+    # Raw ground truth for the checker: the literal metatile definitions and
+    # stage metatile-row IDs actually assembled into the program, dumped from
+    # the running emulator rather than retyped in Python. Table sizes are
+    # derived from these ranges, not hard-coded, so the checker never assumes
+    # METATILE_DEF_COUNT/STAGE_METATILE_ROWS's values.
+    mon.cmd(f'bsave "{out / "metatiledefs.bin"}" 0 {sym["metatileDefs"]:04x} {sym["METATILE_DEFS_END"]-1:04x}')
+    mon.cmd(f'bsave "{out / "stagemetatilerows.bin"}" 0 {sym["stageMetatileRows"]:04x} {sym["STAGE_METATILE_ROWS_END"]-1:04x}')
     mon.cmd('log off')
     mon.cmd('delete')
     mon.sock.sendall(b'x\n')

@@ -7,26 +7,49 @@ import re
 from PIL import Image, ImageDraw
 
 
-def load_stage_rows(path):
-    """Ground truth for the checker: the literal 40-byte stage rows actually
-    assembled into the program, read back from a live emulator memory dump
-    (tools/vice_scroll_test.py bsaves testStageData..TEST_STAGE_DATA_END-1
-    verbatim). Row count comes from this dump's size, never a constant typed
-    into this file, so the checker cannot silently drift from the real
-    TEST_STAGE_ROWS. This only knows the literal row content; it does not
-    reimplement the 6502 addressing/wrap arithmetic under test."""
-    data = path.read_bytes()
-    assert len(data) % 40 == 0, f'{path}: {len(data)} bytes is not a whole number of 40-byte rows'
-    rows = [data[i:i + 40] for i in range(0, len(data), 40)]
-    assert len(set(rows)) == len(rows), 'stage rows are not all unique - the checker cannot ' \
-        'tell a skipped/duplicated row from a merely-identical one'
-    return rows
+METATILE_W = 4                          # Format constants (not stage-specific data): the 4x4 metatile
+METATILE_H = 4                          # shape itself, same as decodeStageCharacterRow assumes.
 
 
-def make_row_codes(stage_rows):
-    n = len(stage_rows)
-    def row_codes(row_id):
-        return list(stage_rows[row_id % n])
+def load_metatile_stage(defs_path, rows_path):
+    """Ground truth for the checker: the literal metatile definitions and
+    stage metatile-row IDs actually assembled into the program, read back
+    from a live emulator memory dump (tools/vice_scroll_test.py bsaves
+    metatileDefs/stageMetatileRows verbatim). Table sizes come from these
+    dumps, never a constant typed into this file, so the checker cannot
+    silently drift from the real METATILE_DEF_COUNT/STAGE_METATILE_ROWS. This
+    only knows the literal definitions/IDs and the public 4x4 tile shape; it
+    independently expands them with plain Python divmod, not the 6502
+    addressing (single-page 8-bit index tricks, shift-based id*16) under
+    test, so a bug in that addressing cannot also be present here."""
+    defs_data = defs_path.read_bytes()
+    tile_bytes = METATILE_W * METATILE_H
+    assert len(defs_data) % tile_bytes == 0, f'{defs_path}: not a whole number of {tile_bytes}-byte tiles'
+    defs = [defs_data[i:i + tile_bytes] for i in range(0, len(defs_data), tile_bytes)]
+
+    metatiles_per_row = 40 // METATILE_W
+    rows_data = rows_path.read_bytes()
+    assert len(rows_data) % metatiles_per_row == 0, \
+        f'{rows_path}: not a whole number of {metatiles_per_row}-ID stage rows'
+    stage_rows = [rows_data[i:i + metatiles_per_row] for i in range(0, len(rows_data), metatiles_per_row)]
+    for row in stage_rows:
+        for tile_id in row:
+            assert tile_id < len(defs), f'stage row references undefined metatile {tile_id}'
+
+    total_logical_rows = len(stage_rows) * METATILE_H
+    return stage_rows, defs, total_logical_rows
+
+
+def make_row_codes(stage_rows, defs, total_logical_rows):
+    metatiles_per_row = 40 // METATILE_W
+    def row_codes(logical_row):
+        metatile_row, internal_row = divmod(logical_row % total_logical_rows, METATILE_H)
+        ids = stage_rows[metatile_row]
+        out = []
+        for col in range(metatiles_per_row):
+            tile = defs[ids[col]]
+            out.extend(tile[internal_row * METATILE_W:(internal_row + 1) * METATILE_W])
+        return out
     return row_codes
 
 
@@ -39,8 +62,9 @@ def main():
     sym = json.loads((root / 'symbols.json').read_text())
     records = json.loads((root / 'frames.json').read_text())
     charset = args.charset.read_bytes()
-    stage_rows = load_stage_rows(root / 'stagedata.bin')
-    row_codes = make_row_codes(stage_rows)
+    stage_rows, defs, total_logical_rows = load_metatile_stage(
+        root / 'metatiledefs.bin', root / 'stagemetatilerows.bin')
+    row_codes = make_row_codes(stage_rows, defs, total_logical_rows)
     failures = []
     clocks, fine, rows, active, batches, deferred, scores = [], [], [], [], [], [], []
     frames = []
@@ -122,7 +146,7 @@ def main():
     # and checks the real invariant: whatever SCROLL_ROW does, it is always
     # exactly one step. Independent of the matrix/pixel checks above; this
     # looks only at the position counter.
-    n = len(stage_rows)
+    n = total_logical_rows
     row_changes = [i for i in range(1, len(rows)) if rows[i] != rows[i-1]]
     stage_step_errors = []
     for i in row_changes:
@@ -139,7 +163,7 @@ def main():
         i0 = row_changes[0]
         first_transition_ok = rows[0] < n and rows[i0] == (rows[0] - 1) % n
 
-    report = {'frames':len(records), 'wraps':len(transitions), 'max_active':max(active), 'max_batches':max(batches), 'max_score':max(scores), 'deferred':max(deferred), 'frame_cycle_deltas':sorted(set(deltas)), 'pixel_checks':pixel_checks, 'stage_rows':n, 'stage_loops':stage_loops, 'first_transition_ok':first_transition_ok, 'stage_step_errors':stage_step_errors[:10], 'failures':failures[:30], 'failure_count':len(failures)}
+    report = {'frames':len(records), 'wraps':len(transitions), 'max_active':max(active), 'max_batches':max(batches), 'max_score':max(scores), 'deferred':max(deferred), 'frame_cycle_deltas':sorted(set(deltas)), 'pixel_checks':pixel_checks, 'stage_logical_rows':n, 'stage_loops':stage_loops, 'first_transition_ok':first_transition_ok, 'stage_step_errors':stage_step_errors[:10], 'failures':failures[:30], 'failure_count':len(failures)}
     (root/'verification.json').write_text(json.dumps(report,indent=2))
     if frames:
         frames[0].save(root/'continuous.gif',save_all=True,append_images=frames[1:],duration=20,loop=0)

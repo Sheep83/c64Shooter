@@ -16,6 +16,11 @@
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
+.const DEBUG_PLAYER_INVULNERABLE = 1          // 0 = normal: collisions can kill the player.
+                                               // 1 = development: capturePlayerCollision still reads/clears
+                                               // $D01E and runs every overlap test, but never sets PLAYER_HIT,
+                                               // so unattended scrolling tests can run indefinitely. Compile-
+                                               // time only - see the !hit branch in capturePlayerCollision.
 .const SCORE_SCREEN = $0400 + 29              // Top row, right-aligned: "SCORE 00000".
 .const SCORE_COLOUR = $d800 + 29
 .const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
@@ -36,15 +41,35 @@
 // double buffering (there is only one screen - $0400 - and the whole
 // 25-row screen scrolls, HUD included). Explicitly NOT here: starfield-
 // during-PLAYING (see startGame), turrets, entities, hitscan-vs-scenery,
-// per-cell colour, stage completion, CharPad, multiload, metatiles.
+// per-cell colour, stage completion, CharPad, multiload, compression.
 // ============================================================================
 .const BG_SCREEN_A = $0400
 .const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
                                                      // colour RAM work at all, scrolling or otherwise.
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
-.const TEST_STAGE_ROWS = 48                         // Row count of the raw test-stage table
-                                                     // (stage_test.asm); referenced before that file
-                                                     // is imported, so it is declared here instead.
+
+// 4x4 character metatile stage (stage_test.asm): a metatile stage row is
+// METATILES_PER_ROW IDs wide (one screen width); a metatile stage row
+// expands to METATILE_H character rows. Declared here (not in
+// stage_test.asm) because decodeStageCharacterRow, below, references
+// these before that file is imported.
+.const METATILE_W = 4
+.const METATILE_H = 4
+.const METATILES_PER_ROW = 10                       // 40 / METATILE_W: metatiles spanning one screen width.
+.const METATILE_DEF_COUNT = 12                       // Distinct 4x4 tile definitions in the test stage.
+.const STAGE_METATILE_ROWS = 20                      // Metatile rows in the test stage (80 character rows -
+                                                      // well past the 25 visible, so multiple coarse
+                                                      // transitions occur before the stage wraps).
+.const STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H // Total logical character rows (80).
+.if (METATILES_PER_ROW * METATILE_W != 40) {
+    .error "METATILES_PER_ROW * METATILE_W must tile the 40-column screen exactly"
+}
+.if (METATILE_DEF_COUNT > 16) {
+    .error "METATILE_DEF_COUNT > 16: id*16 no longer fits an 8-bit metatileDefs offset"
+}
+.if (STAGE_METATILE_ROWS * METATILES_PER_ROW > 256) {
+    .error "stageMetatileRows table no longer fits an 8-bit index"
+}
 
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
@@ -3190,9 +3215,12 @@ capturePlayerCollision:
     jsr checkBulletPlayerOverlap            // Carry set means the small projectile box overlaps the player.
     bcc !next+
 
-!hit:
+!hit:                                        // $D01E is already consumed and every overlap test above still
+                                              // ran; only the final state change is compile-time suppressed.
+.if (DEBUG_PLAYER_INVULNERABLE == 0) {
     lda #1
     sta PLAYER_HIT
+}
     rts
 
 !next:
@@ -3769,12 +3797,25 @@ BATCH_RASTER:          .fill 16, 0
 // identical to the pre-background baseline.
 SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
 SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the WHOLE screen.
-SCROLL_ROW:            .byte 0          // Stage row index (0..TEST_STAGE_ROWS-1) currently shown at
-                                         // screen row 0. See copyStageRowToScreen (stage_test.asm).
+SCROLL_ROW:            .byte 0          // Logical stage row index (0..STAGE_LOGICAL_ROWS-1) currently
+                                         // shown at screen row 0. See renderStageRowToScreen below.
 BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
 BG_CROSSING_ROW:       .fill 40, 0      // 40-byte holding buffer for the one row (old 12 -> new 13)
                                          // that crosses the upper/lower coarse-copy split. Generic:
                                          // holds whatever bytes were actually on screen, not an ID.
+                                         // Physical/already-visible data only - never aliased with
+                                         // BG_INCOMING_ROW (declared below, near BG_COARSE_PENDING;
+                                         // this tight $2000-$2400 block had no room left for another
+                                         // 40 bytes, so only this routine's small scratch bytes live here).
+BG_LOGICAL_ROW:        .byte 0          // Entry param for decodeStageCharacterRow: absolute logical
+                                         // stage row to decode (0..STAGE_LOGICAL_ROWS-1).
+BG_TILE_ROW_OFS:       .byte 0          // Scratch: (logical row mod METATILE_H) * METATILE_W.
+BG_METATILE_ROW:       .byte 0          // Scratch: logical row / METATILE_H.
+BG_ROW_BASE:           .byte 0          // Scratch: BG_METATILE_ROW * METATILES_PER_ROW (stageMetatileRows
+                                         // index of this logical row's column 0).
+BG_COL:                .byte 0          // Scratch: metatile column counter (0..METATILES_PER_ROW-1).
+BG_DEF_BASE:           .byte 0          // Scratch: metatileDefs offset of the current column's 4-byte slice.
+BG_OUT_BASE:           .byte 0          // Scratch: BG_INCOMING_ROW offset of the current column.
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
 ASSIGN_SLOT:           .fill 16, $ff
@@ -4648,10 +4689,10 @@ applyFineScroll:
     rts
 
 // --- Routine: initBackground -----------------------------------------------
-// Fill one screen and fixed colour RAM from the raw test-stage data
-// (testStageData, stage_test.asm) - the same source consumed later by
-// copyStageRowToScreen, so the initial screen and the scrolled-in rows are
-// never two different representations of the background.
+// Fill one screen and fixed colour RAM from the 4x4 metatile test stage
+// (metatileDefs/stageMetatileRows, stage_test.asm) via renderStageRowToScreen
+// - the same routine consumed later by the scroller, so the initial screen
+// and the scrolled-in rows are never two different representations.
 initBackground:
     lda #0
     sta SCROLL_FRAME_COUNT
@@ -4660,10 +4701,10 @@ initBackground:
     sta BG_COARSE_FINISH
     sta BG_COARSE_DEFERRED
     lda #0
-    sta SCROLL_ROW                           // Initial stage position: stage row 0 begins at screen row 0.
+    sta SCROLL_ROW                           // Initial stage position: logical row 0 begins at screen row 0.
 
     ldx #15                                 // Two unused glyphs in the existing RAM charset, reused
-!glyphLoop:                                 // as rail/diagonal glyphs by the raw test-stage data.
+!glyphLoop:                                 // as rail/diagonal glyphs by the metatile test stage.
     lda bgDiagnosticGlyphs,x
     sta STAR_CHARSET + 224 * 8,x
     dex
@@ -4683,60 +4724,138 @@ initBackground:
     ldx #0
 !rowLoop:
     stx BG_DEST_ROW
-    jsr copyStageRowToScreen
+    jsr renderStageRowToScreen
     ldx BG_DEST_ROW
     inx
     cpx #25
     bne !rowLoop-
-    lda #0                                   // SCROLL_ROW always identifies the stage row at row 0;
-    sta SCROLL_ROW                           // unchanged by the fill above, exactly like copyStageRowToScreen expects.
+    lda #0                                   // SCROLL_ROW always identifies the logical row at row 0;
+    sta SCROLL_ROW                           // unchanged by the fill above, exactly like renderStageRowToScreen expects.
     rts
 
-// --- Routine: copyStageRowToScreen -------------------------------------------
+// --- Routine: renderStageRowToScreen -----------------------------------------
 // Entry: BG_DEST_ROW (0-24) = destination screen row.
-//        SCROLL_ROW (0..TEST_STAGE_ROWS-1) = stage row index currently shown
-//        at screen row 0. The source row is (SCROLL_ROW + BG_DEST_ROW) mod
-//        TEST_STAGE_ROWS - the same SCROLL_ROW + BG_DEST_ROW addressing the
-//        old diagnostic renderer used, just now naming a table row instead
-//        of feeding a formula. The sum never exceeds 2*TEST_STAGE_ROWS-1, so
-//        a single conditional subtraction is a complete modulo.
-// Generic: a literal 40-byte copy from testStageData (stage_test.asm) via the
-// stageRowLo/stageRowHi address table - no per-row source addresses are
-// hard-coded. Only screen RAM is written; neither colour RAM nor sprite
-// pointers change. This routine has no idea what the bytes mean; a later
-// metatile/compressed stage format can replace testStageData without
-// touching it.
-copyStageRowToScreen:
+//        SCROLL_ROW (0..STAGE_LOGICAL_ROWS-1) = logical stage row currently
+//        shown at screen row 0. The source row is (SCROLL_ROW + BG_DEST_ROW)
+//        mod STAGE_LOGICAL_ROWS - the same SCROLL_ROW + BG_DEST_ROW
+//        addressing the old raw-row provider used, just now resolving a
+//        logical row to decode instead of a table row to copy directly. The
+//        sum never exceeds 2*STAGE_LOGICAL_ROWS-1, so a single conditional
+//        subtraction is a complete modulo. Same entry contract as the old
+//        copyStageRowToScreen it replaces.
+renderStageRowToScreen:
     lda SCROLL_ROW
     clc
     adc BG_DEST_ROW
-    cmp #TEST_STAGE_ROWS
+    cmp #STAGE_LOGICAL_ROWS
     bcc !noWrapSrc+
-    sbc #TEST_STAGE_ROWS                    // Carry is set here (CMP just confirmed A >= TEST_STAGE_ROWS).
+    sbc #STAGE_LOGICAL_ROWS                 // Carry is set here (CMP just confirmed A >= STAGE_LOGICAL_ROWS).
 !noWrapSrc:
-    tax
+    sta BG_LOGICAL_ROW
+    jsr decodeStageCharacterRow             // Expand the metatile stage into BG_INCOMING_ROW.
+    jsr copyIncomingRowToScreen              // Then copy that generic 40-byte buffer to screen.
+    rts
 
+// --- Routine: decodeStageCharacterRow -----------------------------------------
+// Entry: BG_LOGICAL_ROW (0..STAGE_LOGICAL_ROWS-1) = absolute logical
+//        character row to expand. Exit: BG_INCOMING_ROW holds 40 generic
+//        character bytes. Does not touch screen RAM, colour RAM, $D011,
+//        raster IRQs or sprite state - only BG_INCOMING_ROW and its own
+//        scratch variables.
+//
+// STAGE_METATILE_ROWS*METATILE_H == STAGE_LOGICAL_ROWS exactly (see the
+// .const block above), so plain / and mod by METATILE_H (a power of two)
+// select the metatile row and internal row with no separate wrap case:
+// logical row 0 -> metatile row 0 internal row 0; STAGE_LOGICAL_ROWS-1 ->
+// the last metatile row, internal row METATILE_H-1.
+//
+// Both lookup tables are guarded to fit an 8-bit index (see .const block),
+// so plain absolute,X/Y addressing replaces a runtime multiply throughout:
+// metatileRow*METATILES_PER_ROW selects this row's 10 metatile IDs directly
+// out of stageMetatileRows, and id*METATILE_W*METATILE_H (+ internal-row
+// offset) selects a definition's 4-byte slice directly out of metatileDefs.
+decodeStageCharacterRow:
+    lda BG_LOGICAL_ROW
+    and #METATILE_H - 1
+    asl
+    asl
+    sta BG_TILE_ROW_OFS                      // (logical row mod METATILE_H) * METATILE_W
+
+    lda BG_LOGICAL_ROW
+    lsr
+    lsr
+    sta BG_METATILE_ROW                      // logical row / METATILE_H
+    asl
+    sta BG_ROW_BASE                          // metatileRow * 2
+    lda BG_METATILE_ROW
+    asl
+    asl
+    asl                                      // metatileRow * 8
+    clc
+    adc BG_ROW_BASE
+    sta BG_ROW_BASE                          // metatileRow*8 + metatileRow*2 = metatileRow*METATILES_PER_ROW
+
+    lda #0
+    sta BG_COL
+!colLoop:
+    lda BG_ROW_BASE
+    clc
+    adc BG_COL
+    tax
+    lda stageMetatileRows,x                  // This column's metatile ID (0..METATILE_DEF_COUNT-1).
+    asl
+    asl
+    asl
+    asl                                      // id * (METATILE_W * METATILE_H) = id * 16.
+    clc
+    adc BG_TILE_ROW_OFS
+    sta BG_DEF_BASE                          // metatileDefs offset of this tile's internal-row slice.
+
+    lda BG_COL
+    asl
+    asl
+    sta BG_OUT_BASE                          // BG_INCOMING_ROW offset for this column (col * METATILE_W).
+
+    ldy BG_DEF_BASE
+    ldx BG_OUT_BASE
+    .for (var s = 0; s < METATILE_W; s++) {
+        lda metatileDefs,y
+        sta BG_INCOMING_ROW,x
+        .if (s < METATILE_W - 1) {
+            iny
+            inx
+        }
+    }
+
+    inc BG_COL
+    lda BG_COL
+    cmp #METATILES_PER_ROW
+    bne !colLoop-
+    rts
+
+// --- Routine: copyIncomingRowToScreen -----------------------------------------
+// Entry: BG_DEST_ROW (0-24) = destination screen row. Copies the generic
+// 40-byte BG_INCOMING_ROW (already decoded by decodeStageCharacterRow) to
+// that screen row. Only screen RAM is written; neither colour RAM nor
+// sprite pointers change. This routine has no idea what the bytes mean or
+// where they came from.
+copyIncomingRowToScreen:
     ldy BG_DEST_ROW
     lda starRowLo,y
     sta TEXT_DST
     lda starRowHi,y
     sta TEXT_DST + 1
 
-    lda stageRowLo,x
-    sta STAGE_SRC
-    lda stageRowHi,x
-    sta STAGE_SRC + 1
-
     ldy #39
 !copyLoop:
-    lda (STAGE_SRC),y
+    lda BG_INCOMING_ROW,y
     sta (TEXT_DST),y
     dey
     bpl !copyLoop-
     rts
 
 bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) glyph bitmaps, reused by
-    .byte $18,$18,$18,$18,$18,$18,$18,$18   // the raw test-stage data below.
+    .byte $18,$18,$18,$18,$18,$18,$18,$18   // the metatile test stage below.
     .byte $80,$40,$20,$10,$08,$04,$02,$01
 
 // --- Routine: updateBackgroundScroll ---------------------------------------
@@ -4787,15 +4906,15 @@ prepareBackgroundCoarse:
     jsr shiftBackgroundUpper
 bgUpperCopied:
     lda SCROLL_ROW                          // New scenery enters ABOVE the previous top row: step the
-    bne !stageNoWrap+                       // stage position back one row, wrapping 0 -> TEST_STAGE_ROWS-1
-    lda #TEST_STAGE_ROWS                    // (same direction as the old mod-256 diagnostic decrement,
-!stageNoWrap:                               // just bounded to the raw test-stage's actual row count).
-    sec
+    bne !stageNoWrap+                       // logical stage position back one row, wrapping 0 ->
+    lda #STAGE_LOGICAL_ROWS                 // STAGE_LOGICAL_ROWS-1 (same direction as the original
+!stageNoWrap:                               // mod-256 diagnostic decrement, just bounded to the
+    sec                                     // metatile-expanded stage's actual logical height).
     sbc #1
     sta SCROLL_ROW
     lda #0
     sta BG_DEST_ROW
-    jsr copyStageRowToScreen
+    jsr renderStageRowToScreen
 bgUpperReady:
     lda #0
     sta SCROLL_FINE                         // Published by applyFineScroll at the next raster 0.
@@ -4829,6 +4948,11 @@ bgLowerReady:
 BG_COARSE_PENDING:     .byte 0
 BG_COARSE_FINISH:      .byte 0
 BG_COARSE_DEFERRED:    .byte 0
+BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data not yet on screen:
+                                         // decodeStageCharacterRow expands one logical stage row here;
+                                         // copyIncomingRowToScreen then copies it to a screen row. Never
+                                         // touched by the crossing-row save/restore mechanism (that
+                                         // buffer, BG_CROSSING_ROW, lives separately near SCROLL_ROW).
 BACKGROUND_CONTROL_END:
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"
@@ -4877,27 +5001,19 @@ BACKGROUND_CODE_END:
     .error "Background copy code overlaps BASIC ROM"
 }
 
-// Raw test-stage data (testStageData, literal rows only). Placed immediately
-// after the unrolled copy code so it cannot collide with $3000-$33ff (health
-// sprites), $3800-$3fff (charset), screen RAM or sprite pointers.
+// Metatile stage assets (metatileDefs, stageMetatileRows - literal data
+// only). Placed immediately after the unrolled copy code so they cannot
+// collide with $3000-$33ff (health sprites), $3800-$3fff (charset), screen
+// RAM or sprite pointers. No address-lookup tables are needed here (unlike
+// the raw-row provider this replaces): both tables are guarded above to fit
+// an 8-bit index, so decodeStageCharacterRow addresses them directly.
 #import "stage_test.asm"
-.if (TEST_STAGE_DATA_END - testStageData != TEST_STAGE_ROWS * 40) {
-    .error "testStageData size does not match TEST_STAGE_ROWS * 40"
+.if (METATILE_DEFS_END - metatileDefs != METATILE_DEF_COUNT * METATILE_W * METATILE_H) {
+    .error "metatileDefs size does not match METATILE_DEF_COUNT * METATILE_W * METATILE_H"
 }
-
-// Row-index -> row-address lookup, exactly mirroring the existing
-// starRowLo/starRowHi screen-row tables. copyStageRowToScreen (above) uses
-// this instead of a runtime index*40 multiply. Generated at assemble time
-// from testStageData's own (build-dependent) address; the emitted bytes are
-// still a literal table, not a runtime computation.
-stageRowLo:
-    .for (var i = 0; i < TEST_STAGE_ROWS; i++) {
-        .byte <(testStageData + i * 40)
-    }
-stageRowHi:
-    .for (var i = 0; i < TEST_STAGE_ROWS; i++) {
-        .byte >(testStageData + i * 40)
-    }
+.if (STAGE_METATILE_ROWS_END - stageMetatileRows != STAGE_METATILE_ROWS * METATILES_PER_ROW) {
+    .error "stageMetatileRows size does not match STAGE_METATILE_ROWS * METATILES_PER_ROW"
+}
 
 STAGE_TEST_END:
 .if (STAGE_TEST_END > $a000) {

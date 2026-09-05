@@ -42,8 +42,4 @@
 // $f9/$fa are likewise free while this program owns the machine; used as the
 // indirect pointer to whichever movement-fragment table is currently active.
 .var FRAG_PTR                 = $f9
-// $f7/$f8 are free for the same reason. Main-thread-only indirect pointer to
-// the raw stage row currently being copied to screen RAM; multiplexIRQ never
-// touches it, so the raster IRQ cannot corrupt it mid-copy.
-.var STAGE_SRC                = $f7
 .const BACKGROUND_COLOUR      = $D021
