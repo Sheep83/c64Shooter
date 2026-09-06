@@ -4,6 +4,16 @@
 #import "variables.asm"
 
 .const MAX_OBJECTS = 16
+.const GAMEPLAY_SPRITE_MIN_Y = 71           // Body starts on raster72; no sprite DMA in the HUD transition.
+.const GAMEPLAY_SPRITE_END_Y = 246          // Exclusive: later origins have no pixels inside RSEL=0 aperture.
+// Progressive top-edge clip: objects with GAMEPLAY_SPRITE_CLIP_MIN_Y <= Y < 71
+// are rendered at their TRUE VIC Y using a private bitmap whose top (71-Y) rows
+// are transparent, so a sprite emerges one pixel at a time through raster72.
+// Y = GAMEPLAY_SPRITE_MIN_Y - 20 leaves exactly one visible body row at Y=51.
+.const GAMEPLAY_SPRITE_CLIP_MIN_Y = GAMEPLAY_SPRITE_MIN_Y - 20  // 51
+.const CLIP_SPRITE_POOL = $3400             // 2 plan halves x 8 hw slots x 64 bytes, VIC bank 0.
+.const CLIP_SPRITE_POOL_PTR = CLIP_SPRITE_POOL / 64             // $d0; slot pointer = base + plan + hwslot.
+.const CLIP_FULL_REBUILD_BUDGET = 8         // Max 63-byte clip rebuilds per BUILD; extras wait a frame.
 .const TYPE_PLAYER = 1
 .const TYPE_ENEMY  = 2
 .const TYPE_ENEMY_BULLET = 3
@@ -33,20 +43,32 @@
 .const HEALTH_SPRITE_BASE_PTR = HEALTH_SPRITE_BASE / 64
 
 // ============================================================================
-// MINIMAL scrolling-background prototype.
-// Deliberately narrow goal: prove a vertically scrolling character
-// background can coexist cleanly with the existing sprite multiplexer,
-// without touching its own scheduling. See docs/background-engine.md for
-// the milestone plan. No raster split, second screen or double buffering:
-// all 25 rows at $0400 scroll. Two diagnostic character patches compensate
-// for that motion; see docs/hud-architecture.md. Explicitly NOT here: starfield-
-// during-PLAYING (see startGame), turrets, entities, hitscan-vs-scenery,
-// per-cell colour, stage completion, CharPad, multiload, compression.
+// Single-screen beam-raced scrolling playfield with a fixed top character HUD.
+// One matrix/charset; row0 is fixed, terrainrows1..23 scroll, row24 is unused.
+// The shared raster chain owns the display split and LIVE sprite reassignments.
+// See docs/fixed-hud-codex-worklog.md for measured timing and acceptance status.
 // ============================================================================
 .const BG_SCREEN_A = $0400
+// Fixed HUD row0 private glyphs: codes 128..145 = space, S, C, O, R, E, 0..9,
+// then F and R (for the development FREE-cycle counter). Bitmaps are copied
+// into the RAM charset by initFixedHud; the ten digit glyphs live at
+// HUD_DIGIT_GLYPH..+9. displayScore / displayCycleMinimum write these codes
+// (never screen codes 48-57) into their assigned fixed HUD cells only.
+.const HUD_GLYPH_BASE = 128
+.const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6      // 134..143: private decimal digits 0..9.
+.const HUD_SCORE_CELL = BG_SCREEN_A + 8          // Row 0 cols 8..12: five live score digits.
+.const HUD_FREE_GLYPH_F = HUD_GLYPH_BASE + 16    // 144: private 'F'.
+.const HUD_FREE_GLYPH_R = HUD_GLYPH_BASE + 17    // 145: private 'R'.
+.const HUD_FREE_LABEL_CELL = BG_SCREEN_A + 28    // Row 0 cols 28..37: "FREE " + five digits.
+.const HUD_FREE_CELL = BG_SCREEN_A + 33          // Row 0 cols 33..37: five FREE-cycle digits.
+// 1 = show the approximate development free-cycle headroom (rolling 50-frame
+// minimum) at the right of the fixed HUD. 0 = leave that area blank and skip
+// the once-per-second decimal display work; the measurement itself still runs.
+.const DEBUG_SHOW_FREE_CYCLES = 1
 .const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
                                                      // colour RAM work at all, scrolling or otherwise.
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
+.const BG_COARSE_LATEST_START = 184                // Exclusive; no remaining sprite batches may interrupt the copy.
 
 // 4x4 character metatile stage (stage_test.asm): a metatile stage row is
 // METATILES_PER_ROW IDs wide (one screen width); a metatile stage row
@@ -231,8 +253,7 @@ init:
     // wholly inside fetched terrain for every fine phase and so hides both the
     // top and bottom scroll-edge artefacts (docs/scroll-edge-investigation.md).
     // DEN, YSCROL and the raster-compare MSB are left as the KERNAL set them;
-    // every later $D011 write (applyFineScroll, armFirstBatch, endGame) masks
-    // bit 3, so RSEL stays 0 for the whole run.
+    // Gameplay dispatcher writes and menu restoration also keep bit3 clear.
     lda VIC_CONTROL_1
     and #%11110111
     sta VIC_CONTROL_1
@@ -254,6 +275,7 @@ init:
 // render plan, and switch the top-level state to PLAYING. Re-callable for
 // each new game from the attract screen.
 startGame:
+    jsr initRasterScheduler                // Reset diagnostics before the first game presentation.
     lda #147                                // Wipe any menu / high-score text from screen RAM.
     jsr $ffd2
     // Starfield deliberately NOT repainted here: it is disabled for the
@@ -349,12 +371,10 @@ mainLoop:
 // BUILD_PLAN for the next frame. Returns to the router once the player has
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
-    jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
-    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment. No raster
-                                             // split, no IRQ: the whole 25-row screen scrolls together.
+    jsr waitForGameFrame                    // Coordinate this presentation with the physical-frame IRQ.
+    jsr applyFineScroll                     // Publish the terrain phase for the shared display event.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
-    jsr drawHudDiagnostic                  // Four character cells; never takes ownership of a hardware sprite.
     jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
 
 !frameLoop:
@@ -381,12 +401,11 @@ gameLoop:
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
 
-    jsr waitForFrameStart                   // Call waitForFrameStart; return here when it executes RTS.
-    jsr applyFineScroll                     // Write this frame's YSCROL - see its comment.
+    jsr waitForGameFrame                    // Coordinate this presentation with the physical-frame IRQ.
+    jsr applyFineScroll                     // Publish the terrain phase for the shared display event.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
-    jsr drawHudDiagnostic                  // Publish phase-compensated markers before row 3 is fetched.
     jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
     jmp !frameLoop-                         // Jump unconditionally to !frameLoop-.
 
@@ -407,6 +426,8 @@ endGame:
     sta IRQ_VECTOR                          // stray interrupt can no longer reach multiplexIRQ.
     lda #>$ea31
     sta IRQ_VECTOR + 1
+    lda #$81
+    sta $dc0d                               // Restore KERNAL timer-A IRQ for menu/initials entry.
     cli
 
     lda #0
@@ -414,7 +435,7 @@ endGame:
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
 
     lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
-    and #%11111000                          // OVER/menu - applyFineScroll (PLAYING only) may have
+    and #%11111000                          // OVER/menu - the gameplay display event may have
     ora #3                                  // left this at any of 0-7. Bit 3 (RSEL) is preserved,
     sta VIC_CONTROL_1                       // so the 24-row mode set in init stays in effect.
 
@@ -1436,7 +1457,8 @@ updatePlayer:
     and #%00000001                          // AND A with #%00000001.
     bne !down+                              // Branch to !down+ if the previous result was non-zero/not equal.
     lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
-    cmp #49                                 // Compare A with #49; set flags, leaving A unchanged.
+    cmp #GAMEPLAY_SPRITE_MIN_Y              // Keep the player within the same viewport as every rendered object.
+    bcc !down+
     beq !down+                              // Branch to !down+ if the previous result was zero/equal.
     dec OBJECT_Y,x                          // Up
 
@@ -1560,6 +1582,8 @@ tracePlayerCannon:
     bne !next+
 
     lda OBJECT_Y,x                          // Hitscan only travels upward from the player's current position.
+    cmp #GAMEPLAY_SPRITE_MIN_Y
+    bcc !next+                              // Off-screen ingress is not a hittable target.
     cmp OBJECT_Y
     bcs !next+
 
@@ -1904,7 +1928,7 @@ updateEnemyFire:
     cmp #STAGE_EGRESS
     beq !next+
     lda OBJECT_Y,x                          // Keep firing to the readable middle of an attack.
-    cmp #64
+    cmp #GAMEPLAY_SPRITE_MIN_Y
     bcc !next+
     cmp #190
     bcs !next+
@@ -2359,7 +2383,8 @@ accelerateEnemyDive:
     rts
 
 // --- Routine: buildSortedObjectList ----------------------------------------
-// Collect active logical object numbers into SORTED_OBJECTS.
+// Collect visible active logical objects. Off-screen objects retain their
+// allocation and path/lifetime updates, but own no VIC slot until eligible.
 buildSortedObjectList:
     lda #0                                  // Load A from #0.
     sta SORTED_COUNT                        // Store A in SORTED_COUNT.
@@ -2367,6 +2392,11 @@ buildSortedObjectList:
 !collect:
     lda OBJECT_ACTIVE,x                     // Load A from OBJECT_ACTIVE,x.
     beq !next+                              // Branch to !next+ if the previous result was zero/equal.
+    lda OBJECT_Y,x
+    cmp #GAMEPLAY_SPRITE_CLIP_MIN_Y         // Straddlers (Y 51..70) are kept and rendered top-clipped;
+    bcc !next+                              // only bodies wholly above raster72 own no VIC slot.
+    cmp #GAMEPLAY_SPRITE_END_Y
+    bcs !next+
     ldy SORTED_COUNT                        // Load Y from SORTED_COUNT.
     txa                                     // Copy X into A.
     sta SORTED_OBJECTS,y                    // Store A in SORTED_OBJECTS,y.
@@ -2424,6 +2454,8 @@ sortObjectsByY:
 // --- Routine: buildInitialSpriteSnapshot -----------------------------------
 // Snapshot the first eight sorted objects into BUILD_PLAN.
 buildInitialSpriteSnapshot:
+    lda #CLIP_FULL_REBUILD_BUDGET           // Reset the per-frame 63-byte clip-rebuild allowance.
+    sta CLIP_FULL_BUDGET
     lda SORTED_COUNT                        // Load A from SORTED_COUNT.
     cmp #8                                  // Compare A with #8; set flags, leaving A unchanged.
     bcc !countReady+                        // Branch to !countReady+ if carry is clear.
@@ -2453,10 +2485,11 @@ buildInitialSpriteSnapshot:
     lda OBJECT_X_MSB,x
     sta INITIAL_X_MSB,y
 
-    lda OBJECT_Y,x                          // Snapshot the path-owned Y coordinate directly.
+    lda OBJECT_Y,x                          // Snapshot the path-owned Y coordinate directly (never moved for clipping).
     sta INITIAL_Y,y
-    lda OBJECT_SPRITE,x                     // Load A from OBJECT_SPRITE,x.
-    sta INITIAL_SPRITE,y                    // Store A in INITIAL_SPRITE,y.
+    jsr snapshotSpritePointer              // Straddlers get a private top-clipped bitmap; others the plain pointer.
+    ldx TEMP_OBJECT                         // Restore the logical object index clobbered by the clip build.
+    ldy SNAPSHOT_INDEX                      // Restore the plan entry index.
     lda OBJECT_COLOUR,x                     // Load A from OBJECT_COLOUR,x.
     sta INITIAL_COLOUR,y                    // Store A in INITIAL_COLOUR,y.
     txa                                     // Copy the logical object index into A.
@@ -2472,9 +2505,190 @@ buildInitialSpriteSnapshot:
 !done:
     rts                                     // Return to the calling routine.
 
+// --- Routine: snapshotSpritePointer --------------------------------------------
+// Entry: X = logical object, Y = SNAPSHOT_INDEX = plan entry index (BUILD_PLAN +
+// hardware slot). Writes INITIAL_SPRITE[Y]. For an object whose body is wholly
+// inside the aperture (Y >= 71) that is just OBJECT_SPRITE. For a straddler
+// (51..70) it renders a private bitmap with the top 71-Y rows blanked into
+// CLIP_SPRITE_POOL[plan entry] and points the plan entry there. True VIC Y is
+// never changed. May clobber A, X, Y; callers restore from TEMP_OBJECT /
+// SNAPSHOT_INDEX. buildSortedObjectList guarantees Y >= 51 here.
+snapshotSpritePointer:
+    lda OBJECT_Y,x
+    cmp #GAMEPLAY_SPRITE_MIN_Y
+    bcs !plain+                             // Body starts at raster >= 72: no clipping needed.
+
+    lda #GAMEPLAY_SPRITE_MIN_Y             // d = 71 - Y  (rows to blank from the top, 1..20).
+    sec
+    sbc OBJECT_Y,x
+    ldy SNAPSHOT_INDEX
+    cmp CLIP_SHADOW_D,y                     // Same depth, same source, immutable art: this pool
+    bne !build+                            // slot is already exactly what we need - skip the copy.
+    lda OBJECT_SPRITE,x
+    cmp CLIP_SHADOW_PTR,y
+    bne !build+
+    cmp #HEALTH_SPRITE_BASE_PTR
+    bcs !build+
+    tya
+    clc
+    adc #CLIP_SPRITE_POOL_PTR
+    sta INITIAL_SPRITE,y
+    rts
+
+!build:
+    lda #GAMEPLAY_SPRITE_MIN_Y
+    sec
+    sbc OBJECT_Y,x
+    jsr buildClippedInitialSprite          // Uses A=d, X=object, SNAPSHOT_INDEX=plan entry.
+    bcs !overBudget+                        // Carry set: too many full rebuilds this frame.
+
+    lda SNAPSHOT_INDEX                      // Pointer = CLIP_SPRITE_POOL_PTR + plan entry (0..15).
+    clc
+    adc #CLIP_SPRITE_POOL_PTR
+    ldy SNAPSHOT_INDEX
+    sta INITIAL_SPRITE,y
+    rts
+
+!overBudget:
+    // A brand-new straddler that would need a full 63-byte rebuild is shown as
+    // a blank sprite for this frame only (its pool slot's shadow was cleared so
+    // the next BUILD rebuilds it). At the entry Y this is 1-2 pixels of a body
+    // that is about to appear anyway - not the whole-sprite pop this replaces.
+    lda #blankSprite / 64
+    ldy SNAPSHOT_INDEX
+    sta INITIAL_SPRITE,y
+    rts
+
+!plain:
+    lda #0                                  // This pool slot no longer mirrors a straddler bitmap.
+    sta CLIP_SHADOW_PTR,y
+    lda OBJECT_SPRITE,x
+    sta INITIAL_SPRITE,y
+    rts
+
+// --- Routine: buildClippedInitialSprite --------------------------------------
+// Entry: A = clip depth d in bitmap rows (1..20), X = logical object,
+// SNAPSHOT_INDEX = plan entry (0..15). Copies OBJECT_SPRITE's 63-byte bitmap
+// into CLIP_SPRITE_POOL[plan entry] and zeros the top d*3 bytes. Uses the
+// TEXT_SRC/TEXT_DST zero-page pointers (free at this point in the frame loop -
+// the scroller's copyIncomingRowToScreen runs later). Clobbers A, X, Y.
+.const CLIP_SRC = TEXT_SRC
+.const CLIP_DST = TEXT_DST
+buildClippedInitialSprite:
+    sta CLIP_DEPTH
+    asl                                    // d*3 bytes to blank.
+    clc
+    adc CLIP_DEPTH
+    sta CLIP_DEPTH_BYTES
+
+    lda SNAPSHOT_INDEX                      // dst = CLIP_SPRITE_POOL + planEntry*64.
+    and #3
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta CLIP_DST
+    lda SNAPSHOT_INDEX
+    lsr
+    lsr
+    clc
+    adc #>CLIP_SPRITE_POOL
+    sta CLIP_DST + 1
+
+    lda OBJECT_SPRITE,x                     // src = OBJECT_SPRITE * 64 (low byte).
+    and #3
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta CLIP_SRC
+    lda OBJECT_SPRITE,x                     // src high byte.
+    lsr
+    lsr
+    sta CLIP_SRC + 1
+
+    // If this pool slot already mirrors the same source bitmap (this plan built
+    // it two frames ago), only the mask rows between the old and new clip depth
+    // change - a straddler moves a few pixels per frame, not 63 bytes. Private
+    // health-bar copies ($c0+) can mutate under a stable pointer, so those are
+    // always fully recopied; formation art below $c0 is immutable.
+    lda OBJECT_SPRITE,x
+    cmp #HEALTH_SPRITE_BASE_PTR
+    bcs !fullCopy+
+    ldy SNAPSHOT_INDEX
+    lda CLIP_SHADOW_PTR,y
+    cmp OBJECT_SPRITE,x
+    bne !fullCopy+
+
+    lda CLIP_SHADOW_D,y                     // old_d*3 -> CLIP_OLD_BYTES.
+    asl
+    clc
+    adc CLIP_SHADOW_D,y
+    sta CLIP_OLD_BYTES
+    lda CLIP_SHADOW_D,y
+    cmp CLIP_DEPTH
+    beq !record+                            // Same depth: pool slot is already correct.
+    bcs !shrink+                            // old_d > new_d: restore rows [new_d, old_d) from source.
+
+    ldy CLIP_OLD_BYTES                      // old_d < new_d: blank rows [old_d, new_d).
+    lda #0
+!grow:
+    sta (CLIP_DST),y
+    iny
+    cpy CLIP_DEPTH_BYTES
+    bne !grow-
+    jmp !record+
+
+!shrink:
+    ldy CLIP_DEPTH_BYTES
+!restore:
+    lda (CLIP_SRC),y
+    sta (CLIP_DST),y
+    iny
+    cpy CLIP_OLD_BYTES
+    bne !restore-
+    jmp !record+
+
+!fullCopy:
+    dec CLIP_FULL_BUDGET                    // Bound worst-case BUILD cost: only a few 63-byte
+    bmi !overBudget+                        // rebuilds per frame; the rest wait one frame.
+    ldy #62                                 // New bitmap in this slot: full copy then blank the top.
+!copy:
+    lda (CLIP_SRC),y
+    sta (CLIP_DST),y
+    dey
+    bpl !copy-
+    lda #0
+    ldy CLIP_DEPTH_BYTES
+!blank:
+    dey
+    sta (CLIP_DST),y
+    bne !blank-
+
+!record:
+    ldy SNAPSHOT_INDEX                      // Remember what this pool slot now holds.
+    lda OBJECT_SPRITE,x
+    sta CLIP_SHADOW_PTR,y
+    lda CLIP_DEPTH
+    sta CLIP_SHADOW_D,y
+    clc                                    // Carry clear: a real clipped bitmap is in the pool.
+    rts
+
+!overBudget:
+    ldy SNAPSHOT_INDEX                     // Leave the shadow cleared so the next BUILD rebuilds it.
+    lda #0
+    sta CLIP_SHADOW_PTR,y
+    sec                                    // Carry set: caller shows a blank sprite this frame.
+    rts
+
 // --- Routine: buildBatchSpriteSchedule -------------------------------------
 // Build BUILD_PLAN's raster batches for sorted objects beyond the first eight.
 buildBatchSpriteSchedule:
+    jsr beginRasterPlanMasks               // BUILD-only final hardware masks, outside the IRQ loop.
     lda #0                                  // Load A from #0.
     ldy BUILD_PLAN                          // Load Y from BUILD_PLAN.
     sta BATCH_COUNT,y                       // Store A in BATCH_COUNT,y.
@@ -2624,6 +2838,7 @@ buildBatchSpriteSchedule:
     sta ASSIGN_COLOUR,x                     // Store A in ASSIGN_COLOUR,x.
     tya                                     // Copy the logical object index into A.
     sta ASSIGN_OBJECT,x                     // Remember which object will own the recycled hardware slot.
+    jsr extendRasterPlanMasks              // Snapshot final masks without changing slot selection.
 
     inc SCHED_ASSIGN_INDEX                  // Increment SCHED_ASSIGN_INDEX by one.
     inc SCHED_BATCH_SIZE                    // Increment SCHED_BATCH_SIZE by one.
@@ -2659,6 +2874,10 @@ buildBatchSpriteSchedule:
     sta BATCH_FIRST_ASSIGN,x                // Store A in BATCH_FIRST_ASSIGN,x.
     lda SCHED_BATCH_SIZE                    // Load A from SCHED_BATCH_SIZE.
     sta BATCH_ASSIGN_COUNT,x                // Store A in BATCH_ASSIGN_COUNT,x.
+    lda SCHED_PLAYER_MASK
+    sta BATCH_PLAYER_MASK,x
+    lda SCHED_X_MSB_MASK
+    sta BATCH_X_MSB_MASK,x
 
     ldy BUILD_PLAN                          // Load Y from BUILD_PLAN.
     lda BATCH_COUNT,y                       // Load A from BATCH_COUNT,y.
@@ -2751,14 +2970,13 @@ awardKillScore:
     rts
 
 // --- Routine: displayScore --------------------------------------------------
-// Convert the 16-bit binary score to five decimal digits at SCORE_SCREEN+6.
-// The existing decimal divisor table is shared with the FREE-cycle display.
+// Convert the 16-bit binary score to five decimal digits and write the private
+// fixed-HUD digit glyphs into HUD_SCORE_CELL..+4. Called once per score change
+// (awardKillScore) and once at game start (initFixedHud), never per frame, so
+// no separate change guard is needed. The decimal divisor table is shared with
+// the FREE-cycle display. The scrolling matrix outside the fixed HUD row is
+// never touched.
 displayScore:
-    lda GAME_STATE                          // Keep scoring, but leave the scrolling matrix alone.
-    cmp #GAME_STATE_PLAYING
-    bne !draw+
-    rts
-!draw:
     lda SCORE_LO
     sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
     lda SCORE_HI
@@ -2790,8 +3008,8 @@ displayScore:
 !emitDigit:
     tya
     clc
-    adc #48                                 // Screen codes 48-57 display digits 0-9.
-    sta SCORE_SCREEN + 6,x
+    adc #HUD_DIGIT_GLYPH                    // Private HUD digit glyph 0..9 - never screen codes 48-57.
+    sta HUD_SCORE_CELL,x
     inx
     cpx #5
     bne !digitLoop-
@@ -2801,18 +3019,9 @@ scoreLabel:
     .byte 19,3,15,18,5,32,48,48,48,48,48  // Screen codes for "SCORE 00000".
 
 // --- Routine: setupDebugDisplay --------------------------------------------
-// Draw "FREE 00000", colour it white, and initialise the rolling cycle minimum.
+// Initialise the rolling cycle minimum. The FREE label/digits now live in the
+// fixed HUD row painted by initFixedHud, not in raw screen RAM.
 setupDebugDisplay:
-    ldx #0                                  // Start at the first character in the debug label.
-!labelLoop:
-    lda debugLabel,x                        // Load the next prebuilt screen code.
-    sta DEBUG_SCREEN,x                      // Write it into the top-left of screen RAM.
-    lda #1                                  // Use C64 colour 1: white.
-    sta DEBUG_COLOUR,x                      // Set this character's colour RAM entry.
-    inx                                     // Advance to the next debug character.
-    cpx #10                                 // Label plus five digits occupies ten characters.
-    bne !labelLoop-                         // Keep copying until all ten characters are written.
-
     lda #0                                  // Start the one-second frame counter at zero.
     sta DEBUG_FRAME_COUNT                   // Store the current debug frame count.
     lda #$ff                                // $ffff is higher than any possible PAL-frame free-cycle value.
@@ -2821,15 +3030,18 @@ setupDebugDisplay:
     rts                                     // Return to init.
 
 // --- Routine: updateCycleDebug ---------------------------------------------
-// Track the lowest approximate free-cycle count and display it every 50 frames.
+// Track the lowest approximate free-cycle count and, once per ~PAL second,
+// publish the rolling minimum into the fixed HUD FREE cells. The measurement
+// (raster sample, x63, rolling-min compare) is unchanged and always runs.
 updateCycleDebug:
     inc DEBUG_FRAME_COUNT                   // Count one completed BUILD_PLAN preparation.
     lda DEBUG_FRAME_COUNT                   // Load the updated frame count.
     cmp #DEBUG_FRAMES                       // Has roughly one PAL second elapsed?
     bne !sample+                            // If not, skip the relatively expensive decimal display update.
 
-    // No displayCycleMinimum during PLAYING: retain the RAM measurement,
-    // but the diagnostic background owns the entire screen (no fixed HUD).
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
+    jsr displayCycleMinimum                 // Publish the last interval's minimum before it is reset.
+}
     lda #0                                  // Begin a fresh 50-frame interval.
     sta DEBUG_FRAME_COUNT                   // Reset the frame counter.
     lda #$ff                                // Reset the rolling minimum to the largest possible 16-bit value.
@@ -2899,8 +3111,11 @@ updateCycleDebug:
     rts                                     // Return to the main loop.
 
 // --- Routine: displayCycleMinimum ------------------------------------------
-// Convert the 16-bit rolling minimum to five decimal digits at DEBUG_SCREEN+5.
+// Convert the 16-bit rolling minimum to five private HUD digit glyphs in the
+// fixed HUD FREE cells. Called once per ~PAL second only when the development
+// counter is enabled; the body compiles out to a bare RTS for a release build.
 displayCycleMinimum:
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
     lda DEBUG_MIN_LO                        // Copy the rolling minimum so conversion can destructively subtract.
     sta DEBUG_VALUE_LO                      // Working decimal value, low byte.
     lda DEBUG_MIN_HI                        // Copy minimum high byte.
@@ -2931,16 +3146,14 @@ displayCycleMinimum:
 
 !emitDigit:
     tya                                     // Copy the decimal digit count into A.
-    clc                                     // Clear carry before converting the digit to a screen code.
-    adc #48                                 // Screen codes 48-57 display digits 0-9.
-    sta DEBUG_SCREEN + 5,x                  // Write this digit after the "FREE " label.
+    clc                                     // Clear carry before converting to a private HUD glyph.
+    adc #HUD_DIGIT_GLYPH                    // Private HUD digit glyph 0..9 - never screen codes 48-57.
+    sta HUD_FREE_CELL,x                     // Write this digit after the fixed HUD "FREE " label.
     inx                                     // Advance to the next decimal place.
     cpx #5                                  // Five digits cover every possible PAL-frame cycle count.
     bne !digitLoop-                         // Convert the remaining decimal places.
+}
     rts                                     // Return to updateCycleDebug.
-
-debugLabel:
-    .byte 6,18,5,5,32,48,48,48,48,48       // Screen codes for "FREE 00000".
 
 debugDivisorLo:
     .byte $10,$e8,$64,$0a,$01              // Low bytes: 10000, 1000, 100, 10, 1.
@@ -3017,6 +3230,7 @@ renderSprites:
     sta SPR_X,y                             // Store A in SPR_X,y.
     lda TEMP_Y_REG                          // Load A from TEMP_Y_REG.
     sta SPR_Y,y                             // Store A in SPR_Y,y.
+rasterInitialApplied:                       // Diagnostic trace: X is hardware slot, TEMP_SORT_Y is LIVE index.
 
     ldy TEMP_SORT_Y                         // Load Y from TEMP_SORT_Y.
     lda INITIAL_X_MSB,y                     // Load A from INITIAL_X_MSB,y.
@@ -3031,6 +3245,7 @@ renderSprites:
 
     lda TEMP_MSB                            // Load A from TEMP_MSB.
     sta SPRITE_OVERFLOW_REGISTER            // Store A in SPRITE_OVERFLOW_REGISTER.
+rasterInitialMasksApplied:
     rts                                     // Return to the calling routine.
 
 !none:
@@ -3039,153 +3254,17 @@ renderSprites:
 
 
 // --- Routine: armFirstBatch -------------------------------------------------
-// Install/arm LIVE_PLAN's first raster batch, if one exists.
+// Publish LIVE_PLAN into the shared physical-frame event chain.
 armFirstBatch:
-    sei                                     // Block maskable IRQs while critical state is changed.
-    lda IRQ_ENABLE                          // Load A from IRQ_ENABLE.
-    and #%11111110                          // AND A with #%11111110.
-    sta IRQ_ENABLE                          // Disable raster IRQ while arming
-
-    ldy LIVE_PLAN
-    lda BATCH_COUNT,y
-    bne !hasBatch+
-
-    lda #%00000001                          // Select raster interrupt latch.
-    sta IRQ_STATUS                          // Clear any stale raster condition.
-    jmp !done+
-
-!hasBatch:
-
-    lda #0                                  // Load A from #0.
-    sta BATCH_INDEX                         // Store A in BATCH_INDEX.
-
-    lda #<multiplexIRQ                      // Load A from #<multiplexIRQ.
-    sta IRQ_VECTOR                          // Store A in IRQ_VECTOR.
-    lda #>multiplexIRQ                      // Load A from #>multiplexIRQ.
-    sta IRQ_VECTOR + 1                      // Store A in IRQ_VECTOR + 1.
-
-    lda VIC_CONTROL_1                       // Load A from VIC_CONTROL_1.
-    and #%01111111                          // AND A with #%01111111.
-    sta VIC_CONTROL_1                       // Raster compare below 256
-
-    ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda BATCH_RASTER,y                      // Load A from BATCH_RASTER,y.
-    sta RASTER                              // Store A in RASTER.
-
-    lda #%00000001                          // Load A from #%00000001.
-    sta IRQ_STATUS                          // Clear stale raster IRQ
-    lda IRQ_ENABLE                          // Load A from IRQ_ENABLE.
-    ora #%00000001                          // OR A with #%00000001.
-    sta IRQ_ENABLE                          // Store A in IRQ_ENABLE.
-!done:
-    cli                                     // Allow maskable IRQs.
-    rts                                     // Return to the calling routine.
+    sei                                     // Publish only a complete LIVE plan.
+    jsr publishRasterPlan
+    cli
+    rts
 
 // --- Routine: multiplexIRQ --------------------------------------------------
-// Apply one prepared LIVE_PLAN batch and chain to the next raster batch.
+// One dispatcher owns frame reset, the display hook and LIVE sprite batches.
 multiplexIRQ:
-    lda IRQ_ENABLE                          // Check whether raster IRQ generation is currently enabled.
-    and #%00000001                          // Isolate the VIC raster IRQ enable bit.
-    beq !notRaster+                         // If disabled, this must be some other IRQ source.
-
-    lda IRQ_STATUS                          // Read VIC interrupt status.
-    and #%00000001                          // Isolate the raster interrupt flag.
-    bne !raster+                            // Enabled + pending means this is one of our raster IRQs.
-
-!notRaster:
-    jmp $ea31                               // Let the normal KERNAL IRQ handler deal with it.
-
-!raster:
-    jsr capturePlayerCollision              // Consume $D01E before this batch changes hardware-sprite ownership.
-
-    lda BATCH_INDEX                         // Load A from BATCH_INDEX.
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    adc LIVE_PLAN                           // Add LIVE_PLAN to A, including carry.
-    tax                                     // Buffered batch index
-
-    lda BATCH_FIRST_ASSIGN,x                // Load A from BATCH_FIRST_ASSIGN,x.
-    tay                                     // First ordinary assignment index
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    adc BATCH_ASSIGN_COUNT,x                // Add BATCH_ASSIGN_COUNT,x to A, including carry.
-    sta IRQ_ASSIGN_END                      // Store A in IRQ_ASSIGN_END.
-
-!assignmentLoop:
-    sty IRQ_ASSIGN_INDEX                    // Store Y in IRQ_ASSIGN_INDEX.
-    tya                                     // Copy Y into A.
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    adc LIVE_PLAN                           // Add LIVE_PLAN to A, including carry.
-    tay                                     // Buffered assignment index
-
-    lda ASSIGN_SLOT,y                       // Load A from ASSIGN_SLOT,y.
-    sta IRQ_SELECTED_SLOT                   // Store A in IRQ_SELECTED_SLOT.
-    ldx IRQ_SELECTED_SLOT                   // Load X from IRQ_SELECTED_SLOT.
-
-    lda HW_BIT_MASK,x                       // Get the bit belonging to the hardware slot being recycled.
-    eor #$ff                                // Invert it into a clear-mask.
-    and PLAYER_HW_MASK                      // Remove this slot from the player mask if the player previously owned it.
-    sta PLAYER_HW_MASK                      // Ownership is about to change.
-
-    lda ASSIGN_OBJECT,y                     // Read the logical object taking ownership of this slot.
-    bne !assignmentNotPlayer+               // Non-zero means an enemy/other object.
-    lda HW_BIT_MASK,x                       // Object 0 is the player, so capture its new hardware slot.
-    sta PLAYER_HW_MASK
-!assignmentNotPlayer:
-
-    lda ASSIGN_SPRITE,y                     // Load A from ASSIGN_SPRITE,y.
-    sta HW_SPRITE_POINTER,x                 // Store A in HW_SPRITE_POINTER,x.
-    lda ASSIGN_COLOUR,y                     // Load A from ASSIGN_COLOUR,y.
-    sta HW_SPRITE_COLOUR,x                  // Store A in HW_SPRITE_COLOUR,x.
-
-    lda HW_SPRITE_OFFSET,x                  // Load A from HW_SPRITE_OFFSET,x.
-    tax                                     // Copy A into X.
-    lda ASSIGN_X,y                          // Load A from ASSIGN_X,y.
-    sta SPR_X,x                             // Store A in SPR_X,x.
-    lda ASSIGN_Y,y                          // Load A from ASSIGN_Y,y.
-    sta SPR_Y,x                             // Store A in SPR_Y,x.
-
-    ldx IRQ_SELECTED_SLOT                   // Load X from IRQ_SELECTED_SLOT.
-    lda SPRITE_OVERFLOW_REGISTER            // Load A from SPRITE_OVERFLOW_REGISTER.
-    and HW_CLEAR_MASK,x                     // AND A with HW_CLEAR_MASK,x.
-    sta SPRITE_OVERFLOW_REGISTER            // Store A in SPRITE_OVERFLOW_REGISTER.
-    lda ASSIGN_X_MSB,y                      // Load A from ASSIGN_X_MSB,y.
-    beq !msbDone+                           // Branch to !msbDone+ if the previous result was zero/equal.
-    lda SPRITE_OVERFLOW_REGISTER            // Load A from SPRITE_OVERFLOW_REGISTER.
-    ora HW_BIT_MASK,x                       // OR A with HW_BIT_MASK,x.
-    sta SPRITE_OVERFLOW_REGISTER            // Store A in SPRITE_OVERFLOW_REGISTER.
-!msbDone:
-
-    ldy IRQ_ASSIGN_INDEX                    // Load Y from IRQ_ASSIGN_INDEX.
-    iny                                     // Increment Y by one.
-    cpy IRQ_ASSIGN_END                      // Compare Y with IRQ_ASSIGN_END; set flags, leaving Y unchanged.
-    bne !assignmentLoop-                    // Branch to !assignmentLoop- if the previous result was non-zero/not equal.
-
-    lda #%00000001                          // Load A from #%00000001.
-    sta IRQ_STATUS                          // Acknowledge raster IRQ
-
-    inc BATCH_INDEX                         // Increment BATCH_INDEX by one.
-    ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
-    lda BATCH_INDEX                         // Load A from BATCH_INDEX.
-    cmp BATCH_COUNT,y                       // Compare A with BATCH_COUNT,y; set flags, leaving A unchanged.
-    bcs !allDone+                           // Branch to !allDone+ if carry is set.
-
-    clc                                     // Clear carry before an addition or shift-dependent operation.
-    adc LIVE_PLAN                           // Add LIVE_PLAN to A, including carry.
-    tax                                     // Copy A into X.
-    lda BATCH_RASTER,x                      // Load A from BATCH_RASTER,x.
-    sta RASTER                              // Arm next batch
-    jmp $ea31                               // Jump unconditionally to $ea31.
-
-!allDone:
-    lda IRQ_ENABLE                          // Load the VIC interrupt-enable register.
-    and #%11111110                          // Clear raster interrupt enable bit.
-    sta IRQ_ENABLE                          // Disable further raster IRQ generation.
-
-    lda #%00000001                          // Select the VIC raster interrupt latch.
-    sta IRQ_STATUS                          // Clear any pending/stale raster condition.
-
-    lda #0                                  // Reset batch position for the next frame.
-    sta BATCH_INDEX                         // Store zero in BATCH_INDEX.
-    jmp $ea31                               // Continue through the normal KERNAL IRQ handler.
+    jmp rasterIRQ
 
 
 // --- Routine: capturePlayerCollision ---------------------------------------
@@ -3195,6 +3274,7 @@ multiplexIRQ:
 // avoids 6502 relative-branch range problems as collision rules grow.
 capturePlayerCollision:
     lda VIC_SPRITE_COLLISION                // Always read/clear the VIC latch, even while invulnerable.
+checkCapturedPlayerCollision:
     ldy PLAYER_STATE
     beq !playerAlive+
     rts
@@ -3212,6 +3292,11 @@ capturePlayerCollision:
     jmp !next+
 
 !active:
+    lda OBJECT_Y,x
+    cmp #GAMEPLAY_SPRITE_MIN_Y
+    bcc !next+                              // Culled ingress cannot cause an invisible software collision.
+    cmp #GAMEPLAY_SPRITE_END_Y
+    bcs !next+
     lda OBJECT_TYPE,x
     cmp #TYPE_ENEMY
     bne !checkBullet+
@@ -3803,16 +3888,13 @@ BATCH_INDEX:           .byte 0
 BATCH_RASTER:          .fill 16, 0
 
 // --- Minimal background-scroll state -------------------------------------
-// No raster split or second screen. The HUD compensates in character data.
-// $D011 bits 0-2 (YSCROL) are written once per presented frame from the main loop -
-// no IRQ of any kind is armed for the background. The sprite multiplexer
-// (armFirstBatch/multiplexIRQ, above) is untouched, byte-for-byte
-// identical to the pre-background baseline.
+// One screen; the shared raster display event separates fixedrow0 from terrain.
+// Main prepares SCROLL_FINE; RASTER_DISPLAY_FINE owns the presented IRQ phase.
 SCROLL_FRAME_COUNT:    .byte 0          // Counts up to SCROLL_FRAME_DIVIDER.
-SCROLL_FINE:           .byte 0          // Current YSCROL, 0-7, applied to the WHOLE screen.
+SCROLL_FINE:           .byte 0          // Next terrain YSCROL,0-7; may be pending coarse publication.
 SCROLL_ROW:            .byte 0          // Logical stage row index (0..STAGE_LOGICAL_ROWS-1) currently
-                                         // shown at screen row 0. See renderStageRowToScreen below.
-BG_DEST_ROW:           .byte 0          // Scratch: destination screen row (0-24).
+                                         // shown at matrix row1. See renderStageRowToScreen below.
+BG_DEST_ROW:           .byte 0          // Scratch: terrain destination matrix row (1-23).
 BG_CROSSING_ROW:       .fill 40, 0      // 40-byte holding buffer for the one row (old 12 -> new 13)
                                          // that crosses the upper/lower coarse-copy split. Generic:
                                          // holds whatever bytes were actually on screen, not an ID.
@@ -4674,9 +4756,23 @@ HEALTH_SPRITE_POOL_END:
     .error "Health sprite pool exceeds VIC bank 0"
 }
 
+// --- Private top-clipped sprite RAM --------------------------------------------
+// buildInitialSpriteSnapshot writes a straddler's clipped bitmap here during
+// BUILD and stores CLIP_SPRITE_POOL_PTR + planIndex in the render plan. Two
+// plan halves (BUILD/LIVE base 0 or 8) x 8 hardware slots keep BUILD writes
+// clear of the LIVE bitmap the VIC/IRQ replay is fetching. VIC bank 0, below
+// the charset.
+* = CLIP_SPRITE_POOL
+clipSpritePool:
+    .fill 16 * 64, $00
+CLIP_SPRITE_POOL_END:
+.if (CLIP_SPRITE_POOL_END > STAR_CHARSET) {
+    .error "Clipped sprite pool overlaps the charset"
+}
+
 // ============================================================================
-// Single-screen diagnostic scrolling. Ordinary main-loop work only; no
-// screen flip, colour scroll, background IRQ, shadow or temporary row buffer.
+// Single-screen beam-raced scrolling. Main copies straddle VIC fetches; the
+// shared display event fixes the aperture. No screen flip or terrain shadow.
 // Two in-place portions straddle presentation; see docs/background-engine.md.
 // Control fits in the existing gap below health sprites; unrolled copies
 // live outside VIC bank 0, where there is room to keep the cycle count simple.
@@ -4684,21 +4780,11 @@ HEALTH_SPRITE_POOL_END:
 * = $2920
 
 // --- Routine: applyFineScroll -----------------------------------------------
-// Writes SCROLL_FINE into $D011 bits 0-2, retaining the display mode bits.
-// $D011 bit 7 reads current raster high, but writes IRQ compare high.
-// This read/write is safe here because the call is at
-// raster 0, so the read high bit equals the scheduler's below-256 compare
-// high bit. It would NOT preserve that compare bit at arbitrary rasters.
-// Called once per presented frame from gameLoop. This
-// is the only background write to $D011 - no split, no second
-// value, no IRQ of any kind armed for it.
+// Publish the presented phase at frame0. The shared physical-frame dispatcher
+// owns all gameplay D011 writes; pending coarse SCROLL_FINE is never read by IRQ.
 applyFineScroll:
-    sei
-    lda VIC_CONTROL_1
-    and #%11111000
-    ora SCROLL_FINE
-    sta VIC_CONTROL_1
-    cli
+    lda SCROLL_FINE
+    sta RASTER_DISPLAY_FINE
     rts
 
 // --- Routine: initBackground -----------------------------------------------
@@ -4707,7 +4793,6 @@ applyFineScroll:
 // - the same routine consumed later by the scroller, so the initial screen
 // and the scrolled-in rows are never two different representations.
 initBackground:
-    jsr initHudDiagnostic
     lda #0
     sta SCROLL_FRAME_COUNT
     sta SCROLL_FINE
@@ -4715,7 +4800,7 @@ initBackground:
     sta BG_COARSE_FINISH
     sta BG_COARSE_DEFERRED
     lda #0
-    sta SCROLL_ROW                           // Initial stage position: logical row 0 begins at screen row 0.
+    sta SCROLL_ROW                           // Initial stage position: logical row 0 begins at screen row 1.
 
     ldx #15                                 // Two unused glyphs in the existing RAM charset, reused
 !glyphLoop:                                 // as rail/diagonal glyphs by the metatile test stage.
@@ -4735,32 +4820,27 @@ initBackground:
     cpx #250
     bne !colourFill-
 
-    ldx #0
+    ldx #1
 !rowLoop:
     stx BG_DEST_ROW
     jsr renderStageRowToScreen
     ldx BG_DEST_ROW
     inx
-    cpx #25
+    cpx #24
     bne !rowLoop-
-    lda #0                                   // SCROLL_ROW always identifies the logical row at row 0;
-    sta SCROLL_ROW                           // unchanged by the fill above, exactly like renderStageRowToScreen expects.
+    jsr initFixedHud
     rts
 
 // --- Routine: renderStageRowToScreen -----------------------------------------
-// Entry: BG_DEST_ROW (0-24) = destination screen row.
-//        SCROLL_ROW (0..STAGE_LOGICAL_ROWS-1) = logical stage row currently
-//        shown at screen row 0. The source row is (SCROLL_ROW + BG_DEST_ROW)
-//        mod STAGE_LOGICAL_ROWS - the same SCROLL_ROW + BG_DEST_ROW
-//        addressing the old raw-row provider used, just now resolving a
-//        logical row to decode instead of a table row to copy directly. The
-//        sum never exceeds 2*STAGE_LOGICAL_ROWS-1, so a single conditional
-//        subtraction is a complete modulo. Same entry contract as the old
-//        copyStageRowToScreen it replaces.
+// Entry: BG_DEST_ROW (1-23) = terrain matrix row. Row0 is fixed HUD.
+// SCROLL_ROW identifies the logical stage row at matrix row1. Decode source
+// (SCROLL_ROW + BG_DEST_ROW - 1) modulo80 into the unchanged incoming buffer.
 renderStageRowToScreen:
     lda SCROLL_ROW
     clc
     adc BG_DEST_ROW
+    sec
+    sbc #1
     cmp #STAGE_LOGICAL_ROWS
     bcc !noWrapSrc+
     sbc #STAGE_LOGICAL_ROWS                 // Carry is set here (CMP just confirmed A >= STAGE_LOGICAL_ROWS).
@@ -4894,8 +4974,8 @@ updateBackgroundScroll:
     rts
 
 // --- Routine: prepareBackgroundCoarse --------------------------------------
-// At YSCROL=7 the VIC fetches row 12 on line 151. From line 152 onward,
-// rows 0-12 can change without affecting this frame (the VIC caches row 12).
+// At YSCROL=7 the split display fetches row12 on159. From160 onward,
+// terrain rows1-12 can change without affecting this frame (the VIC caches row 12).
 // Keep the old lower rows until the NEXT frame. Their one crossing row (old
 // row 12) is physically saved into BG_CROSSING_ROW before shiftBackgroundUpper
 // overwrites it, so the bytes need not be reproducible from any formula.
@@ -4906,17 +4986,19 @@ prepareBackgroundCoarse:
     lda #0
     sta BG_COARSE_PENDING
 
+    ldx RASTER_BATCH_OFFSET
+    cpx RASTER_BATCH_END
+    bcc !defer+                             // Variable sprite IRQ/collision work has no place in this copy budget.
     lda VIC_CONTROL_1                       // Do not start late and run over sprite presentation at line 0.
     bmi !defer+
     lda RASTER
-    cmp #200
+    cmp #BG_COARSE_LATEST_START
     bcs !defer+
 !waitRead:
     lda RASTER
-    cmp #152
+    cmp #160
     bcc !waitRead-
 
-    jsr restoreHudTerrain                  // HUD rows have been fetched; copy only the original terrain.
     jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
     jsr shiftBackgroundUpper
 bgUpperCopied:
@@ -4927,7 +5009,7 @@ bgUpperCopied:
     sec                                     // metatile-expanded stage's actual logical height).
     sbc #1
     sta SCROLL_ROW
-    lda #0
+    lda #1
     sta BG_DEST_ROW
     jsr renderStageRowToScreen
 bgUpperReady:
@@ -4945,10 +5027,11 @@ bgUpperReady:
 
 // --- Routine: finishBackgroundCoarse ---------------------------------------
 // Called immediately AFTER armFirstBatch. Fine 0 is already set. The VIC
-// will not fetch row 13 until line 152, leaving ample time for this half.
-// Move rows 23->24 down through 13->14 (this reads old row 13 as the source
+// will not fetch row13 until160 in the shortened playfield.
+// Move rows22->23 down through13->14 (this reads old row 13 as the source
 // for new row 14, so it must run BEFORE row 13 is overwritten below), then
 // restore the row 12 bytes saved by prepareBackgroundCoarse into row 13.
+gameplayPresented:                         // Diagnostic presentation point, before any lower-copy work.
 finishBackgroundCoarse:
     lda BG_COARSE_FINISH
     beq !done+
@@ -4959,64 +5042,6 @@ finishBackgroundCoarse:
 bgLowerReady:
 !done:
     rts
-
-// Two static character markers at raster 80..87, columns 2 and 31.
-// All 25 rows still scroll normally. Pre-shifted glyphs cancel their phase;
-// saved cells keep the in-place coarse copy free of HUD trails. No IRQ,
-// VIC register, colour RAM, score or lives changes. Sprites can cover them.
-// Ownership/timing model: docs/hud-architecture.md.
-.const HUD_GLYPH_BASE = 128
-.var hudCells = List().add(BG_SCREEN_A + 3*40 + 2, BG_SCREEN_A + 4*40 + 2,
-                          BG_SCREEN_A + 3*40 + 31, BG_SCREEN_A + 4*40 + 31)
-initHudDiagnostic:
-    lda #0
-    sta HUD_PATCHED
-    ldx #0
-!glyphs:
-    lda hudDiagnosticGlyphs,x
-    sta STAR_CHARSET + HUD_GLYPH_BASE*8,x
-    inx
-    bne !glyphs-
-    rts
-
-drawHudDiagnostic:
-    lda HUD_PATCHED
-    bne !draw+
-    .for (var cell = 0; cell < hudCells.size(); cell++) {
-        lda hudCells.get(cell)
-        sta HUD_TERRAIN + cell
-    }
-    lda #1
-    sta HUD_PATCHED
-!draw:
-    lda SCROLL_FINE
-    asl
-    clc
-    adc #HUD_GLYPH_BASE
-    sta hudCells.get(0)
-    adc #1                                  // Codes stay below 256; carry remains clear throughout.
-    sta hudCells.get(1)
-    adc #15
-    sta hudCells.get(2)
-    adc #1
-    sta hudCells.get(3)
-hudDiagnosticReady:
-    rts
-
-restoreHudTerrain:
-    lda HUD_PATCHED
-    beq !done+
-    .for (var cell = 0; cell < hudCells.size(); cell++) {
-        lda HUD_TERRAIN + cell
-        sta hudCells.get(cell)
-    }
-    lda #0
-    sta HUD_PATCHED
-!done:
-    rts
-
-HUD_PATCHED: .byte 0
-HUD_TERRAIN: .fill 4, 0
 
 BG_COARSE_PENDING:     .byte 0
 BG_COARSE_FINISH:      .byte 0
@@ -5036,21 +5061,21 @@ BACKGROUND_CONTROL_END:
 // Interrupts remain enabled. Neither copy reaches $07e8-$07ff / sprite pointers.
 * = $4000
 shiftBackgroundUpper:
-    .for (var row = 12; row >= 1; row--) {
-        .for (var col = 0; col < 40; col++) {
-            lda BG_SCREEN_A + (row - 1) * 40 + col
-            sta BG_SCREEN_A + row * 40 + col
-        }
-    }
-    rts                                     // 480 bytes: 3840 cycles + RTS.
-shiftBackgroundLower:
-    .for (var row = 24; row >= 14; row--) {
+    .for (var row = 12; row >= 2; row--) {
         .for (var col = 0; col < 40; col++) {
             lda BG_SCREEN_A + (row - 1) * 40 + col
             sta BG_SCREEN_A + row * 40 + col
         }
     }
     rts                                     // 440 bytes: 3520 cycles + RTS.
+shiftBackgroundLower:
+    .for (var row = 23; row >= 14; row--) {
+        .for (var col = 0; col < 40; col++) {
+            lda BG_SCREEN_A + (row - 1) * 40 + col
+            sta BG_SCREEN_A + row * 40 + col
+        }
+    }
+    rts                                     // 400 bytes: 3200 cycles + RTS.
 
 // Generic crossing-row preservation: the one row that straddles the
 // upper/lower coarse-copy split (old row 12 -> new row 13) is saved and
@@ -5093,24 +5118,66 @@ STAGE_TEST_END:
     .error "Test stage assets overlap BASIC ROM"
 }
 
-// Two deliberately plain bitmaps, eight phases, two glyphs per phase.
-// Codes 128..159 are unused by the current stage; copying them at game start
-// does not replace the existing terrain glyphs (32, 35, 42, 224, 225).
-hudDiagnosticGlyphs:
-.var hudMarkerPixels = List().add($3c,$42,$81,$81,$81,$81,$42,$3c,
-                                 $81,$42,$24,$18,$18,$24,$42,$81)
-.for (var marker = 0; marker < 2; marker++) {
-    .for (var phase = 0; phase < 8; phase++) {
-        .for (var line = 0; line < 16; line++) {
-            .var sourceLine = line - (8 - phase)
-            .if (sourceLine >= 0 && sourceLine < 8) {
-                .byte hudMarkerPixels.get(marker*8 + sourceLine)
-            } else {
-                .byte 0
-            }
-        }
+// Fixed matrix row0, private stock glyphs (see HUD_GLYPH_BASE near the top):
+// space, S, C, O, R, E, the ten decimal digits 0..9, then F and R.
+.var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57, 6,18)
+initFixedHud:
+    ldx #7
+!glyph:
+    .for (var code = 0; code < hudStockCodes.size(); code++) {
+        lda STAR_CHARSET + hudStockCodes.get(code)*8,x
+        sta STAR_CHARSET + (HUD_GLYPH_BASE+code)*8,x
     }
+    dex
+    bpl !glyph-
+    ldx #39
+!row:
+    lda #HUD_GLYPH_BASE                     // Private blank in the fixed HUD row.
+    sta BG_SCREEN_A,x
+    lda #32
+    sta BG_SCREEN_A + 24*40,x               // Unused last matrix row never enters the aperture.
+    lda #1
+    sta $d800,x
+    dex
+    bpl !row-
+    ldx #10
+!text:
+    lda fixedHudText,x
+    sta BG_SCREEN_A + 2,x
+    dex
+    bpl !text-
+    jsr displayScore                        // Fill the five digit cells from SCORE_LO/HI (0 at game start).
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
+    ldx #9                                  // "FREE " + five private 0 digits at columns 28..37.
+!free:
+    lda fixedHudFreeLabel,x
+    sta HUD_FREE_LABEL_CELL,x
+    dex
+    bpl !free-
 }
-.if (* > $a000) {
-    .error "HUD diagnostic glyphs overlap BASIC ROM"
+    rts
+fixedHudText:
+    .byte 129,130,131,132,133,128,134,134,134,134,134 // "SCORE " + private 00000; digits overwritten by displayScore.
+fixedHudFreeLabel:
+    .byte HUD_FREE_GLYPH_F, HUD_FREE_GLYPH_R, 133, 133, 128, 134,134,134,134,134 // "FREE 00000" (private glyphs).
+.if (HUD_GLYPH_BASE + hudStockCodes.size() > 224) {
+    .error "Fixed HUD glyphs overlap terrain charset allocation"
 }
+.if (HUD_DIGIT_GLYPH + 9 >= HUD_GLYPH_BASE + hudStockCodes.size()) {
+    .error "Fixed HUD digit glyphs 0..9 do not all fit the private allocation"
+}
+.if (HUD_FREE_GLYPH_R >= HUD_GLYPH_BASE + hudStockCodes.size()) {
+    .error "Fixed HUD FREE letter glyphs do not fit the private allocation"
+}
+.if (STAR_CHARSET + HUD_GLYPH_BASE*8 < CLIP_SPRITE_POOL_END) {
+    .error "Fixed HUD glyph bitmaps overlap the clipped sprite pool"
+}
+.if (STAR_CHARSET + (HUD_GLYPH_BASE + hudStockCodes.size())*8 > STAR_CHARSET + $800) {
+    .error "Fixed HUD glyph bitmaps run past the charset"
+}
+.if (* > $6000) {
+    .error "Background/HUD code overlaps raster scheduler"
+}
+
+// The shared event dispatcher has its own guarded resident allocation.
+#import "raster_scheduler.asm"

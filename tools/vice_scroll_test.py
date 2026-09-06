@@ -51,6 +51,7 @@ def main():
     parser.add_argument('--physical', action='store_true', help='Capture raster 311 of every physical PAL frame')
     parser.add_argument('--trace', action='store_true')
     parser.add_argument('--stress', action='store_true', help='Accelerate the existing spawner through monitor data writes')
+    parser.add_argument('--dense', action='store_true', help='Seed16 stationary legal objects producing8 closely spaced batches; keep real scrolling/main loop')
     parser.add_argument('--symbols', type=Path, default=Path('build/main.vs'))
     parser.add_argument('--out', type=Path, default=Path('build/scroll-test'))
     parser.add_argument('--prg', type=Path, default=Path('build/shooter.prg'))
@@ -84,12 +85,32 @@ def main():
     mon.cmd(f'break {sym["applyFineScroll"]:04x}')
     mon.cmd('x')
     mon.cmd('jpdb 1 ef')
+    if args.dense:
+        def put(name, values):
+            mon.cmd(f'> {sym[name]:04x} '+' '.join(f'{v:02x}' for v in values))
+        put('OBJECT_ACTIVE',[1]*16)
+        put('OBJECT_TYPE',[1]+[2]*15)
+        put('OBJECT_Y',list(range(100,129,4))+list(range(136,165,4)))
+        put('OBJECT_X',[24+32*(i%8) for i in range(16)])
+        put('OBJECT_X_MSB',[0]*16)
+        put('OBJECT_SPRITE',[sym['blankSprite']//64]*16)
+        put('OBJECT_PATH_TIMER',[255]*16)
+        put('OBJECT_STAGE',[2]*16)  # Valid egress coast; no eligible enemy firing source.
+        for name in ('OBJECT_VEL_X','OBJECT_VEL_Y','OBJECT_TARGET_VEL_X','OBJECT_TARGET_VEL_Y','OBJECT_HIT_TIMER','OBJECT_DEATH_TIMER'):
+            put(name,[0]*16)
+        mon.cmd('jpdb 1 ff')
     if args.trace:
         mon.cmd(f'logname "{out / "timing.log"}"')
         mon.cmd('log on')
-        for name in ('armFirstBatch', 'multiplexIRQ', 'hudDiagnosticReady', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady'):
+        for name in ('armFirstBatch', 'multiplexIRQ', 'gameplayPresented', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady', 'rasterFrameReset', 'rasterInitialApplied', 'rasterAssignmentApplied', 'rasterDisplayHook'):
             if name in sym:
                 mon.cmd(f'trace exec {sym[name]:04x}')
+        if 'RASTER_STATE_BEGIN' in sym:
+            for name in ('rasterDisplayRestored', 'rasterBadlineRestored', 'rasterInitialMasksApplied', 'rasterBatchMasksApplied'):
+                if name in sym:
+                    mon.cmd(f'trace exec {sym[name]:04x}')
+            mon.cmd('trace store d012 d012')
+            mon.cmd('trace store d011 d011')
     physical_break = None
     if args.physical:
         # Replace the presentation breakpoint; tracepoints remain installed.
@@ -110,17 +131,21 @@ def main():
         mon.cmd(f'bsave "{out / f"{frame:05d}.state"}" 0 2000 23ff')
         mon.cmd(f'screenshot "{out / f"{frame:05d}.png"}" 2')
         mon.cmd(f'bsave "{out / f"{frame:05d}.bg"}" 0 2920 2fff')
+        if 'RASTER_STATE_BEGIN' in sym:
+            mon.cmd(f'bsave "{out / f"{frame:05d}.raster"}" 0 {sym["RASTER_STATE_BEGIN"]:04x} {sym["RASTER_STATE_END"]-1:04x}')
         record = {'frame': frame, 'registers': regs}
         if args.physical:
-            io = mon.cmd('m d011 d011')
-            record['physical_fine'] = int(re.search(r'>C:d011\s+([0-9a-fA-F]{2})', io)[1], 16) & 7
+            io = mon.cmd('m d010 d011')
+            values = re.search(r'>C:d010\s+([0-9a-fA-F]{2})\s+([0-9a-fA-F]{2})', io)
+            record['physical_x_msb'] = int(values[1], 16)
+            record['physical_fine'] = int(values[2], 16) & 7
         records.append(record)
         (out / 'frames.json').write_text(json.dumps(records, indent=2))
         (out / 'symbols.json').write_text(json.dumps(sym, indent=2))
         if frame % 100 == 0:
             print(f'Captured {frame}/{args.frames}', flush=True)
         direction = 4 if (frame // 70) % 2 else 8
-        mon.cmd(f'jpdb 1 {255 ^ (16 | direction):02x}')
+        mon.cmd('jpdb 1 ff' if args.dense else f'jpdb 1 {255 ^ (16 | direction):02x}')
         if args.physical:
             mon.cmd(f'condition {physical_break} if RL == $000')
             mon.cmd('x')
