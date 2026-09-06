@@ -18,8 +18,12 @@
 
 // Editor-facing placement layer: character column and world character row.
 // A body covers2x2 cells; its second row wraps modulo STAGE_LOGICAL_ROWS.
-.var turretCols = List().add(10,28,6)
-.var turretRows = List().add(99,32,65)
+// Each placement sits on the interior of a M14 MACH housing in the redesigned
+// bas-relief stage (stage_test.asm), so a turret reads as machinery emerging
+// from the same hull surface: turret 0 in platform A, turret 1 in the section-B
+// platform, turret 2 in the large section-D massif.
+.var turretCols = List().add(17,29,13)
+.var turretRows = List().add(13,29,57)
 .if (turretCols.size() != TURRET_COUNT || turretRows.size() != TURRET_COUNT) {
     .error "Turret placement count does not match TURRET_COUNT"
 }

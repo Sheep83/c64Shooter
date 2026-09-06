@@ -342,3 +342,107 @@ size; `metatileColours` gone), $6000-$634f, $8800-$8edf. PRG SHA-256
 
 ### Status: complete. Ordinary terrain = fixed multicolour palette, no colour
 ### scroll. Stage-3 per-cell colour path fully removed. No commits/pushes.
+
+## ================================================================
+## FOLLOW-UP - full continuous bas-relief hull stage (visual/data proof)
+## ================================================================
+## (Fixed-palette engine checkpointed as a24afbe; this is ART/DATA only.)
+
+Goal: replace the mixed legacy test art with a complete 10x25 stage that reads
+as one continuous constructed grey surface (Uridium-style depth from four
+colours), so the human can judge whether the fixed-4-colour-per-stage model is
+visually sufficient. No engine change beyond ONE palette constant.
+
+### Palette retune (the only non-data change)
+`TERRAIN_MC_COLOUR_1` 11 -> 12 (so $D022 = grey 12 = the dominant BASE plating).
+`TERRAIN_MC_COLOUR_2` stays 15 ($D023 = light grey = raised/bevel). $D021 = 0
+(black = DEPTH only). `TERRAIN_COLOUR_RAM` unchanged (8|1 -> white highlight).
+Ramp: black < grey(base) < light-grey(raised) < white(highlight).
+Sprite shared colours ($D025=11, $D026=15) left untouched; player individual
+colour 2 (red) contrasts strongly with the grey surface.
+
+### Data changes
+- `src/main.asm`: `TERRAIN_GLYPH_COUNT` 40 -> 48; `terrainGlyphs` replaced with
+  41 authored + 7 reserved glyphs (codes 160..207, bitmaps $3D00..$3E7F; 208..223
+  still free). Comment above the block rewritten.
+- `src/stage_test.asm`: `metatileDefs` + `stageMetatileRows` fully replaced; new
+  16-metatile construction kit + 25-row stage; header legend rewritten.
+- `src/background_turrets.asm`: `turretCols` [10,28,6] -> [17,29,13];
+  `turretRows` [99,32,65] -> [13,29,57]. Each turret now sits on the interior of
+  a M14 MACH housing (platform A, section-B platform, section-D massif) so it
+  reads as machinery emerging from the hull. Disjoint-row guard still satisfied.
+- `tools/vice_turret_cases.py`: the hitscan/aim/fire sub-tests derived their ray
+  and player-X coordinates from a hard-coded turret-0 X of 104 (old column 10).
+  Now computed from the turret's authored X (`TURRET_X_LO/HI`), mirroring the
+  Stage-1 practice of reading placement from the running program. Turret GAMEPLAY
+  is unchanged; only stale test literals moved.
+- Generator: `scratchpad/relief.py` (glyph/metatile/stage designer + ASCII
+  preview + KA emitter). Not part of the build.
+
+### 16-metatile construction kit
+M0 PLATE (grey base + faint 32px plate grid) | M1 R_FILL (raised interior) |
+M2..M5 R_T/R_B/R_L/R_R (raised platform edges) | M6..M9 R_TL/R_TR/R_BL/R_BR
+(raised platform outer corners) | M10 CHAN_V (vertical groove, tiles T-B) |
+M11 CHAN_H (full-width shallow groove, tiles L-R) | M12 RECESS (inset panel:
+grey floor, shadow N/W, lit S/E; tiles into fields) | M13 GRILLE (raised-louvre
+vent bank) | M14 MACH (machinery housing; turret mount) | M15 STEP (quiet base
++ a small stepped detail). M2..M9 + M1 build raised platforms of any size.
+
+### Stage composition (25 rows, wraps grey->grey)
+r0-1 intro grey plating | r2-4 platform A (96px tall, width-spanning) + turret 0
+| r5 grey | r6-9 section B: vertical channels W, inset-panel field, platform E +
+turret 1 | r10 grey | r11 full-width channel/plate-boundary | r12 grey+grille |
+r13-17 section D: 160px structural massif + grille + machinery + turret 2 | r18
+grey | r19-20 section E: paired channels flanking a grille bank | r21 grey |
+r22-23 platform F | r24 grey plating (wrap seam).
+
+### Continuous grey surface / lighting / four colours
+Base is grey (01) everywhere - PLATE and STEP fill the quiet rows; no metatile
+is "open black". Black (00) appears only as: plate-seam grooves, channel floors,
+recess shadow walls, machinery slots, the thin drop-shadow line under raised
+S/E edges. Light source is top-left across the whole stage: raised N/W rims and
+"/" bevels are white (11); raised faces are light grey (10); S/E edges step
+grey->thin black; recesses are dark on their N/W inner walls, light on S/E.
+All four values carry structure.
+
+### Build + validation (final build)
+Clean, all guards pass. PRG SHA-256
+`ea803ed1d06de7aed53a4eaa2d4da9e83b8ff8e7844a18dd400e3b2c08632024`.
+- `prepareBackgroundCoarse` CPU (all 100 origins): **5881..5931 = the turret
+  baseline exactly**. The scroller code path is untouched; zero timing change.
+- raster oracle (2600-3000 frames): 0 service failures, 0 sprite-start misses,
+  0 catchups, 0 replay frames, frame cadence deltas [19656].
+- turret functional probes: 45 checks, 0 failures (hitscan/aim/fire/damage/
+  destruction/underlay-restore/cap all pass with the new placements).
+- turret capture oracle: 0 failures (per-frame visibility/screen-Y vs presented
+  origin, health, shared bullet cap, slot-0 identity, dead reentry).
+- lifecycle: 0 failures, turret reset checked, gameplay jiffy drift 0.
+- 17 raster scheduler cases (all 8 phases): 0/0.
+- safe coarse deferrals: 5..21 per stage circuit across runs (turret baseline
+  itself is ~36; previous fixed-palette build ~9). Within band, all the SAFE
+  kind (0 replay frames, cadence never lost). The turret repositioning clusters
+  active turrets so per-frame turret CPU peaks more often - it exercises the
+  existing hold-and-retry more, it does not break it.
+- FREE (rolling 50-frame min, deterministic test): min 630..1386 across runs,
+  median ~5900. Lower than the 2079 of the previous checkpoint because the three
+  turrets are now closer together (more simultaneously active). No frame
+  overran (0 replay, exact cadence). Worth watching if turret load grows.
+- HUD structural oracle: matrix / charset-integrity / stock-glyph / FREE /
+  edge-motion / PAL-cadence all pass. Its `physical pixels` class fails on ~24
+  sampled frames ONLY because `expected_pixels` still renders terrain as brown
+  hires - it has no MCM model. This was already stale before this task; it is
+  NOT a regression and no engine behaviour was changed to satisfy it.
+- Visual (build/mc-test/f-*.png, rf-*.png): the whole playfield reads as one
+  grey constructed surface; large raised platforms with bevelled rims; channels,
+  inset panels, grille banks; turrets sit inside machinery housings; seamless
+  grey wrap; player/enemies/bullets clearly readable against the grey.
+
+### Multicolour-resolution compromises
+Each char is 4 double-wide MC pixels, so bevels/rims are 1-2 MC pixels (2-4
+hires px) wide - shapes are drawn across several chars/metatiles, not per char.
+Diagonal "/" and "\" bevels are coarse. The recess "hole" in a M12 tile is only
+2 chars, so recessed regions are shown as tiled panel fields rather than one
+smooth pit. The base plate texture (studs/seams) is deliberately light so it
+reads as machined surface, not noise.
+
+### Status: complete - full bas-relief hull proof stage. No commits/pushes.

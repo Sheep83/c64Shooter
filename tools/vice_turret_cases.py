@@ -104,19 +104,21 @@ def main():
         put('TURRET_Y',[100,100,100])
         put('TURRET_HEALTH',[3,3,3])
         tx=list(read('TURRET_X_LO',3)); th=list(read('TURRET_X_HI',3))
-        for ray, expected in ((103,255),(104,128),(119,128),(120,255)):
-            put('HITSCAN_X_LO',ray);put('HITSCAN_X_MSB',0)
+        x0=tx[0]+256*th[0]                      # turret 0 world X (from its authored column)
+        for ray, expected in ((x0-1,255),(x0,128),(x0+15,128),(x0+16,255)):
+            put('HITSCAN_X_LO',ray&255);put('HITSCAN_X_MSB',ray>>8)
             expect(f'turret ray{ray}',call('tracePlayerCannon')[1],expected)
-        put('HITSCAN_X_LO',104)
+        put('HITSCAN_X_LO',x0&255);put('HITSCAN_X_MSB',x0>>8)
         put('OBJECT_ACTIVE',1,1);put('OBJECT_TYPE',2,1)
-        put('OBJECT_X',104,1);put('OBJECT_X_MSB',0,1)
+        put('OBJECT_X',x0&255,1);put('OBJECT_X_MSB',x0>>8,1)
         for y,expected in ((80,128),(150,1),(100,1)):
             put('OBJECT_Y',y,1)
             expect(f'nearest enemy Y{y}',call('tracePlayerCannon')[1],expected)
         put('OBJECT_ACTIVE',0,1)
         put('TURRET_VISIBLE',[0,1,0])
-        put('HITSCAN_X_LO',0);put('HITSCAN_X_MSB',1)
-        expect('turret1 bbox crossing X255',call('tracePlayerCannon')[1],129)
+        x1=tx[1]+256*th[1]                      # turret 1 world X
+        put('HITSCAN_X_LO',(x1+4)&255);put('HITSCAN_X_MSB',(x1+4)>>8)
+        expect('turret1 ninth-X-bit bbox',call('tracePlayerCannon')[1],129)
         put('TURRET_VISIBLE',[1,0,0])
         put('SCORE_LO',0);put('SCORE_HI',0)
         for hp in (2,1,0):
@@ -131,16 +133,17 @@ def main():
         # Body never allocates: only the player is active after all hits.
         expect('no body logical allocations',list(read('OBJECT_ACTIVE',16)),[1]+[0]*15)
         put('TURRET_HEALTH',3)
+        # player X relative to turret 0: well left (<-24 deadband), centred, well right (>=+24)
         for y,offset in ((50,0),(240,3)):
             put('OBJECT_Y',y)
-            for x,aim in ((40,0),(104,1),(200,2)):
-                put('OBJECT_X',x);put('OBJECT_X_MSB',0)
+            for x,aim in ((x0-64,0),(x0,1),(x0+80,2)):
+                put('OBJECT_X',x&255);put('OBJECT_X_MSB',x>>8)
                 call('aimBackgroundTurret')
-                expect(f'aim X{x} Y{y}',read('TURRET_AIM')[0],aim+offset)
+                expect(f'aim dx{x-x0} Y{y}',read('TURRET_AIM')[0],aim+offset)
         put('OBJECT_X',20);put('OBJECT_X_MSB',1)
         call('aimBackgroundTurret')
         expect('aim ninth X bit',read('TURRET_AIM')[0],5)
-        put('OBJECT_X',104);put('OBJECT_X_MSB',0);put('OBJECT_Y',240)
+        put('OBJECT_X',x0&255);put('OBJECT_X_MSB',x0>>8);put('OBJECT_Y',240)
         put('PLAYER_STATE',0);put('TURRET_HIT_TIMER',[0,0,0])
         put('TURRET_FIRE_TIMER',[0,0,0]);put('ENEMY_BULLET_COUNT',0)
         call('updateBackgroundTurrets')
