@@ -78,11 +78,12 @@
 .const METATILE_W = 4
 .const METATILE_H = 4
 .const METATILES_PER_ROW = 10                       // 40 / METATILE_W: metatiles spanning one screen width.
-.const METATILE_DEF_COUNT = 12                       // Distinct 4x4 tile definitions in the test stage.
-.const STAGE_METATILE_ROWS = 20                      // Metatile rows in the test stage (80 character rows -
-                                                      // well past the 25 visible, so multiple coarse
-                                                      // transitions occur before the stage wraps).
-.const STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H // Total logical character rows (80).
+.const METATILE_DEF_COUNT = 16                       // Distinct 4x4 metatile definitions (bas-relief tileset).
+.const STAGE_METATILE_ROWS = 25                      // 100 character rows ~ 4.5 gameplay screen heights.
+                                                      // 25 is the ceiling: decodeStageCharacterRow's 8-bit
+                                                      // stageMetatileRows index is metatileRow*10 + col, so
+                                                      // 24*10 + 9 = 249 is the last valid byte offset.
+.const STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H // Total logical character rows (100).
 .if (METATILES_PER_ROW * METATILE_W != 40) {
     .error "METATILES_PER_ROW * METATILE_W must tile the 40-column screen exactly"
 }
@@ -93,8 +94,35 @@
     .error "stageMetatileRows table no longer fits an 8-bit index"
 }
 
+// Bas-relief terrain character art occupies its own permanent namespace.
+// 146..159 stay reserved for future HUD expansion; 224/225 stay as the
+// diagnostic rail/diagonal glyphs; 240..251 stay as the starfield.
+.const TERRAIN_GLYPH_BASE = 160                     // First terrain art char code ($A0).
+.const TERRAIN_GLYPH_COUNT = 40                     // Codes 160..199; 200..223 left free for expansion.
+.if (TERRAIN_GLYPH_BASE < 160) {
+    .error "TERRAIN_GLYPH_BASE must be >= 160"
+}
+.if (TERRAIN_GLYPH_BASE <= HUD_GLYPH_BASE + 31) {
+    .error "terrain glyphs must clear the 146..159 HUD-expansion reserve (start >= 160)"
+}
+.if (TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_COUNT - 1 > 223) {
+    .error "terrain glyphs run past code 223"
+}
+.if (TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_COUNT > 224) {
+    .error "terrain glyphs collide with the diagnostic glyphs at 224/225"
+}
+.if (TERRAIN_GLYPH_COUNT != 40) {
+    .error "initBackground's terrain glyph copy loop is unrolled for exactly 40 glyphs (320 bytes)"
+}
+
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
+.if (STAR_CHARSET + TERRAIN_GLYPH_BASE * 8 != $3d00) {
+    .error "terrain glyph bitmaps must begin at $3D00"
+}
+.if (STAR_CHARSET + (TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_COUNT) * 8 > $4000) {
+    .error "terrain glyph bitmaps run past the $3800..$3FFF charset"
+}
 .const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
 .const STAR_GLYPH_BYTES = 96
 
@@ -4809,6 +4837,16 @@ initBackground:
     dex
     bpl !glyphLoop-
 
+    ldx #0                                  // Bas-relief terrain art: 40 glyphs (320 bytes) from
+!terrainGlyphLoop:                          // terrainGlyphs into the RAM charset at TERRAIN_GLYPH_BASE
+    .for (var b = 0; b < 5; b++) {          // ($3D00). Unrolled x5 so one x pass (0..63) covers 320 B.
+        lda terrainGlyphs + b*64,x
+        sta STAR_CHARSET + TERRAIN_GLYPH_BASE*8 + b*64,x
+    }
+    inx
+    cpx #64
+    bne !terrainGlyphLoop-
+
     ldx #0
 !colourFill:
     lda #TERRAIN_COLOUR
@@ -4951,6 +4989,57 @@ copyIncomingRowToScreen:
 bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) glyph bitmaps, reused by
     .byte $18,$18,$18,$18,$18,$18,$18,$18   // the metatile test stage below.
     .byte $80,$40,$20,$10,$08,$04,$02,$01
+
+// --- Bas-relief terrain glyphs, char codes 160..199 -> $3D00..$3E3F --------
+// Monochrome 8x8 hires; bit set = TERRAIN_COLOUR pixel. Copied into the RAM
+// charset once per game start by initBackground. Reusable primitives: fills,
+// thin/thick edges, frame corners, filled slope triangles, 1px/2px diagonals,
+// staircase steps, diamond apex/side pieces, ribs, black slots, inner notches.
+terrainGlyphs:
+    .byte $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff   // 160 SOLID
+    .byte $88,$00,$22,$00,$88,$00,$22,$00   // 161 STIPPLE
+    .byte $ff,$00,$00,$00,$00,$00,$00,$00   // 162 EDGE_T
+    .byte $00,$00,$00,$00,$00,$00,$00,$ff   // 163 EDGE_B
+    .byte $80,$80,$80,$80,$80,$80,$80,$80   // 164 EDGE_L
+    .byte $01,$01,$01,$01,$01,$01,$01,$01   // 165 EDGE_R
+    .byte $ff,$ff,$00,$00,$00,$00,$00,$00   // 166 EDGE_T2
+    .byte $00,$00,$00,$00,$00,$00,$ff,$ff   // 167 EDGE_B2
+    .byte $c0,$c0,$c0,$c0,$c0,$c0,$c0,$c0   // 168 EDGE_L2
+    .byte $03,$03,$03,$03,$03,$03,$03,$03   // 169 EDGE_R2
+    .byte $ff,$80,$80,$80,$80,$80,$80,$80   // 170 CRN_TL
+    .byte $ff,$01,$01,$01,$01,$01,$01,$01   // 171 CRN_TR
+    .byte $80,$80,$80,$80,$80,$80,$80,$ff   // 172 CRN_BL
+    .byte $01,$01,$01,$01,$01,$01,$01,$ff   // 173 CRN_BR
+    .byte $ff,$ff,$c0,$c0,$c0,$c0,$c0,$c0   // 174 CRN_TL2
+    .byte $ff,$ff,$03,$03,$03,$03,$03,$03   // 175 CRN_TR2
+    .byte $c0,$c0,$c0,$c0,$c0,$c0,$ff,$ff   // 176 CRN_BL2
+    .byte $03,$03,$03,$03,$03,$03,$ff,$ff   // 177 CRN_BR2
+    .byte $ff,$fe,$fc,$f8,$f0,$e0,$c0,$80   // 178 TRI_TL
+    .byte $ff,$7f,$3f,$1f,$0f,$07,$03,$01   // 179 TRI_TR
+    .byte $80,$c0,$e0,$f0,$f8,$fc,$fe,$ff   // 180 TRI_BL
+    .byte $01,$03,$07,$0f,$1f,$3f,$7f,$ff   // 181 TRI_BR
+    .byte $01,$02,$04,$08,$10,$20,$40,$80   // 182 DIAG_F
+    .byte $80,$40,$20,$10,$08,$04,$02,$01   // 183 DIAG_B
+    .byte $03,$06,$0c,$18,$30,$60,$c0,$80   // 184 DIAG_F2
+    .byte $c0,$60,$30,$18,$0c,$06,$03,$01   // 185 DIAG_B2
+    .byte $03,$03,$0c,$0c,$30,$30,$c0,$c0   // 186 STEP_F
+    .byte $c0,$c0,$30,$30,$0c,$0c,$03,$03   // 187 STEP_B
+    .byte $18,$3c,$7e,$ff,$ff,$ff,$ff,$ff   // 188 APEX_T
+    .byte $ff,$ff,$ff,$ff,$ff,$7e,$3c,$18   // 189 APEX_B
+    .byte $80,$e0,$f8,$fe,$fe,$f8,$e0,$80   // 190 APEX_L
+    .byte $01,$07,$1f,$7f,$7f,$1f,$07,$01   // 191 APEX_R
+    .byte $00,$00,$ff,$ff,$00,$00,$00,$00   // 192 RIB_H
+    .byte $18,$18,$18,$18,$18,$18,$18,$18   // 193 RIB_V
+    .byte $e7,$e7,$e7,$e7,$e7,$e7,$e7,$e7   // 194 SLOT_V
+    .byte $ff,$ff,$00,$00,$ff,$ff,$00,$00   // 195 SLOT_H
+    .byte $0f,$0f,$0f,$0f,$ff,$ff,$ff,$ff   // 196 NOTCH_TL
+    .byte $f0,$f0,$f0,$f0,$ff,$ff,$ff,$ff   // 197 NOTCH_TR
+    .byte $ff,$ff,$ff,$ff,$0f,$0f,$0f,$0f   // 198 NOTCH_BL
+    .byte $ff,$ff,$ff,$ff,$f0,$f0,$f0,$f0   // 199 NOTCH_BR
+terrainGlyphsEnd:
+.if (terrainGlyphsEnd - terrainGlyphs != TERRAIN_GLYPH_COUNT * 8) {
+    .error "terrainGlyphs data size does not match TERRAIN_GLYPH_COUNT * 8"
+}
 
 // --- Routine: updateBackgroundScroll ---------------------------------------
 // Advance 1px every SCROLL_FRAME_DIVIDER frames. A wrap is only published

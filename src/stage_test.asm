@@ -1,78 +1,106 @@
 // ============================================================================
-// 4x4 character metatile test stage (deliberately wasteful test art, not
-// final game graphics - see docs/background-engine.md and the comment above
+// Bas-relief terrain metatile stage (background art + hand-authored wrapping
+// test level - see docs/background-engine.md and the comment above
 // decodeStageCharacterRow in main.asm for the addressing scheme).
 //
 // Two tables:
 //
-//   metatileDefs       - METATILE_DEF_COUNT definitions, METATILE_W*METATILE_H
-//                         (16) literal character bytes each, row-major
-//                         (definition's row 0 first, then row 1, 2, 3).
-//   stageMetatileRows  - STAGE_METATILE_ROWS rows of METATILES_PER_ROW (10)
-//                         metatile IDs each, one screen width per row.
+//   metatileDefs       - METATILE_DEF_COUNT (16) definitions,
+//                         METATILE_W*METATILE_H (16) literal character bytes
+//                         each, row-major (definition's row 0 first, then row
+//                         1, 2, 3). Cells are TERRAIN_GLYPH_BASE-relative
+//                         char codes (160..199) or 32 for open black.
+//   stageMetatileRows  - STAGE_METATILE_ROWS (25) rows of METATILES_PER_ROW
+//                         (10) metatile IDs each, one screen width per row.
+//                         25 metatile rows -> 100 logical character rows
+//                         (~4.5 visible gameplay screen heights). The wrap
+//                         is metatile row 24 -> row 0; both are all-M0 (open
+//                         black) so logical row 99 -> 0 shows continuous black.
 //
 // decodeStageCharacterRow (main.asm) expands these into a plain 40-byte
 // character row on request; it does not care that the source is a metatile
 // table rather than a raw row or, eventually, a compressed/loaded format.
-// Runtime output depends on the actual stored IDs and definitions below -
-// nothing is reconstructed from a row-number formula.
 //
-// Tile legend (ID: name - shape):
-//   0  EMPTY        - all space.
-//   1  SOLID        - solid rail block, all 16 cells.
-//   2  WALL_L       - rail down the left column only.
-//   3  WALL_R       - rail down the right column only.
-//   4  NARROW_MID   - a 2x2 rail obstruction centred in the tile.
-//   5  ASYM         - left-heavy top, right-heavy bottom (asymmetric).
-//   6  GAP          - both side walls with a one-row gap (passage) at row 2.
-//   7  STAIR        - a diagonal that moves one column per internal row -
-//                     the shape changes across all four internal rows.
-//   8  MARKER       - two sparse marker glyphs, otherwise empty.
-//   9  DOUBLE_WALL  - both side walls, solid (no gap).
-//   10 TOP_BAR      - a solid bar across internal row 0 only.
-//   11 BOTTOM_BAR   - a solid bar across internal row 3 only.
+// Terrain glyph legend (bitmaps in main.asm terrainGlyphs, codes 160..199):
+//   160 SOLID   161 STIPPLE 162 EDGE_T  163 EDGE_B  164 EDGE_L  165 EDGE_R
+//   166 EDGE_T2 167 EDGE_B2 168 EDGE_L2 169 EDGE_R2 170..173 thin frame corners
+//   174..177 thick frame corners       178..181 filled slope triangles
+//   182 DIAG_F  183 DIAG_B  184 DIAG_F2 185 DIAG_B2 186 STEP_F 187 STEP_B
+//   188 APEX_T  189 APEX_B  190 APEX_L  191 APEX_R  192 RIB_H  193 RIB_V
+//   194 SLOT_V  195 SLOT_H  196..199 inner-corner notches
+//
+// Metatile legend (ID: name - shape):
+//   0  OPEN       - all black (also the seamless wrap row).
+//   1  FLOOR_H    - raised horizontal band, chains left-right across seams.
+//   2  CHANNEL_V  - open trench with 2px walls, chains up-down across seams.
+//   3  SLAB       - 32x32 thick-bordered solid slab.
+//   4  SLAB_OPEN  - bordered frame, black interior (negative space).
+//   5  SLAB_L     - left half of a wide slab (open right edge -> M6).
+//   6  SLAB_R     - right half of a wide slab.
+//   7  DIAMOND    - solid 32x32 diamond built from four filled slope triangles.
+//   8  STEP_PYR   - staircase apex (STEP_F/STEP_B) over a solid base.
+//   9  SLOPE_F    - filled '/' ramp, chains diagonally up-right across seams.
+//   10 SLOPE_B    - filled '\' ramp, chains diagonally up-left across seams.
+//   11 CORNER     - asymmetric L, thin inner-corner glyphs at the steps.
+//   12 JUNCTION   - ribbed cross intersection, chains all four ways.
+//   13 DETAIL     - dense technological block (slots + inner notches + stipple).
+//   14 CONNECT_H  - two thin rules spanning full width (transitional).
+//   15 CONNECT_V  - two thin rules spanning full height (transitional).
 // ============================================================================
 
 metatileDefs:
-    .byte 32,32,32,32,  32,32,32,32,  32,32,32,32,  32,32,32,32              // 0  EMPTY
-    .byte 224,224,224,224,  224,224,224,224,  224,224,224,224,  224,224,224,224  // 1  SOLID
-    .byte 224,32,32,32,  224,32,32,32,  224,32,32,32,  224,32,32,32          // 2  WALL_L
-    .byte 32,32,32,224,  32,32,32,224,  32,32,32,224,  32,32,32,224          // 3  WALL_R
-    .byte 32,32,32,32,  32,224,224,32,  32,224,224,32,  32,32,32,32          // 4  NARROW_MID
-    .byte 224,32,32,32,  224,224,32,32,  32,32,224,224,  32,32,32,224        // 5  ASYM
-    .byte 224,32,32,224,  224,32,32,224,  32,32,32,32,  224,32,32,224        // 6  GAP
-    .byte 225,32,32,32,  32,225,32,32,  32,32,225,32,  32,32,32,225          // 7  STAIR
-    .byte 32,32,32,32,  32,42,32,32,  32,32,35,32,  32,32,32,32              // 8  MARKER
-    .byte 224,32,32,224,  224,32,32,224,  224,32,32,224,  224,32,32,224      // 9  DOUBLE_WALL
-    .byte 224,224,224,224,  32,32,32,32,  32,32,32,32,  32,32,32,32          // 10 TOP_BAR
-    .byte 32,32,32,32,  32,32,32,32,  32,32,32,32,  224,224,224,224          // 11 BOTTOM_BAR
+    .byte  32, 32, 32, 32,   32, 32, 32, 32,   32, 32, 32, 32,   32, 32, 32, 32   //  0 OPEN
+    .byte  32, 32, 32, 32,  192,192,192,192,  192,192,192,192,   32, 32, 32, 32   //  1 FLOOR_H
+    .byte 169, 32, 32,168,  169, 32, 32,168,  169, 32, 32,168,  169, 32, 32,168   //  2 CHANNEL_V
+    .byte 174,166,166,175,  168,160,160,169,  168,160,160,169,  176,167,167,177   //  3 SLAB
+    .byte 174,166,166,175,  168, 32, 32,169,  168, 32, 32,169,  176,167,167,177   //  4 SLAB_OPEN
+    .byte 174,166,166,166,  168,160,160,160,  168,160,160,160,  176,167,167,167   //  5 SLAB_L
+    .byte 166,166,166,175,  160,160,160,169,  160,160,160,169,  167,167,167,177   //  6 SLAB_R
+    .byte  32,181,180, 32,  181,160,160,180,  179,160,160,178,   32,179,178, 32   //  7 DIAMOND
+    .byte  32,186,187, 32,  186,160,160,187,  160,160,160,160,  160,160,160,160   //  8 STEP_PYR
+    .byte  32, 32, 32,180,   32, 32,180,160,   32,180,160,160,  180,160,160,160   //  9 SLOPE_F
+    .byte 181, 32, 32, 32,  160,181, 32, 32,  160,160,181, 32,  160,160,160,181   // 10 SLOPE_B
+    .byte 174,166,166,166,  168,160,160,173,  168,160,173, 32,  176,167, 32, 32   // 11 CORNER
+    .byte  32,193,193, 32,  192,160,160,192,  192,160,160,192,   32,193,193, 32   // 12 JUNCTION
+    .byte 174,195,197,175,  168,194,194,169,  168,198,161,169,  176,161,167,177   // 13 DETAIL
+    .byte  32, 32, 32, 32,  166,166,166,166,   32, 32, 32, 32,  163,163,163,163   // 14 CONNECT_H
+    .byte  32,165, 32,164,   32,165, 32,164,   32,165, 32,164,   32,165, 32,164   // 15 CONNECT_V
 METATILE_DEFS_END:
 
-// Stage metatile rows: 10 IDs per row (one screen width), hand-placed - not
-// a repeating or row-number-derived sequence. STAGE_METATILE_ROWS = 20 rows
-// expand to 80 logical character rows, well past the 25 visible at once, so
-// several ordinary coarse transitions occur before the stage wraps.
+// Stage metatile rows: 10 IDs per row (one screen width), hand-placed in five
+// vertical sections. Metatile row 0 and row 24 are both all-M0 (open black),
+// so the logical row 99 -> 0 wrap is a continuous black seam.
 stageMetatileRows:
-    .byte  2,0,0,7,0,0,0,0,3,0    // metatile row  0
-    .byte  2,0,9,0,4,0,0,0,3,8    // metatile row  1
-    .byte  0,6,0,0,0,10,0,5,0,2   // metatile row  2
-    .byte  0,0,0,3,0,0,7,0,0,9    // metatile row  3
-    .byte  1,0,2,0,0,0,3,0,4,0    // metatile row  4
-    .byte  0,8,0,0,11,0,0,0,6,0   // metatile row  5
-    .byte  2,0,0,5,0,3,0,0,0,7    // metatile row  6
-    .byte  0,0,9,0,0,0,4,0,2,0    // metatile row  7
-    .byte  0,3,0,0,10,0,0,6,0,0   // metatile row  8
-    .byte  2,0,0,0,7,0,3,0,0,8    // metatile row  9
-    .byte  0,0,5,0,0,0,0,9,0,2    // metatile row 10
-    .byte  3,0,0,4,0,11,0,0,0,0   // metatile row 11
-    .byte  0,2,0,0,0,0,6,0,3,0    // metatile row 12
-    .byte  0,0,7,0,9,0,0,0,0,2    // metatile row 13
-    .byte  3,0,0,8,0,0,5,0,0,0    // metatile row 14
-    .byte  0,4,0,0,2,0,0,0,3,10   // metatile row 15
-    .byte  0,0,0,6,0,7,0,0,0,0    // metatile row 16
-    .byte  2,0,9,0,0,0,3,0,0,5    // metatile row 17
-    .byte  0,0,0,0,8,0,0,4,0,2    // metatile row 18
-    .byte  3,0,7,0,0,0,0,0,9,0    // metatile row 19
+    // --- SECTION 1: INTRO / OPEN RELIEF ---
+    .byte  0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // metatile row  0  (logical rows 0-3)
+    .byte  0, 0, 3, 0, 0, 0, 0, 5, 6, 0   // metatile row  1  (logical rows 4-7)
+    .byte  0, 0, 0, 0, 0, 1, 1, 0, 0, 0   // metatile row  2  (logical rows 8-11)
+    .byte  3, 0, 0, 0, 0, 0, 0, 0, 0, 3   // metatile row  3  (logical rows 12-15)
+    .byte  0, 0,14,14,14,14,14,14, 0, 0   // metatile row  4  (logical rows 16-19)
+    // --- SECTION 2: SQUARE ARCHITECTURE ---
+    .byte  5, 6, 0, 0, 4, 0, 0, 5, 6, 0   // metatile row  5  (logical rows 20-23)
+    .byte  0, 0, 0, 5, 6, 5, 6, 0, 0, 3   // metatile row  6  (logical rows 24-27)
+    .byte  4, 0, 5, 6, 0, 0, 5, 6, 0, 4   // metatile row  7  (logical rows 28-31)
+    .byte  0, 5, 6, 5, 6, 0, 0, 5, 6, 0   // metatile row  8  (logical rows 32-35)
+    .byte 14,14,14,14,14,14,14,14,14,14   // metatile row  9  (logical rows 36-39)
+    // --- SECTION 3: PYRAMID FIELD ---
+    .byte  0, 7, 0, 0,10, 9, 0, 0, 7, 0   // metatile row 10  (logical rows 40-43)
+    .byte  7, 0,10, 9, 0, 0,10, 9, 0, 7   // metatile row 11  (logical rows 44-47)
+    .byte 10, 9, 0, 7, 0, 0, 7, 0,10, 9   // metatile row 12  (logical rows 48-51)
+    .byte  0,10, 9,10, 9,10, 9,10, 9, 0   // metatile row 13  (logical rows 52-55)
+    .byte  7, 0, 7, 0, 7, 0, 7, 0, 7, 0   // metatile row 14  (logical rows 56-59)
+    // --- SECTION 4: CHANNEL / INDUSTRIAL ---
+    .byte  2, 0, 2, 0, 2, 0, 2, 0, 2, 0   // metatile row 15  (logical rows 60-63)
+    .byte  2,12, 2,13, 2, 0, 2,12, 2,13   // metatile row 16  (logical rows 64-67)
+    .byte  2, 0, 2, 0,12, 0, 2, 0, 2, 0   // metatile row 17  (logical rows 68-71)
+    .byte 15, 2,13, 2, 0, 1, 1, 2,13, 2   // metatile row 18  (logical rows 72-75)
+    .byte  2,12, 2, 0, 2,12, 2, 0, 2,12   // metatile row 19  (logical rows 76-79)
+    // --- SECTION 5: COMPLEX / COMBINED -> fade to open ---
+    .byte  5, 6,13, 0, 7, 0,11,12, 5, 6   // metatile row 20  (logical rows 80-83)
+    .byte 13, 0,10, 9, 4, 5, 6,13, 0, 9   // metatile row 21  (logical rows 84-87)
+    .byte  0,11, 0, 1, 1,12, 0,11, 7, 0   // metatile row 22  (logical rows 88-91)
+    .byte  3, 0,14,14,14,14,14,14, 0, 3   // metatile row 23  (logical rows 92-95)
+    .byte  0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // metatile row 24  (logical rows 96-99)
 STAGE_METATILE_ROWS_END:
 // Size guards, and the final BASIC-ROM overlap guard, live in main.asm right
 // after this file's #import - KickAssembler resolves .if against the
