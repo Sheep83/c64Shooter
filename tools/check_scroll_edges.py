@@ -13,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from PIL import Image, ImageDraw
 from check_scroll_capture import load_metatile_stage, make_row_codes
+from mc_terrain import load_palette_config
 
 # Visible aperture of the production build. The engine now runs RSEL=0 (24-row)
 # permanently (docs/scroll-edge-investigation.md), so the border comparisons sit
@@ -45,6 +46,18 @@ def check_capture(root):
     charset = (root / 'charset.bin').read_bytes()
     stage = load_metatile_stage(root / 'metatiledefs.bin', root / 'stagemetatilerows.bin')
     row_codes = make_row_codes(*stage)
+    # Mixed hires / global-multicolour render model. Terrain cells are
+    # multicolour (one fixed colour-RAM value); palette registers come from the
+    # capture's vic.bin, else src/main.asm.
+    cfg = load_palette_config(root)
+    glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
+    hud_present = 'initFixedHud' in sym
+    total_logical_rows = stage[2]
+    turret_spans = []
+    if (root / 'turret-placements.bin').exists():
+        d = (root / 'turret-placements.bin').read_bytes()
+        half = len(d) // 2
+        turret_spans = list(zip(d[:half], d[half:]))  # published turret glyph cells; skipped here.
     stats = defaultdict(lambda: dict(pairs=0, checks=0, differences=0, raster_rows=defaultdict(int)))
     failures, examples = [], []
     spatial_checks = 0
@@ -66,21 +79,34 @@ def check_capture(root):
             bad = []
             for raster in list(range(44, 71)) + list(range(231, 260)):
                 border = not APERTURE_TOP <= raster <= APERTURE_BOTTOM
-                active = not border and 48+phase <= raster <= 247+phase
+                # Raster 71 is the first scrolled terrain line (matrix row 1)
+                # under the permanent 24-row RSEL=0 display; 55..70 are the fixed
+                # hires HUD + separator band (owned by check_fixed_hud_capture).
+                screenrow, gy = divmod(raster - 64 - phase, 8)
+                hud_band = not border and (raster < 71 or screenrow < 0)
+                active = not border and not hud_band
+                skip_cols = set()
                 if active:
-                    screenrow, gy = divmod(raster-48-phase, 8)
-                    codes = row_codes(row+finish+screenrow)
+                    logical = row+finish+screenrow
+                    codes = row_codes(logical)
+                    row_rgb = cfg.row_bytes(codes, gy, glyphs, cfg.terrain_cram)
+                    for col, world in turret_spans:
+                        if (logical - world) % total_logical_rows < 2:
+                            skip_cols |= {col, col + 1}
                 y = raster-16
                 for x in range(32, 352):
+                    if hud_band:
+                        continue
                     if not border and masked[x, y]:
+                        continue
+                    col, gx = divmod(x-32, 8)
+                    if active and col in skip_cols:
                         continue
                     expected = (0, 0, 0)  # Current engine has black border/background.
                     if active:
-                        col, gx = divmod(x-32, 8)
-                        if (charset[codes[col]*8+gy] >> (7-gx)) & 1:
-                            expected = (119, 83, 0)
+                        expected = tuple(row_rgb[(col*8 + gx)*3:(col*8 + gx)*3 + 3])
                     spatial_checks += 1
-                    if pix[x, y] != expected and len(bad) < 12:
+                    if tuple(pix[x, y]) != expected and len(bad) < 12:
                         bad.append([x, raster, list(pix[x, y]), list(expected)])
             if bad:
                 failures.append([n, 'edge spatial pixels', bad])
@@ -103,10 +129,23 @@ def check_capture(root):
                 for raster in range(first, last+1):
                     if not APERTURE_TOP <= raster <= APERTURE_BOTTOM:
                         continue  # 24-row crop: this scanline is border, not a scrolled row.
+                    if hud_present and raster < 71:
+                        continue  # Fixed hires HUD + separator band: does not scroll.
                     if raster-dy < APERTURE_TOP:
                         continue  # One genuinely new pixel row may enter through the border.
                     y = raster-16
+                    # Turret private glyphs are republished on aim/hit/death; that
+                    # deliberate content change is covered by check_fixed_hud_capture
+                    # and check_turret_capture, not by this motion comparison.
+                    turret_x = set()
+                    if turret_spans:
+                        logical = row + finish + (raster - 64 - phase) // 8
+                        for tcol, tworld in turret_spans:
+                            if (logical - tworld) % total_logical_rows < 2:
+                                turret_x |= {32 + tcol*8 + k for k in range(16)}
                     for x in range(32, 352):
+                        if x in turret_x:
+                            continue
                         if m[x, y] or om[x, y-dy]:
                             continue
                         stat['checks'] += 1

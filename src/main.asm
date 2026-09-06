@@ -452,6 +452,10 @@ gameLoop:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
+    jsr refreshScoreIfDirty                 // Deferred HUD score-digit rebuild: AFTER the coarse-prepare
+                                            // admission test (so a kill cannot delay it) and before the
+                                            // frame-end wait (so screen RAM is current well before the
+                                            // next row-0 fetch). Same visible timing as the old inline path.
 
     jsr waitForGameFrame                    // Coordinate this presentation with the physical-frame IRQ.
     jsr publishTurretGlyphs                 // Bounded private-glyph publication before any terrain fetch.
@@ -3007,6 +3011,7 @@ setupScoreDisplay:
     lda #0
     sta SCORE_LO                            // Score begins at zero, low byte.
     sta SCORE_HI                            // Score begins at zero, high byte.
+    sta SCORE_DIRTY                         // No deferred HUD rebuild pending at game start.
 
     ldx #0                                  // Copy the fixed label plus five decimal digits.
 !labelLoop:
@@ -3020,12 +3025,16 @@ setupScoreDisplay:
     rts
 
 // --- Routine: awardKillScore -----------------------------------------------
-// Add the fixed kill reward to the 16-bit binary score and refresh the HUD.
-// X is the logical enemy index in the caller, so preserve it across conversion.
+// Add the fixed kill reward to the 16-bit binary score and mark the HUD digits
+// stale. The visible-digit rebuild (displayScore, a repeated-subtraction
+// decimal conversion costing up to ~900 cycles) is NOT done here: on a coarse-
+// transition frame that synchronous cost could push prepareBackgroundCoarse
+// past its raster-184 admission cutoff and force a safe one-frame coarse hold
+// (see docs/multicolour-terrain-worklog.md, turret-kill hitch). Instead
+// refreshScoreIfDirty rebuilds the digits once at frame start, off that path.
+// The 16-bit score value is updated immediately; only the on-screen digits
+// lag by one frame.
 awardKillScore:
-    txa
-    pha                                     // Preserve updateEnemyHitEffects' object-loop X index.
-
     lda SCORE_LO
     clc
     adc #<SCORE_PER_KILL
@@ -3034,10 +3043,21 @@ awardKillScore:
     adc #>SCORE_PER_KILL
     sta SCORE_HI
 
-    jsr displayScore
+    lda #1
+    sta SCORE_DIRTY                         // Deferred HUD-digit rebuild; X is untouched by the code above.
+    rts
 
-    pla
-    tax                                     // Restore the dying enemy's logical object index.
+// --- Routine: refreshScoreIfDirty ---------------------------------------
+// Called once per frame at a frame-start point that is not on the gameplay ->
+// prepareBackgroundCoarse critical path. Rebuilds the five fixed-HUD score
+// digits only on the frame after a kill; otherwise ~10 cycles.
+refreshScoreIfDirty:
+    lda SCORE_DIRTY
+    beq !clean+
+    lda #0
+    sta SCORE_DIRTY
+    jmp displayScore                        // Tail call; writes HUD_SCORE_CELL..+4 only.
+!clean:
     rts
 
 // --- Routine: displayScore --------------------------------------------------
@@ -4068,6 +4088,10 @@ SCORE_LO:              .byte 0            // 16-bit binary score, low byte.
 SCORE_HI:              .byte 0            // 16-bit binary score, high byte.
 SCORE_VALUE_LO:        .byte 0            // Scratch copy used by decimal HUD conversion.
 SCORE_VALUE_HI:        .byte 0            // Scratch copy used by decimal HUD conversion.
+SCORE_DIRTY:           .byte 0            // Set by awardKillScore; the deferred HUD-digit rebuild
+                                          // (displayScore) then runs once at a frame-start point that
+                                          // is off the gameplay -> prepareBackgroundCoarse critical
+                                          // path, so a kill can no longer delay a coarse transition.
 
 DEBUG_FRAME_COUNT:     .byte 0
 DEBUG_RASTER_LO:       .byte 0

@@ -314,6 +314,20 @@ updateBackgroundTurrets:
     bcs !next+                              // Existing bullets fly downward: hold fire when player is above/near.
     lda PLAYER_STATE
     bne !next+
+#if !TURRET_FIRE_NO_MITIGATION
+    // Hold fire when the playfield is already at the sprite-multiplexer
+    // threshold. SORTED_COUNT (previous frame's render-eligible object count) of
+    // 8 means a 9th sprite would force buildBatchSpriteSchedule to emit a LIVE
+    // batch; if that batch lands low it keeps prepareBackgroundCoarse's
+    // "all batches consumed" gate from admitting the coarse copy, deferring the
+    // background scroll for as long as the extra object persists. A turret shot
+    // is the projectile most able to sit low enough to cause this, so it yields
+    // one fire cycle rather than add the tipping sprite. Enemy fire is unchanged.
+    // -define TURRET_FIRE_NO_MITIGATION compiles this out for the wave-phase A/B.
+    lda SORTED_COUNT
+    cmp #8
+    bcs !next+
+#endif
     lda TURRET_X_LO,x
     clc
     adc #4                                  // Centre the existing8-pixel projectile on the16-pixel mount.

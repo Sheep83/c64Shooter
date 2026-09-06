@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 from PIL import Image, ImageDraw
+from mc_terrain import load_palette_config
 
 
 METATILE_W = 4                          # Format constants (not stage-specific data): the 4x4 metatile
@@ -65,6 +66,22 @@ def main():
     stage_rows, defs, total_logical_rows = load_metatile_stage(
         root / 'metatiledefs.bin', root / 'stagemetatilerows.bin')
     row_codes = make_row_codes(stage_rows, defs, total_logical_rows)
+    # Mixed hires / global-multicolour render model (palette registers from the
+    # capture's vic.bin, else src/main.asm). Terrain cells are multicolour with
+    # one fixed colour-RAM value; the fixed HUD row (when present) is hires and
+    # is validated by check_fixed_hud_capture, so it is skipped here.
+    cfg = load_palette_config(root)
+    glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
+    hud_present = 'initFixedHud' in sym
+    # Turret private-glyph columns are published per frame and validated
+    # exhaustively by check_fixed_hud_capture / check_turret_capture; this
+    # independent terrain oracle skips those 2-wide cells rather than duplicate
+    # the turret glyph-publication model.
+    turret_spans = []
+    if (root / 'turret-placements.bin').exists():
+        d = (root / 'turret-placements.bin').read_bytes()
+        half = len(d) // 2
+        turret_spans = list(zip(d[:half], d[half:]))
     failures = []
     clocks, fine, rows, active, batches, deferred, scores = [], [], [], [], [], [], []
     frames = []
@@ -97,14 +114,15 @@ def main():
         top_id = rows[-1] + finish
         im = Image.open(root / f'{f:05d}.png').convert('RGB')
         pix = im.load()
-        # Mask the full rectangles of sprites in the displayed LIVE plan.
-        # Muzzle flashes can use the same brown as the terrain.
+        # Mask the full rectangles of sprites in the displayed LIVE plan. A
+        # sprite at plan Y covers rasters Y+1..Y+21 (image rows Y-15..Y+5);
+        # terrain now shares the sprites' greys/white so the box must be exact.
         live = get('LIVE_PLAN')
         boxes = []
         for prefix, count in [('INITIAL', state[sym['RENDER_COUNT']-0x2000+live]), ('ASSIGN', 8)]:
             for i in range(count):
                 def plan(field): return state[sym[prefix+'_'+field]-0x2000+live+i]
-                sx, sy = plan('X') + 256*plan('X_MSB') + 8, plan('Y') - 16
+                sx, sy = plan('X') + 256*plan('X_MSB') + 8, plan('Y') - 15
                 boxes.append((sx, sy, sx+24, sy+21))
         mask = Image.new('1', im.size)
         draw = ImageDraw.Draw(mask)
@@ -112,20 +130,31 @@ def main():
             draw.rectangle((x0,y0,x1-1,y1-1), fill=1)
         maskpix = mask.load()
         bad = []
-        for y in range(39, 231):  # Interior common to all fine phases; no edge/HUD assumption.
-            screenrow, gy = divmod(y - (32 + phase), 8)
-            codes = row_codes(top_id + screenrow)
+        top_y = 55 if hud_present else 39  # Skip the hires fixed-HUD band when present.
+        for y in range(top_y, 231):  # Interior common to all fine phases.
+            # Raster 71 == first scrolled terrain row (matrix row 1) under the
+            # permanent 24-row RSEL=0 display; matches check_fixed_hud_capture.
+            screenrow, gy = divmod(y - (48 + phase), 8)
+            if screenrow < 0:
+                continue
+            logical = top_id + screenrow
+            codes = row_codes(logical)
+            skip_cols = set()
+            for col, world in turret_spans:
+                if (logical - world) % total_logical_rows < 2:
+                    skip_cols |= {col, col + 1}
+            # One fixed multicolour colour-RAM value for the whole playfield.
+            row_rgb = cfg.row_bytes(codes, gy, glyphs, cfg.terrain_cram)
             for x in range(32, 352):
                 if maskpix[x, y]:
                     continue
-                actual = pix[x, y]
-                if actual not in ((0, 0, 0), (119, 83, 0)):
-                    continue  # Foreground sprite pixels; character colour is fixed brown.
                 col, gx = divmod(x - 32, 8)
-                bit = (charset[codes[col]*8 + gy] >> (7-gx)) & 1
+                if col in skip_cols:
+                    continue
                 pixel_checks += 1
-                if (actual != (0,0,0)) != bool(bit):
-                    bad.append((x,y))
+                expected = tuple(row_rgb[(col*8 + gx)*3:(col*8 + gx)*3 + 3])
+                if tuple(pix[x, y]) != expected:
+                    bad.append((x, y))
         if bad:
             failures.append({'frame': f, 'kind': 'pixels', 'count': len(bad), 'positions': bad[:12], 'fine':phase, 'top':top_id})
         if 300 <= f < 420:

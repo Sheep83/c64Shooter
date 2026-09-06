@@ -137,6 +137,7 @@ def main():
         mon.cmd(f'bsave "{out / f"{frame:05d}.state"}" 0 2000 23ff')
         mon.cmd(f'screenshot "{out / f"{frame:05d}.png"}" 2')
         mon.cmd(f'bsave "{out / f"{frame:05d}.bg"}" 0 2920 2fff')
+        mon.cmd(f'bsave "{out / f"{frame:05d}.colour"}" 0 d800 dbff')
         if 'TURRET_STATE_BEGIN' in sym:
             mon.cmd(f'bsave "{out / f"{frame:05d}.turret"}" 0 {sym["TURRET_STATE_BEGIN"]:04x} {sym["TURRET_STATE_END"]-1:04x}')
             mon.cmd(f'bsave "{out / f"{frame:05d}.charset"}" 0 3800 3fff')
@@ -188,6 +189,10 @@ def main():
     (out / 'frames.json').write_text(json.dumps(records, indent=2))
     (out / 'symbols.json').write_text(json.dumps(sym, indent=2))
     mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
+    # VIC-II register image ($D000..$D02F): the terrain oracles read $D016
+    # (global char MCM), $D021/$D022/$D023 (the multicolour palette registers)
+    # from here rather than hard-coding them.
+    mon.cmd(f'bsave "{out / "vic.bin"}" 0 d000 d02f')
     if 'TURRET_STATE_BEGIN' in sym:
         for name, low, high in [('turret-placements.bin',sym['turretWorldCol'],sym['turretWorldXLo']-1),
                                 ('turret-art.bin',sym['turretArt'],sym['turretArtEnd']-1),

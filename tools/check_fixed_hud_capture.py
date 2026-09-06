@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw
 from check_scroll_capture import load_metatile_stage, make_row_codes
+from mc_terrain import load_palette_config, load_colour_ram
 
 
 def main():
@@ -39,6 +40,21 @@ def main():
     if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,146)):
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
+    # Mixed hires / global-multicolour render model. The playfield runs global
+    # char MCM during PLAYING; terrain + turret cells are multicolour (fixed
+    # colour RAM), the fixed HUD row stays hires. Palette registers come from
+    # the capture's vic.bin, else from src/main.asm - never a literal here.
+    cfg = load_palette_config(root)
+    if not cfg.mcm_on:
+        failures.append(['global char MCM not enabled during PLAYING'])
+    if not (8 <= cfg.terrain_cram <= 15):
+        failures.append(['terrain colour RAM not a multicolour selector 8..15', cfg.terrain_cram])
+    if cfg.hud_cram & 0x08:
+        failures.append(['HUD colour RAM is not hires', cfg.hud_cram])
+    stage_codes = {code for r in range(stage[2]) for code in rows(r)}
+    if stage_codes - set(range(160, 224)):
+        failures.append(['terrain glyph outside 160..223', sorted(stage_codes - set(range(160, 224)))])
+    terrain_cram_seen = set()
     turrets = 'TURRET_STATE_BEGIN' in sym
     # Turret private glyph code base (relocated out of the 160..223 terrain
     # namespace); exported as a label so this oracle carries no literal.
@@ -48,6 +64,8 @@ def main():
         data = (root/'turret-placements.bin').read_bytes()
         count = len(data)//2
         placements = list(zip(data[:count],data[count:]))
+        if not (226 <= tbase and tbase + count*4 <= 238):
+            failures.append(['turret private glyphs outside 226..237', tbase, count])
         if set((root/'metatiledefs.bin').read_bytes()) & set(range(tbase,tbase+count*4)):
             failures.append(['raw terrain uses turret private glyphs'])
         art = (root/'turret-art.bin').read_bytes()
@@ -71,17 +89,15 @@ def main():
         out = bytearray()
         for raster in range(55,247):
             if raster < 63:
-                codes, gy, colour = hud, raster-55, bytes((255,255,255))
+                # Fixed HUD row: hires (colour RAM hud_cram) even under global MCM.
+                out.extend(cfg.row_bytes(hud, raster-55, current_glyphs, cfg.hud_cram))
             elif raster < 71:
                 out.extend(bytes(320*3))
-                continue
             else:
+                # Terrain / turret cells: multicolour, one fixed colour RAM value.
                 terrain_row, gy = divmod(raster-(64+phase),8)
-                codes, colour = visual_rows(row+terrain_row), bytes((119,83,0))
-            for code in codes:
-                bits = current_glyphs[code][gy]
-                for bit in range(7,-1,-1):
-                    out.extend(colour if bits & (1<<bit) else bytes(3))
+                codes = visual_rows(row+terrain_row)
+                out.extend(cfg.row_bytes(codes, gy, current_glyphs, cfg.terrain_cram))
         return Image.frombytes('RGB',(320,192),bytes(out))
     def nonzero(im):
         # RGB difference -> a binary mask: any nonzero component is a mismatch.
@@ -118,6 +134,16 @@ def main():
             expected_charset = charset[:tbase*8]+private_pixels(styles)+charset[tbase*8+32*len(placements):]
             if actual_charset != expected_charset:
                 failures.append([frame,'private glyph publication/charset integrity'])
+        colour_ram = load_colour_ram(root, frame, cfg)
+        if len(colour_ram) == 1000:
+            # Terrain colour RAM is written once and never scrolled: every cell
+            # below the HUD stays the one fixed multicolour value, every frame.
+            terrain_cells = set(colour_ram[40:1000])
+            terrain_cram_seen.update(terrain_cells)
+            if terrain_cells - {cfg.terrain_cram}:
+                failures.append([frame,'terrain colour RAM not fixed',sorted(terrain_cells)])
+            if set(colour_ram[:40]) - {cfg.hud_cram}:
+                failures.append([frame,'HUD colour RAM changed',sorted(set(colour_ram[:40]))])
         score = get('SCORE_LO') + 256*get('SCORE_HI')
         free_region = ram[28:38]                       # "FREE " + five digits, or ten blanks when disabled.
         hud = hud_row(score, free_region)
@@ -217,11 +243,16 @@ def main():
         phases.append(phase)
     deltas=sorted(set(b-a for a,b in zip(clocks,clocks[1:])))
     if deltas != [19656]:failures.append(['PAL cadence',deltas])
+    if len(terrain_cram_seen) > 1:
+        failures.append(['terrain colour RAM varied across run',sorted(terrain_cram_seen)])
     result=dict(frames=len(records), phases=sorted(set(phases)), coarse_transitions=wraps,
                 stage_circuits=wraps/stage[2],max_active=max_active,max_batches=max_batches,
                 deferred=max_deferred,frame_cycle_deltas=deltas,pixel_checks=checks,
                 unmasked_hud_separator_checks=hud_checks,physical_edge_motion_checks=edge_checks,
                 score_visible_next_frame=delayed_scores,
+                render_model=cfg.source, char_mcm=cfg.mcm_on,
+                palette_registers=dict(d021=cfg.d021,d022=cfg.d022,d023=cfg.d023),
+                terrain_colour_ram=sorted(terrain_cram_seen) or [cfg.terrain_cram],
                 failure_count=len(failures),failures=failures[:24])
     (root/'fixed-hud-verification.json').write_text(json.dumps(result,indent=2))
     (root/'fixed-hud-failures.json').write_text(json.dumps(failures,indent=2))

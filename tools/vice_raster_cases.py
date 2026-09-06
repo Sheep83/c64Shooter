@@ -118,6 +118,7 @@ def main():
             records.append({'frame': frame, 'registers': mon.cmd('r'), 'physical_fine': frame % 8 if args.all_phases else 7})
             if args.solid:
                 mon.cmd(f'screenshot "{out / f"{frame:05d}.png"}" 2')
+                mon.cmd(f'bsave "{out / f"{frame:05d}.colour"}" 0 d800 dbff')
             for extension, low, high in [('state', 0x2000, 0x23ff), ('ram', 0x0400, 0x07ff),
                                          ('raster', sym['RASTER_STATE_BEGIN'], sym['RASTER_STATE_END']-1)]:
                 mon.cmd(f'bsave "{out / f"{frame:05d}.{extension}"}" 0 {low:04x} {high:04x}')
@@ -130,6 +131,8 @@ def main():
         (out/'frames.json').write_text(json.dumps(records, indent=2))
         (out/'symbols.json').write_text(json.dumps(sym, indent=2))
         mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
+        if args.solid:
+            mon.cmd(f'bsave "{out / "vic.bin"}" 0 d000 d02f')
         if args.publish_turret:
             mon.cmd(f'delete {bp}')
             put('TURRET_DESIRED_STYLE',[4,4,0])

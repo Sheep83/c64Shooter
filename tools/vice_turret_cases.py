@@ -146,6 +146,7 @@ def main():
         put('OBJECT_X',x0&255);put('OBJECT_X_MSB',x0>>8);put('OBJECT_Y',240)
         put('PLAYER_STATE',0);put('TURRET_HIT_TIMER',[0,0,0])
         put('TURRET_FIRE_TIMER',[0,0,0]);put('ENEMY_BULLET_COUNT',0)
+        put('SORTED_COUNT',0)                   # below the sprite-multiplex hold-fire threshold
         call('updateBackgroundTurrets')
         expect('world turret fired',read('TURRET_SHOTS_FIRED')[0],1)
         expect('projectile logical slot1',read('OBJECT_TYPE',2),bytes([1,3]))
@@ -163,6 +164,7 @@ def main():
         expect('full object pool rejection',call('spawnEnemyBulletAt')[0],1)
         expect('failed allocation leaves bullet count',read('ENEMY_BULLET_COUNT')[0],0)
         put('OBJECT_ACTIVE',[1]+[0]*15)
+        put('SORTED_COUNT',0)                   # isolate the fire-margin checks from the multiplex hold
         for player_y,turret_y in ((80,100),(240,72),(240,208)):
             put('OBJECT_Y',player_y);put('TURRET_Y',turret_y);put('TURRET_FIRE_TIMER',0)
             call('updateBackgroundTurrets')
