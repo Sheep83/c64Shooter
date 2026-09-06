@@ -245,3 +245,100 @@ of CHARACTER data is unaffected (regression oracles pass).
 
 ## Status: Stages 1 & 2b complete and validated. Stage 3 stopped with measured
 ## blockers - see docs and end-of-task report. No commits/pushes.
+
+## ================================================================
+## FOLLOW-UP TASK - global fixed terrain multicolour palette (no colour scroll)
+## ================================================================
+## (Stages 1 & 2b checkpointed as commit 2744b35; this section works on top.)
+
+Decision: abandon per-cell colour RAM for ordinary scrolling terrain. Use ONE
+fixed stage-global multicolour colour-RAM value for the whole playfield, so
+colour RAM is written once and NEVER scrolled. All visual detail lives in the
+glyph bitmaps as authored 2-bit multicolour pixels. This drops the entire
+Stage-2/3 colour-copy path.
+
+### Retained from the previous experiment
+- `$D016` MCM enable (initBackground) / disable (endGame); `VIC_CONTROL_2`,
+  `EXTRA_COLOUR_1/2` in variables.asm.
+- Terrain glyph namespace 160..223 (64), generalised glyph copy, guards (Stage 1).
+- Turret private glyphs relocated to 226..237; exported `TURRET_GLYPH_BASE_CODE`;
+  charset ownership guards (Stage 1).
+- Tool changes deriving the turret glyph base from the symbol (Stage 1).
+- `TERRAIN_MC_COLOUR_1` = 11 ($D022). `TERRAIN_MC_COLOUR_2` retuned 12 -> 15
+  ($D023) for a clearer dark/light spread.
+
+### Removed (dead per-cell-colour machinery)
+- `metatileColours` table + `METATILE_COLOURS_END` + its size guard.
+- `BG_INCOMING_COLOUR` buffer; `applyIncomingRowColour` routine; the parallel
+  `metatileColours` stores in `decodeStageCharacterRow`; the row-1 colour apply
+  in `finishBackgroundCoarse`; the per-row colour apply in the init row loop.
+- `COLOUR_DST` zero-page pointer.
+- `.const TERRAIN_COLOUR` (0..7 hires fallback) -> replaced by
+  `.const TERRAIN_COLOUR_RAM = 8|1` (fixed multicolour value: bit3 MC, low3 = 1
+  = white), guarded 8..15.
+
+### New model
+- `initBackground` fills all 1000 colour-RAM cells with `TERRAIN_COLOUR_RAM`
+  once; `initFixedHud` then repaints row 0 (white hires HUD). Colour RAM is
+  static thereafter. No crossing-colour buffer, no coarse colour shift, no
+  incoming-colour copy.
+- `decodeStageCharacterRow` / `renderStageRowToScreen` / `copyIncomingRowToScreen`
+  are back to character-only. `finishBackgroundCoarse` / `prepareBackgroundCoarse`
+  add zero colour work.
+- Stage palette: $D021 = 0 (black), $D022 = 11 (dark grey), $D023 = 15 (light
+  grey), TERRAIN_COLOUR_RAM & 7 = 1 (white). Four tones per glyph.
+
+### Multicolour art proof
+12 terrain glyphs re-authored as true 4-colour multicolour:
+- SLAB bevel: 166 EDGE_T2, 167 EDGE_B2, 168 EDGE_L2, 169 EDGE_R2, 174..177
+  thick corners -> light-grey lit top/left edge, dark-grey shadow bottom/right
+  edge, white interior. Makes metatiles 3 (SLAB), 4 (SLAB_OPEN), 5 (SLAB_L),
+  6 (SLAB_R), 11 (CORNER), 13 (DETAIL frame) render as bevelled bas-relief.
+- DETAIL panel: 194 SLOT_V (light/white/dark/white ribs), 195 SLOT_H (light rib
+  / dark rib), 197/198 NOTCH (white block + dark-grey notch) -> metatile 13
+  reads as a shaded ribbed tech panel.
+The remaining glyphs stay 2-tone (00/11 = black/white), identical to the old
+mono relief. `CHANNEL_V` (uses 168/169) picks up the light/dark bevel walls.
+
+### Turrets
+7 `turretArt` templates re-authored as multicolour bitmaps (common white dome on
+a dark-grey base + a light-grey barrel nub per aim; style 6 = white flash). No
+gameplay/publication/cache logic changed. Turret screen cells carry the same
+fixed `TERRAIN_COLOUR_RAM`; destroyed turrets restore the cached (now MC)
+terrain glyph bitmaps - colour is automatic. `installTurretRow` still writes
+characters only.
+
+### Build
+Clean, all guards pass. Segments $2920-$2c53, $4000-$5841 (back to the Stage-1
+size; `metatileColours` gone), $6000-$634f, $8800-$8edf. PRG SHA-256
+`27b7441827a3679f90c8d330468cb374d56a5ec0825a3ada8d908ba8032818af`.
+
+### Measurements
+- `prepareBackgroundCoarse` pure CPU incl. JSR, all 100 origins:
+  **5881..5928 = byte-for-byte the turret baseline** (Stage 2b was 6232..6312).
+  Zero coarse-scroll colour cost.
+- Matched 3000-frame `--physical --trace` capture, this build vs baseline
+  `96c6924` (built to build/base96):
+  | metric | baseline 96c6924 | this build |
+  |---|---|---|
+  | coarse transitions | 123 | 124 |
+  | safe coarse deferrals | 45 | **11** |
+  | FREE min / median / max | 1575 / 6237 / 11277 | 2079 / 6489 / 11655 |
+  | raster svc / start / replay | 0 / 0 / 0 | 0 / 0 / 0 |
+  | frame cadence | [19656] | [19656] |
+  Deferrals and FREE are BETTER than the turret baseline; deterministic (two
+  runs identical). No new coarse-scroll timing regression.
+- turret functional cases: 45 checks, 0 failures. lifecycle: 0 failures, turret
+  reset OK, jiffy drift 0. 17 scheduler cases: 0/0.
+- Visual: bevelled multicolour slabs + ribbed DETAIL panels clearly show
+  black/dark-grey/light-grey/white; terrain+colour fully coherent through scroll
+  and wrap; **no top-row colour artefact** (colour RAM is uniform - nothing can
+  desync). HUD/sprites/menu unaffected ($D016 = $C8 at menu).
+- Oracle note: `check_fixed_hud_capture.py`'s pixel model still renders terrain
+  as brown hires -> `physical pixels` class flags on ~24 sampled frames
+  (colour-model only). Structural checks (matrix, charset integrity, stock
+  glyphs, HUD, cadence, coarse) all pass. Updating that model to multicolour is
+  still the outstanding follow-up.
+
+### Status: complete. Ordinary terrain = fixed multicolour palette, no colour
+### scroll. Stage-3 per-cell colour path fully removed. No commits/pushes.

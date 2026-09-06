@@ -148,13 +148,12 @@ initBackgroundTurrets:
     jmp publishTurretGlyphs                 // All three are ready before the first gameplay frame.
 
 // Tail of renderStageRowToScreen: TEXT_DST still addresses the installed row.
-// This O(1) hook never changes BG_INCOMING_ROW / BG_INCOMING_COLOUR or the
-// metatile decoder. It overwrites two CHARACTER cells only; the colour-RAM
-// values copyIncomingRowToScreen already wrote for those cells (the underlying
-// authored terrain colour) are left in place, so a turret body - alive or
-// destroyed - inherits its terrain cell's colour. The three prototype
-// placements sit on metatiles 0 / 5 / 12, whose metatileColours entries are
-// hires (0..7), so the private glyphs render as hires characters.
+// This O(1) hook never changes BG_INCOMING_ROW or the metatile decoder. It
+// overwrites two CHARACTER cells only. Colour RAM is the single stage-global
+// TERRAIN_COLOUR_RAM value everywhere in the playfield, so a turret body - alive
+// or destroyed - renders with that same fixed multicolour palette; the turret
+// glyph bitmaps (turretArt / the cached underlay) are authored/kept as valid
+// multicolour bitmaps. No turret-specific colour-RAM handling exists.
 installTurretRow:
     ldx BG_LOGICAL_ROW
     lda turretRowGlyph,x
@@ -485,42 +484,50 @@ turretRowColumn:
 .align $100
 turretGroundGlyphs: .fill TURRET_COUNT*32,0
 .align $100
+// Seven 16x16 turret-body bitmaps, 4 glyphs each (TL,TR then BL,BR = 8 rows +
+// 8 rows). Authored for GLOBAL multicolour text mode: the turret screen cells
+// carry the same fixed TERRAIN_COLOUR_RAM value as the terrain, so these are
+// 2-bit multicolour bitmaps against the stage palette (00 black, 01 $D022 dark
+// grey, 10 $D023 light grey, 11 white). Common mount = white dome on a
+// dark-grey base; only a small light-grey barrel nub differs per aim. Style 7
+// (destroyed) is not a template - publishTurretGlyphs restores the cached
+// underlying terrain glyphs for that instance instead.
 turretArt:
     // Style0: up-left
-    .byte $00,$60,$30,$7f,$4f,$4e,$4b,$49
-    .byte $00,$00,$00,$fe,$c2,$62,$32,$b2
-    .byte $48,$4c,$47,$43,$50,$40,$7f,$00
-    .byte $32,$62,$c2,$82,$0a,$02,$fe,$00
+    .byte $20,$20,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $00,$00,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$00,$00
+    .byte $ff,$ff,$ff,$55,$55,$54,$00,$00
     // Style1: up
-    .byte $01,$01,$01,$7f,$47,$4d,$49,$49
-    .byte $80,$80,$80,$fe,$c2,$e2,$b2,$b2
-    .byte $48,$4c,$47,$43,$50,$40,$7f,$00
-    .byte $32,$62,$c2,$82,$0a,$02,$fe,$00
+    .byte $02,$02,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $80,$80,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$00,$00
+    .byte $ff,$ff,$ff,$55,$55,$54,$00,$00
     // Style2: up-right
-    .byte $00,$00,$00,$7f,$47,$4c,$48,$49
-    .byte $00,$03,$0e,$fe,$f2,$72,$f2,$b2
-    .byte $48,$4c,$47,$43,$50,$40,$7f,$00
-    .byte $32,$62,$c2,$82,$0a,$02,$fe,$00
+    .byte $00,$00,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $08,$08,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$00,$00
+    .byte $ff,$ff,$ff,$55,$55,$54,$00,$00
     // Style3: down-left
-    .byte $00,$00,$00,$7f,$47,$4c,$48,$49
-    .byte $00,$00,$00,$fe,$c2,$62,$32,$b2
-    .byte $4b,$4f,$4f,$5b,$70,$70,$7f,$00
-    .byte $32,$62,$c2,$82,$0a,$02,$fe,$00
+    .byte $00,$00,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $00,$00,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$20,$20
+    .byte $ff,$ff,$ff,$55,$55,$54,$00,$00
     // Style4: down
-    .byte $00,$00,$00,$7f,$47,$4c,$48,$49
-    .byte $00,$00,$00,$fe,$c2,$62,$32,$b2
-    .byte $49,$4d,$47,$43,$51,$41,$7f,$01
-    .byte $b2,$e2,$c2,$82,$8a,$82,$fe,$80
+    .byte $00,$00,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $00,$00,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$02,$02
+    .byte $ff,$ff,$ff,$55,$55,$54,$80,$80
     // Style5: down-right
-    .byte $00,$00,$00,$7f,$47,$4c,$48,$49
-    .byte $00,$00,$00,$fe,$c2,$62,$32,$b2
-    .byte $48,$4c,$47,$43,$50,$40,$7f,$00
-    .byte $f2,$62,$f2,$9a,$0e,$06,$ff,$00
-    // Style6: hit
-    .byte $c0,$ff,$60,$50,$48,$44,$42,$41
-    .byte $03,$ff,$06,$0a,$12,$22,$42,$82
-    .byte $41,$42,$44,$48,$50,$60,$ff,$c0
-    .byte $82,$42,$22,$12,$0a,$06,$ff,$03
+    .byte $00,$00,$0f,$3f,$ff,$ff,$ff,$ff
+    .byte $00,$00,$f0,$fc,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$55,$55,$15,$00,$00
+    .byte $ff,$ff,$ff,$55,$55,$54,$08,$08
+    // Style6: hit (bright white flash)
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$ff,$ff
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$ff,$ff
+    .byte $ff,$ff,$ff,$ff,$ff,$ff,$7e,$3c
+    .byte $ff,$ff,$ff,$ff,$ff,$ff,$7e,$3c
 turretArtEnd:
 .if (turretArtEnd - turretArt != 7*32) {
     .error "Turret templates must contain seven16x16 bitmaps"

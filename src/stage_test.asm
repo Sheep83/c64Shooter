@@ -3,16 +3,13 @@
 // test level - see docs/background-engine.md and the comment above
 // decodeStageCharacterRow in main.asm for the addressing scheme).
 //
-// Three tables (all future editor-generated):
+// Two tables (both future editor-generated):
 //
 //   metatileDefs       - METATILE_DEF_COUNT (16) definitions,
 //                         METATILE_W*METATILE_H (16) literal character bytes
 //                         each, row-major (definition's row 0 first, then row
 //                         1, 2, 3). Cells are terrain char codes (160..223) or
 //                         32 for open black.
-//   metatileColours    - the parallel 16 colour-RAM values per metatile, same
-//                         4x4 row-major layout. 0..7 hires colour; 8..15
-//                         multicolour (see the block above metatileColours).
 //   stageMetatileRows  - STAGE_METATILE_ROWS (25) rows of METATILES_PER_ROW
 //                         (10) metatile IDs each, one screen width per row.
 //                         25 metatile rows -> 100 logical character rows
@@ -20,10 +17,14 @@
 //                         is metatile row 24 -> row 0; both are all-M0 (open
 //                         black) so logical row 99 -> 0 shows continuous black.
 //
+// Colour is NOT per cell. Global multicolour text mode is on and EVERY playfield
+// colour-RAM cell holds one fixed value (TERRAIN_COLOUR_RAM in main.asm), so
+// colour RAM never scrolls. Each glyph bitmap carries its own 2-bit multicolour
+// detail against the stage palette ($D021 / $D022 / $D023 / TERRAIN_COLOUR_RAM&7).
+//
 // decodeStageCharacterRow (main.asm) expands these into a plain 40-byte
-// character row plus a parallel 40-byte colour row on request; it does not
-// care that the source is a metatile table rather than a raw row or,
-// eventually, a compressed/loaded format.
+// character row on request; it does not care that the source is a metatile
+// table rather than a raw row or, eventually, a compressed/loaded format.
 //
 // Terrain glyph legend (bitmaps in main.asm terrainGlyphs, codes 160..199):
 //   160 SOLID   161 STIPPLE 162 EDGE_T  163 EDGE_B  164 EDGE_L  165 EDGE_R
@@ -70,34 +71,6 @@ metatileDefs:
     .byte  32, 32, 32, 32,  166,166,166,166,   32, 32, 32, 32,  163,163,163,163   // 14 CONNECT_H
     .byte  32,165, 32,164,   32,165, 32,164,   32,165, 32,164,   32,165, 32,164   // 15 CONNECT_V
 METATILE_DEFS_END:
-
-// Per-cell colour-RAM values, one 16-byte block per metatile, identical 4x4
-// row-major layout to metatileDefs. decodeStageCharacterRow reads this with the
-// same offset it uses for metatileDefs. Global multicolour text mode is on:
-//   value 0..7  -> hires cell, value = foreground colour   (bg = $D021 black)
-//   value 8..15 -> multicolour cell: bitpair 01->$D022, 10->$D023, 11->(value&7)
-// Regression stage keeps the mono relief readable (mostly white = 1) with a few
-// hires accents; metatile 13 (DETAIL) is the deliberate multicolour proof.
-// Metatiles 0 / 5 / 12 carry the three prototype turret bodies and are kept
-// fully hires (0..7) so the private turret glyphs render as hires.
-metatileColours:
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  0 OPEN      (hires white; turret 0)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  1 FLOOR_H   (hires white)
-    .byte  3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3   //  2 CHANNEL_V (hires cyan)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  3 SLAB      (hires white)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  4 SLAB_OPEN (hires white)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  5 SLAB_L    (hires white; turret 1)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   //  6 SLAB_R    (hires white)
-    .byte  7, 7, 7, 7,   7, 7, 7, 7,   7, 7, 7, 7,   7, 7, 7, 7   //  7 DIAMOND   (hires yellow)
-    .byte  7, 7, 7, 7,   7, 7, 7, 7,   7, 7, 7, 7,   7, 7, 7, 7   //  8 STEP_PYR  (hires yellow)
-    .byte  3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3   //  9 SLOPE_F   (hires cyan)
-    .byte  3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3   // 10 SLOPE_B   (hires cyan)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   // 11 CORNER    (hires white)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   // 12 JUNCTION  (hires white; turret 2)
-    .byte 15,13,11, 9,  13,11, 9,15,  11, 9,15,13,   9,15,13,11   // 13 DETAIL    (MULTICOLOUR proof; all >= 8)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   // 14 CONNECT_H (hires white)
-    .byte  1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1   // 15 CONNECT_V (hires white)
-METATILE_COLOURS_END:
 
 // Stage metatile rows: 10 IDs per row (one screen width), hand-placed in five
 // vertical sections. Metatile row 0 and row 24 are both all-M0 (open black),

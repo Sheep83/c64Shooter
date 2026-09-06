@@ -65,18 +65,22 @@
 // minimum) at the right of the fixed HUD. 0 = leave that area blank and skip
 // the once-per-second decimal display work; the measurement itself still runs.
 .const DEBUG_SHOW_FREE_CYCLES = 1
-// Global multicolour text mode is enabled for the playfield (see initBackground).
-// Each terrain cell now carries its own colour-RAM value from metatileColours:
-//   0..7  -> hires cell, that value is the foreground; bg = $D021 (black).
-//   8..15 -> multicolour cell; bit pairs pick $D021 / $D022 / $D023 / (value&7).
-// TERRAIN_COLOUR is only the boot/fallback fill and the row-24 (offscreen) value;
-// it MUST be 0..7 because most authored cells and every turret cell are hires.
-// Brown (9) can no longer be a hires colour in mixed hires/MC text mode, so the
-// legacy monochrome relief is now white (1); per-cell values add the colour.
-.const TERRAIN_COLOUR = 1
-.const TERRAIN_MC_COLOUR_1 = 11                     // $D022 shared shade (dark grey).
-.const TERRAIN_MC_COLOUR_2 = 12                     // $D023 shared shade (mid grey).
-.if (TERRAIN_COLOUR > 7) { .error "TERRAIN_COLOUR fallback must be a 0..7 hires colour under global MC text mode" }
+// Global multicolour text mode is enabled for the whole PLAYING playfield
+// (see initBackground; cleared again in endGame for the menu). Every ordinary
+// scrolling terrain cell - and every turret body cell - uses ONE fixed
+// stage-global colour-RAM value, so colour RAM never has to scroll. All visual
+// detail lives in the glyph bitmaps as authored 2-bit multicolour pixels:
+//   bit pair 00 -> $D021 (background)
+//   bit pair 01 -> $D022 (TERRAIN_MC_COLOUR_1, shared shade 1)
+//   bit pair 10 -> $D023 (TERRAIN_MC_COLOUR_2, shared shade 2)
+//   bit pair 11 -> low 3 bits of TERRAIN_COLOUR_RAM (the per-cell colour)
+.const TERRAIN_MC_COLOUR_1 = 11                     // $D022 shared shade: dark grey.
+.const TERRAIN_MC_COLOUR_2 = 15                     // $D023 shared shade: light grey.
+.const TERRAIN_COLOUR_RAM  = 8 | 1                  // Fixed colour RAM for all terrain cells:
+                                                     // bit 3 = multicolour, low 3 bits = white (1).
+.if (TERRAIN_COLOUR_RAM < 8 || TERRAIN_COLOUR_RAM > 15) {
+    .error "TERRAIN_COLOUR_RAM must be a multicolour colour-RAM value 8..15"
+}
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
 .const BG_COARSE_LATEST_START = 184                // Exclusive; no remaining sprite batches may interrupt the copy.
 
@@ -4890,13 +4894,18 @@ initBackground:
     ora #%00010000                          // MCM = 1. Preserve CSEL / XSCROLL / unused bits.
     sta VIC_CONTROL_2
     lda #TERRAIN_MC_COLOUR_1
-    sta EXTRA_COLOUR_1                      // $D022 shared multicolour shade.
+    sta EXTRA_COLOUR_1                      // $D022 shared multicolour shade 1.
     lda #TERRAIN_MC_COLOUR_2
-    sta EXTRA_COLOUR_2                      // $D023 shared multicolour shade.
+    sta EXTRA_COLOUR_2                      // $D023 shared multicolour shade 2.
 
-    ldx #0                                  // Boot/fallback colour fill (also covers offscreen row24).
-!colourFill:                               // Terrain rows 1..23 are overwritten below with per-cell
-    lda #TERRAIN_COLOUR                     // colour decoded from metatileColours; row0 by initFixedHud.
+    // One fixed multicolour colour-RAM value for the WHOLE playfield. Written
+    // once here; colour RAM is then static for the life of the game - it is
+    // never scrolled, and the scroller never touches it. initFixedHud overwrites
+    // row 0 (the fixed HUD) afterwards. Every terrain and turret glyph carries
+    // its detail as 2-bit multicolour pixels in the bitmap itself.
+    ldx #0
+!colourFill:
+    lda #TERRAIN_COLOUR_RAM
     sta $d800,x
     sta $d800 + 250,x
     sta $d800 + 500,x
@@ -4908,8 +4917,7 @@ initBackground:
     ldx #1
 !rowLoop:
     stx BG_DEST_ROW
-    jsr renderStageRowToScreen              // Character row.
-    jsr applyIncomingRowColour              // Its per-cell colour row (immediate at init).
+    jsr renderStageRowToScreen              // Character row only; colour RAM is the fixed fill above.
     ldx BG_DEST_ROW
     inx
     cpx #24
@@ -4922,11 +4930,9 @@ initBackground:
 // SCROLL_ROW identifies the logical stage row at matrix row1. Decode source
 // (SCROLL_ROW + BG_DEST_ROW - 1) modulo STAGE_LOGICAL_ROWS.
 //
-// This writes the CHARACTER row only. decodeStageCharacterRow also fills
-// BG_INCOMING_COLOUR as a side effect; the caller applies that colour row
-// separately (applyIncomingRowColour) - at init immediately, and in the coarse
-// path deferred into finishBackgroundCoarse where there is beam slack, keeping
-// prepareBackgroundCoarse's frame-N budget intact.
+// Writes the CHARACTER row only. Colour RAM is a single stage-global fixed
+// value (TERRAIN_COLOUR_RAM), written once by initBackground and never touched
+// by the scroller, so there is no colour row to render here.
 renderStageRowToScreen:
     lda SCROLL_ROW
     clc
@@ -4938,36 +4944,16 @@ renderStageRowToScreen:
     sbc #STAGE_LOGICAL_ROWS                 // Carry is set here (CMP just confirmed A >= STAGE_LOGICAL_ROWS).
 !noWrapSrc:
     sta BG_LOGICAL_ROW
-    jsr decodeStageCharacterRow             // Fills BG_INCOMING_ROW and BG_INCOMING_COLOUR.
+    jsr decodeStageCharacterRow             // Expand the metatile stage into BG_INCOMING_ROW.
     jsr copyIncomingRowToScreen              // Character bytes -> screen row BG_DEST_ROW.
     jmp installTurretRow                    // Safe world-character installation; raw incoming buffer is unchanged.
-
-// Write the 40 decoded colour values for BG_DEST_ROW into the matching colour
-// RAM row ($D800 = $0400 + $D400: pointer low byte shared, high byte + $D4).
-applyIncomingRowColour:
-    ldy BG_DEST_ROW
-    lda starRowLo,y
-    sta COLOUR_DST
-    lda starRowHi,y
-    clc
-    adc #$d4
-    sta COLOUR_DST + 1
-    ldy #39
-!colourLoop:
-    lda BG_INCOMING_COLOUR,y
-    sta (COLOUR_DST),y
-    dey
-    bpl !colourLoop-
-    rts
 
 // --- Routine: decodeStageCharacterRow -----------------------------------------
 // Entry: BG_LOGICAL_ROW (0..STAGE_LOGICAL_ROWS-1) = absolute logical
 //        character row to expand. Exit: BG_INCOMING_ROW holds 40 generic
-//        character bytes and BG_INCOMING_COLOUR holds the 40 parallel per-cell
-//        colour-RAM values (metatileColours has the identical 16-bytes-per-tile
-//        layout as metatileDefs, so one offset indexes both). Does not touch
-//        screen RAM, colour RAM, $D011, raster IRQs or sprite state - only the
-//        two incoming buffers and its own scratch variables.
+//        character bytes. Does not touch screen RAM, colour RAM, $D011,
+//        raster IRQs or sprite state - only BG_INCOMING_ROW and its own
+//        scratch variables.
 //
 // STAGE_METATILE_ROWS*METATILE_H == STAGE_LOGICAL_ROWS exactly (see the
 // .const block above), so plain / and mod by METATILE_H (a power of two)
@@ -5027,8 +5013,6 @@ decodeStageCharacterRow:
     .for (var s = 0; s < METATILE_W; s++) {
         lda metatileDefs,y
         sta BG_INCOMING_ROW,x
-        lda metatileColours,y                // Parallel table, identical id*16 + row*4 + s layout.
-        sta BG_INCOMING_COLOUR,x
         .if (s < METATILE_W - 1) {
             iny
             inx
@@ -5043,8 +5027,8 @@ decodeStageCharacterRow:
 
 // --- Routine: copyIncomingRowToScreen -----------------------------------------
 // Entry: BG_DEST_ROW (0-24) = destination screen row. Copies the decoded
-// 40-byte BG_INCOMING_ROW to that screen row. Colour RAM is written separately
-// by applyIncomingRowColour. Sprite pointers are untouched.
+// 40-byte BG_INCOMING_ROW to that screen row. Colour RAM is a stage-global
+// fixed value and is never written here. Sprite pointers are untouched.
 copyIncomingRowToScreen:
     ldy BG_DEST_ROW
     lda starRowLo,y
@@ -5066,30 +5050,33 @@ bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) gl
 
 // --- Editor-owned terrain glyphs, TERRAIN_GLYPH_COUNT of the 64-code (160..223)
 // namespace -> $3D00.. ; currently 40 glyphs, codes 160..199, $3D00..$3E3F.
-// 8x8 hires bitmaps; bit set = the cell's colour-RAM foreground pixel. Copied
-// into the RAM charset once per game start by initBackground. Reusable
-// primitives: fills, thin/thick edges, frame corners, filled slope triangles,
-// 1px/2px diagonals, staircase steps, diamond apex/side pieces, ribs, black
-// slots, inner notches. Future editor output extends this table up to 64 glyphs.
+// 8x8 bitmaps rendered in GLOBAL multicolour text mode: each byte is 4 double-
+// wide pixels, bit pair 00=$D021 black, 01=$D022 (dark grey), 10=$D023 (light
+// grey), 11 = TERRAIN_COLOUR_RAM & 7 (white). Copied into the RAM charset once
+// per game start by initBackground. Most glyphs here are still 2-tone (00/11 =
+// black/white), which reads identically to the old hires mono relief; the SLAB
+// bevel pieces (166..169, 174..177) and the DETAIL panel pieces (194,195,197,
+// 198) are authored as true 4-colour multicolour proof art. Future editor
+// output authors every glyph as multicolour and extends this table up to 64.
 terrainGlyphs:
-    .byte $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff   // 160 SOLID
+    .byte $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff   // 160 SOLID     (all white)
     .byte $88,$00,$22,$00,$88,$00,$22,$00   // 161 STIPPLE
     .byte $ff,$00,$00,$00,$00,$00,$00,$00   // 162 EDGE_T
     .byte $00,$00,$00,$00,$00,$00,$00,$ff   // 163 EDGE_B
     .byte $80,$80,$80,$80,$80,$80,$80,$80   // 164 EDGE_L
     .byte $01,$01,$01,$01,$01,$01,$01,$01   // 165 EDGE_R
-    .byte $ff,$ff,$00,$00,$00,$00,$00,$00   // 166 EDGE_T2
-    .byte $00,$00,$00,$00,$00,$00,$ff,$ff   // 167 EDGE_B2
-    .byte $c0,$c0,$c0,$c0,$c0,$c0,$c0,$c0   // 168 EDGE_L2
-    .byte $03,$03,$03,$03,$03,$03,$03,$03   // 169 EDGE_R2
+    .byte $aa,$aa,$00,$00,$00,$00,$00,$00   // 166 EDGE_T2  MC: light-grey lit top bevel
+    .byte $00,$00,$00,$00,$00,$00,$55,$55   // 167 EDGE_B2  MC: dark-grey shadow bottom bevel
+    .byte $80,$80,$80,$80,$80,$80,$80,$80   // 168 EDGE_L2  MC: light-grey lit left bevel
+    .byte $01,$01,$01,$01,$01,$01,$01,$01   // 169 EDGE_R2  MC: dark-grey shadow right bevel
     .byte $ff,$80,$80,$80,$80,$80,$80,$80   // 170 CRN_TL
     .byte $ff,$01,$01,$01,$01,$01,$01,$01   // 171 CRN_TR
     .byte $80,$80,$80,$80,$80,$80,$80,$ff   // 172 CRN_BL
     .byte $01,$01,$01,$01,$01,$01,$01,$ff   // 173 CRN_BR
-    .byte $ff,$ff,$c0,$c0,$c0,$c0,$c0,$c0   // 174 CRN_TL2
-    .byte $ff,$ff,$03,$03,$03,$03,$03,$03   // 175 CRN_TR2
-    .byte $c0,$c0,$c0,$c0,$c0,$c0,$ff,$ff   // 176 CRN_BL2
-    .byte $03,$03,$03,$03,$03,$03,$ff,$ff   // 177 CRN_BR2
+    .byte $aa,$aa,$80,$80,$80,$80,$80,$80   // 174 CRN_TL2  MC: lit top + lit left bevel corner
+    .byte $aa,$aa,$01,$01,$01,$01,$01,$01   // 175 CRN_TR2  MC: lit top + shadow right bevel corner
+    .byte $80,$80,$80,$80,$80,$80,$55,$55   // 176 CRN_BL2  MC: lit left + shadow bottom bevel corner
+    .byte $01,$01,$01,$01,$01,$01,$55,$55   // 177 CRN_BR2  MC: shadow right + shadow bottom bevel corner
     .byte $ff,$fe,$fc,$f8,$f0,$e0,$c0,$80   // 178 TRI_TL
     .byte $ff,$7f,$3f,$1f,$0f,$07,$03,$01   // 179 TRI_TR
     .byte $80,$c0,$e0,$f0,$f8,$fc,$fe,$ff   // 180 TRI_BL
@@ -5106,11 +5093,11 @@ terrainGlyphs:
     .byte $01,$07,$1f,$7f,$7f,$1f,$07,$01   // 191 APEX_R
     .byte $00,$00,$ff,$ff,$00,$00,$00,$00   // 192 RIB_H
     .byte $18,$18,$18,$18,$18,$18,$18,$18   // 193 RIB_V
-    .byte $e7,$e7,$e7,$e7,$e7,$e7,$e7,$e7   // 194 SLOT_V
-    .byte $ff,$ff,$00,$00,$ff,$ff,$00,$00   // 195 SLOT_H
+    .byte $b7,$b7,$b7,$b7,$b7,$b7,$b7,$b7   // 194 SLOT_V   MC: light/white/dark/white vertical ribs
+    .byte $aa,$aa,$00,$00,$55,$55,$00,$00   // 195 SLOT_H   MC: light rib, gap, dark rib, gap
     .byte $0f,$0f,$0f,$0f,$ff,$ff,$ff,$ff   // 196 NOTCH_TL
-    .byte $f0,$f0,$f0,$f0,$ff,$ff,$ff,$ff   // 197 NOTCH_TR
-    .byte $ff,$ff,$ff,$ff,$0f,$0f,$0f,$0f   // 198 NOTCH_BL
+    .byte $f5,$f5,$f5,$f5,$ff,$ff,$ff,$ff   // 197 NOTCH_TR  MC: white block, dark-grey notch top-right
+    .byte $ff,$ff,$ff,$ff,$5f,$5f,$5f,$5f   // 198 NOTCH_BL  MC: white block, dark-grey notch bottom-left
     .byte $ff,$ff,$ff,$ff,$f0,$f0,$f0,$f0   // 199 NOTCH_BR
 terrainGlyphsEnd:
 .if (terrainGlyphsEnd - terrainGlyphs != TERRAIN_GLYPH_COUNT * 8) {
@@ -5196,20 +5183,13 @@ bgUpperReady:
 // Move rows22->23 down through13->14 (this reads old row 13 as the source
 // for new row 14, so it must run BEFORE row 13 is overwritten below), then
 // restore the row 12 bytes saved by prepareBackgroundCoarse into row 13.
+// Colour RAM is a stage-global fixed value and is not moved.
 gameplayPresented:                         // Diagnostic presentation point, before any lower-copy work.
 finishBackgroundCoarse:
     lda BG_COARSE_FINISH
     beq !done+
     lda #0
     sta BG_COARSE_FINISH
-    // Apply the new top row's per-cell colour, deferred here from
-    // prepareBackgroundCoarse. BG_INCOMING_COLOUR still holds that row's decoded
-    // colours (nothing decodes between prepare and this call). Row 1's colour
-    // RAM is not fetched until this frame's badline ~55; this runs first, well
-    // ahead of it, and off prepareBackgroundCoarse's tighter frame-N budget.
-    lda #1
-    sta BG_DEST_ROW
-    jsr applyIncomingRowColour
     jsr shiftBackgroundLower
     jsr restoreCrossingRow
 bgLowerReady:
@@ -5224,7 +5204,6 @@ BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data
                                          // copyIncomingRowToScreen then copies it to a screen row. Never
                                          // touched by the crossing-row save/restore mechanism (that
                                          // buffer, BG_CROSSING_ROW, lives separately near SCROLL_ROW).
-BG_INCOMING_COLOUR:    .fill 40, 0      // Parallel per-cell colour-RAM values for the same decoded row.
 BACKGROUND_CONTROL_END:
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"
@@ -5282,9 +5261,6 @@ BACKGROUND_CODE_END:
 #import "stage_test.asm"
 .if (METATILE_DEFS_END - metatileDefs != METATILE_DEF_COUNT * METATILE_W * METATILE_H) {
     .error "metatileDefs size does not match METATILE_DEF_COUNT * METATILE_W * METATILE_H"
-}
-.if (METATILE_COLOURS_END - metatileColours != METATILE_DEF_COUNT * METATILE_W * METATILE_H) {
-    .error "metatileColours size does not match metatileDefs (16 colour bytes per metatile)"
 }
 .if (STAGE_METATILE_ROWS_END - stageMetatileRows != STAGE_METATILE_ROWS * METATILES_PER_ROW) {
     .error "stageMetatileRows size does not match STAGE_METATILE_ROWS * METATILES_PER_ROW"
