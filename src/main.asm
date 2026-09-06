@@ -49,6 +49,13 @@
 // See docs/fixed-hud-codex-worklog.md for measured timing and acceptance status.
 // ============================================================================
 .const BG_SCREEN_A = $0400
+// Fixed HUD row0 private glyphs: codes 128..143 = space, S, C, O, R, E, 0..9.
+// Bitmaps are copied into the RAM charset by initFixedHud; the ten digit
+// glyphs live at HUD_DIGIT_GLYPH..+9. displayScore writes these codes (never
+// screen codes 48-57) into the five score cells at HUD_SCORE_CELL..+4.
+.const HUD_GLYPH_BASE = 128
+.const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6
+.const HUD_SCORE_CELL = BG_SCREEN_A + 8
 .const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
                                                      // colour RAM work at all, scrolling or otherwise.
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
@@ -2954,14 +2961,13 @@ awardKillScore:
     rts
 
 // --- Routine: displayScore --------------------------------------------------
-// Convert the 16-bit binary score to five decimal digits at SCORE_SCREEN+6.
-// The existing decimal divisor table is shared with the FREE-cycle display.
+// Convert the 16-bit binary score to five decimal digits and write the private
+// fixed-HUD digit glyphs into HUD_SCORE_CELL..+4. Called once per score change
+// (awardKillScore) and once at game start (initFixedHud), never per frame, so
+// no separate change guard is needed. The decimal divisor table is shared with
+// the FREE-cycle display. The scrolling matrix outside the fixed HUD row is
+// never touched.
 displayScore:
-    lda GAME_STATE                          // Keep scoring, but leave the scrolling matrix alone.
-    cmp #GAME_STATE_PLAYING
-    bne !draw+
-    rts
-!draw:
     lda SCORE_LO
     sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
     lda SCORE_HI
@@ -2993,8 +2999,8 @@ displayScore:
 !emitDigit:
     tya
     clc
-    adc #48                                 // Screen codes 48-57 display digits 0-9.
-    sta SCORE_SCREEN + 6,x
+    adc #HUD_DIGIT_GLYPH                    // Private HUD digit glyph 0..9 - never screen codes 48-57.
+    sta HUD_SCORE_CELL,x
     inx
     cpx #5
     bne !digitLoop-
@@ -5108,10 +5114,9 @@ STAGE_TEST_END:
     .error "Test stage assets overlap BASIC ROM"
 }
 
-// Fixed matrix row0, private stock glyphs. Current stage uses32/35/42/224/225;
-// stars use240..251. Codes128..137 replace only the rejected patch experiment.
-.const HUD_GLYPH_BASE = 128
-.var hudStockCodes = List().add(32,19,3,15,18,5,48,49,50,53)
+// Fixed matrix row0, private stock glyphs (see HUD_GLYPH_BASE near the top):
+// space, S, C, O, R, E, then the ten decimal digits 0..9.
+.var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57)
 initFixedHud:
     ldx #7
 !glyph:
@@ -5131,17 +5136,27 @@ initFixedHud:
     sta $d800,x
     dex
     bpl !row-
-    ldx #11
+    ldx #10
 !text:
     lda fixedHudText,x
     sta BG_SCREEN_A + 2,x
     dex
     bpl !text-
+    jsr displayScore                        // Fill the five digit cells from SCORE_LO/HI (0 at game start).
     rts
 fixedHudText:
-    .byte 129,130,131,132,133,128,134,135,136,137,134,134 // SCORE 012500
+    .byte 129,130,131,132,133,128,134,134,134,134,134 // "SCORE " + private 00000; digits overwritten by displayScore.
 .if (HUD_GLYPH_BASE + hudStockCodes.size() > 224) {
     .error "Fixed HUD glyphs overlap terrain charset allocation"
+}
+.if (HUD_DIGIT_GLYPH + 9 >= HUD_GLYPH_BASE + hudStockCodes.size()) {
+    .error "Fixed HUD digit glyphs 0..9 do not all fit the private allocation"
+}
+.if (STAR_CHARSET + HUD_GLYPH_BASE*8 < CLIP_SPRITE_POOL_END) {
+    .error "Fixed HUD glyph bitmaps overlap the clipped sprite pool"
+}
+.if (STAR_CHARSET + (HUD_GLYPH_BASE + hudStockCodes.size())*8 > STAR_CHARSET + $800) {
+    .error "Fixed HUD glyph bitmaps run past the charset"
 }
 .if (* > $6000) {
     .error "Background/HUD code overlaps raster scheduler"

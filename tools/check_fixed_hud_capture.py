@@ -19,17 +19,23 @@ def main():
     charset = (root/'charset.bin').read_bytes()
     stage = load_metatile_stage(root/'metatiledefs.bin', root/'stagemetatilerows.bin')
     rows = make_row_codes(*stage)
-    stock = [32,19,3,15,18,5,48,49,50,53]
-    hud = bytes([128,128,129,130,131,132,133,128,134,135,136,137,134,134]+[128]*26)
+    # Private HUD glyphs 128..143: space, S, C, O, R, E, then digits 0..9.
+    stock = [32,19,3,15,18,5,48,49,50,51,52,53,54,55,56,57]
+    HUD_DIGIT = 134
+    # Fixed row-0 layout; cells 8..12 are the live five-digit score (filled per frame).
+    hud_prefix = [128,128,129,130,131,132,133,128]
+    def hud_row(score):
+        digits = [HUD_DIGIT + int(d) for d in f'{score % 100000:05d}']
+        return bytes(hud_prefix + digits + [128]*27)
     failures = []
     for i, source in enumerate(stock):
         if charset[(128+i)*8:(129+i)*8] != charset[source*8:(source+1)*8]:
             failures.append(['stock glyph copy', i, source])
-    if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,138)):
+    if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,144)):
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
-    @lru_cache(maxsize=640)
-    def expected_pixels(row, phase):
+    @lru_cache(maxsize=1280)
+    def expected_pixels(row, phase, hud):
         out = bytearray()
         for raster in range(55,247):
             if raster < 63:
@@ -65,6 +71,8 @@ def main():
             return raster_state[addr-sym['RASTER_STATE_BEGIN']]
         phase = record['physical_fine']
         row, finish, live = get('SCROLL_ROW'), get('BG_COARSE_FINISH'), get('LIVE_PLAN')
+        score = get('SCORE_LO') + 256*get('SCORE_HI')
+        hud = hud_row(score)
         terrain = bytearray(hud)
         for r in range(1,24):terrain.extend(rows(row+r-1+(1 if finish and r>=13 else 0)))
         terrain.extend([32]*40)
@@ -102,7 +110,7 @@ def main():
         # Never excuse HUD/separator contamination as a sprite-covered pixel.
         draw.rectangle((0,0,319,15),fill=0)
         if frame:
-            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase)))
+            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud)))
             difference=ImageChops.subtract(difference,mask)
             bad=difference.getbbox()
             if bad:failures.append([frame,'physical pixels',bad,difference.histogram()[255]])
