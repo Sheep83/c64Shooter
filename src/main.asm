@@ -6,6 +6,14 @@
 .const MAX_OBJECTS = 16
 .const GAMEPLAY_SPRITE_MIN_Y = 71           // Body starts on raster72; no sprite DMA in the HUD transition.
 .const GAMEPLAY_SPRITE_END_Y = 246          // Exclusive: later origins have no pixels inside RSEL=0 aperture.
+// Progressive top-edge clip: objects with GAMEPLAY_SPRITE_CLIP_MIN_Y <= Y < 71
+// are rendered at their TRUE VIC Y using a private bitmap whose top (71-Y) rows
+// are transparent, so a sprite emerges one pixel at a time through raster72.
+// Y = GAMEPLAY_SPRITE_MIN_Y - 20 leaves exactly one visible body row at Y=51.
+.const GAMEPLAY_SPRITE_CLIP_MIN_Y = GAMEPLAY_SPRITE_MIN_Y - 20  // 51
+.const CLIP_SPRITE_POOL = $3400             // 2 plan halves x 8 hw slots x 64 bytes, VIC bank 0.
+.const CLIP_SPRITE_POOL_PTR = CLIP_SPRITE_POOL / 64             // $d0; slot pointer = base + plan + hwslot.
+.const CLIP_FULL_REBUILD_BUDGET = 8         // Max 63-byte clip rebuilds per BUILD; extras wait a frame.
 .const TYPE_PLAYER = 1
 .const TYPE_ENEMY  = 2
 .const TYPE_ENEMY_BULLET = 3
@@ -2369,8 +2377,8 @@ buildSortedObjectList:
     lda OBJECT_ACTIVE,x                     // Load A from OBJECT_ACTIVE,x.
     beq !next+                              // Branch to !next+ if the previous result was zero/equal.
     lda OBJECT_Y,x
-    cmp #GAMEPLAY_SPRITE_MIN_Y
-    bcc !next+
+    cmp #GAMEPLAY_SPRITE_CLIP_MIN_Y         // Straddlers (Y 51..70) are kept and rendered top-clipped;
+    bcc !next+                              // only bodies wholly above raster72 own no VIC slot.
     cmp #GAMEPLAY_SPRITE_END_Y
     bcs !next+
     ldy SORTED_COUNT                        // Load Y from SORTED_COUNT.
@@ -2430,6 +2438,8 @@ sortObjectsByY:
 // --- Routine: buildInitialSpriteSnapshot -----------------------------------
 // Snapshot the first eight sorted objects into BUILD_PLAN.
 buildInitialSpriteSnapshot:
+    lda #CLIP_FULL_REBUILD_BUDGET           // Reset the per-frame 63-byte clip-rebuild allowance.
+    sta CLIP_FULL_BUDGET
     lda SORTED_COUNT                        // Load A from SORTED_COUNT.
     cmp #8                                  // Compare A with #8; set flags, leaving A unchanged.
     bcc !countReady+                        // Branch to !countReady+ if carry is clear.
@@ -2459,10 +2469,11 @@ buildInitialSpriteSnapshot:
     lda OBJECT_X_MSB,x
     sta INITIAL_X_MSB,y
 
-    lda OBJECT_Y,x                          // Snapshot the path-owned Y coordinate directly.
+    lda OBJECT_Y,x                          // Snapshot the path-owned Y coordinate directly (never moved for clipping).
     sta INITIAL_Y,y
-    lda OBJECT_SPRITE,x                     // Load A from OBJECT_SPRITE,x.
-    sta INITIAL_SPRITE,y                    // Store A in INITIAL_SPRITE,y.
+    jsr snapshotSpritePointer              // Straddlers get a private top-clipped bitmap; others the plain pointer.
+    ldx TEMP_OBJECT                         // Restore the logical object index clobbered by the clip build.
+    ldy SNAPSHOT_INDEX                      // Restore the plan entry index.
     lda OBJECT_COLOUR,x                     // Load A from OBJECT_COLOUR,x.
     sta INITIAL_COLOUR,y                    // Store A in INITIAL_COLOUR,y.
     txa                                     // Copy the logical object index into A.
@@ -2477,6 +2488,186 @@ buildInitialSpriteSnapshot:
     bne !snapshotLoop-                      // Branch to !snapshotLoop- if the previous result was non-zero/not equal.
 !done:
     rts                                     // Return to the calling routine.
+
+// --- Routine: snapshotSpritePointer --------------------------------------------
+// Entry: X = logical object, Y = SNAPSHOT_INDEX = plan entry index (BUILD_PLAN +
+// hardware slot). Writes INITIAL_SPRITE[Y]. For an object whose body is wholly
+// inside the aperture (Y >= 71) that is just OBJECT_SPRITE. For a straddler
+// (51..70) it renders a private bitmap with the top 71-Y rows blanked into
+// CLIP_SPRITE_POOL[plan entry] and points the plan entry there. True VIC Y is
+// never changed. May clobber A, X, Y; callers restore from TEMP_OBJECT /
+// SNAPSHOT_INDEX. buildSortedObjectList guarantees Y >= 51 here.
+snapshotSpritePointer:
+    lda OBJECT_Y,x
+    cmp #GAMEPLAY_SPRITE_MIN_Y
+    bcs !plain+                             // Body starts at raster >= 72: no clipping needed.
+
+    lda #GAMEPLAY_SPRITE_MIN_Y             // d = 71 - Y  (rows to blank from the top, 1..20).
+    sec
+    sbc OBJECT_Y,x
+    ldy SNAPSHOT_INDEX
+    cmp CLIP_SHADOW_D,y                     // Same depth, same source, immutable art: this pool
+    bne !build+                            // slot is already exactly what we need - skip the copy.
+    lda OBJECT_SPRITE,x
+    cmp CLIP_SHADOW_PTR,y
+    bne !build+
+    cmp #HEALTH_SPRITE_BASE_PTR
+    bcs !build+
+    tya
+    clc
+    adc #CLIP_SPRITE_POOL_PTR
+    sta INITIAL_SPRITE,y
+    rts
+
+!build:
+    lda #GAMEPLAY_SPRITE_MIN_Y
+    sec
+    sbc OBJECT_Y,x
+    jsr buildClippedInitialSprite          // Uses A=d, X=object, SNAPSHOT_INDEX=plan entry.
+    bcs !overBudget+                        // Carry set: too many full rebuilds this frame.
+
+    lda SNAPSHOT_INDEX                      // Pointer = CLIP_SPRITE_POOL_PTR + plan entry (0..15).
+    clc
+    adc #CLIP_SPRITE_POOL_PTR
+    ldy SNAPSHOT_INDEX
+    sta INITIAL_SPRITE,y
+    rts
+
+!overBudget:
+    // A brand-new straddler that would need a full 63-byte rebuild is shown as
+    // a blank sprite for this frame only (its pool slot's shadow was cleared so
+    // the next BUILD rebuilds it). At the entry Y this is 1-2 pixels of a body
+    // that is about to appear anyway - not the whole-sprite pop this replaces.
+    lda #blankSprite / 64
+    ldy SNAPSHOT_INDEX
+    sta INITIAL_SPRITE,y
+    rts
+
+!plain:
+    lda #0                                  // This pool slot no longer mirrors a straddler bitmap.
+    sta CLIP_SHADOW_PTR,y
+    lda OBJECT_SPRITE,x
+    sta INITIAL_SPRITE,y
+    rts
+
+// --- Routine: buildClippedInitialSprite --------------------------------------
+// Entry: A = clip depth d in bitmap rows (1..20), X = logical object,
+// SNAPSHOT_INDEX = plan entry (0..15). Copies OBJECT_SPRITE's 63-byte bitmap
+// into CLIP_SPRITE_POOL[plan entry] and zeros the top d*3 bytes. Uses the
+// TEXT_SRC/TEXT_DST zero-page pointers (free at this point in the frame loop -
+// the scroller's copyIncomingRowToScreen runs later). Clobbers A, X, Y.
+.const CLIP_SRC = TEXT_SRC
+.const CLIP_DST = TEXT_DST
+buildClippedInitialSprite:
+    sta CLIP_DEPTH
+    asl                                    // d*3 bytes to blank.
+    clc
+    adc CLIP_DEPTH
+    sta CLIP_DEPTH_BYTES
+
+    lda SNAPSHOT_INDEX                      // dst = CLIP_SPRITE_POOL + planEntry*64.
+    and #3
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta CLIP_DST
+    lda SNAPSHOT_INDEX
+    lsr
+    lsr
+    clc
+    adc #>CLIP_SPRITE_POOL
+    sta CLIP_DST + 1
+
+    lda OBJECT_SPRITE,x                     // src = OBJECT_SPRITE * 64 (low byte).
+    and #3
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta CLIP_SRC
+    lda OBJECT_SPRITE,x                     // src high byte.
+    lsr
+    lsr
+    sta CLIP_SRC + 1
+
+    // If this pool slot already mirrors the same source bitmap (this plan built
+    // it two frames ago), only the mask rows between the old and new clip depth
+    // change - a straddler moves a few pixels per frame, not 63 bytes. Private
+    // health-bar copies ($c0+) can mutate under a stable pointer, so those are
+    // always fully recopied; formation art below $c0 is immutable.
+    lda OBJECT_SPRITE,x
+    cmp #HEALTH_SPRITE_BASE_PTR
+    bcs !fullCopy+
+    ldy SNAPSHOT_INDEX
+    lda CLIP_SHADOW_PTR,y
+    cmp OBJECT_SPRITE,x
+    bne !fullCopy+
+
+    lda CLIP_SHADOW_D,y                     // old_d*3 -> CLIP_OLD_BYTES.
+    asl
+    clc
+    adc CLIP_SHADOW_D,y
+    sta CLIP_OLD_BYTES
+    lda CLIP_SHADOW_D,y
+    cmp CLIP_DEPTH
+    beq !record+                            // Same depth: pool slot is already correct.
+    bcs !shrink+                            // old_d > new_d: restore rows [new_d, old_d) from source.
+
+    ldy CLIP_OLD_BYTES                      // old_d < new_d: blank rows [old_d, new_d).
+    lda #0
+!grow:
+    sta (CLIP_DST),y
+    iny
+    cpy CLIP_DEPTH_BYTES
+    bne !grow-
+    jmp !record+
+
+!shrink:
+    ldy CLIP_DEPTH_BYTES
+!restore:
+    lda (CLIP_SRC),y
+    sta (CLIP_DST),y
+    iny
+    cpy CLIP_OLD_BYTES
+    bne !restore-
+    jmp !record+
+
+!fullCopy:
+    dec CLIP_FULL_BUDGET                    // Bound worst-case BUILD cost: only a few 63-byte
+    bmi !overBudget+                        // rebuilds per frame; the rest wait one frame.
+    ldy #62                                 // New bitmap in this slot: full copy then blank the top.
+!copy:
+    lda (CLIP_SRC),y
+    sta (CLIP_DST),y
+    dey
+    bpl !copy-
+    lda #0
+    ldy CLIP_DEPTH_BYTES
+!blank:
+    dey
+    sta (CLIP_DST),y
+    bne !blank-
+
+!record:
+    ldy SNAPSHOT_INDEX                      // Remember what this pool slot now holds.
+    lda OBJECT_SPRITE,x
+    sta CLIP_SHADOW_PTR,y
+    lda CLIP_DEPTH
+    sta CLIP_SHADOW_D,y
+    clc                                    // Carry clear: a real clipped bitmap is in the pool.
+    rts
+
+!overBudget:
+    ldy SNAPSHOT_INDEX                     // Leave the shadow cleared so the next BUILD rebuilds it.
+    lda #0
+    sta CLIP_SHADOW_PTR,y
+    sec                                    // Carry set: caller shows a blank sprite this frame.
+    rts
 
 // --- Routine: buildBatchSpriteSchedule -------------------------------------
 // Build BUILD_PLAN's raster batches for sorted objects beyond the first eight.
@@ -4553,6 +4744,20 @@ healthSpritePool:
 HEALTH_SPRITE_POOL_END:
 .if (HEALTH_SPRITE_POOL_END > $4000) {
     .error "Health sprite pool exceeds VIC bank 0"
+}
+
+// --- Private top-clipped sprite RAM --------------------------------------------
+// buildInitialSpriteSnapshot writes a straddler's clipped bitmap here during
+// BUILD and stores CLIP_SPRITE_POOL_PTR + planIndex in the render plan. Two
+// plan halves (BUILD/LIVE base 0 or 8) x 8 hardware slots keep BUILD writes
+// clear of the LIVE bitmap the VIC/IRQ replay is fetching. VIC bank 0, below
+// the charset.
+* = CLIP_SPRITE_POOL
+clipSpritePool:
+    .fill 16 * 64, $00
+CLIP_SPRITE_POOL_END:
+.if (CLIP_SPRITE_POOL_END > STAR_CHARSET) {
+    .error "Clipped sprite pool overlaps the charset"
 }
 
 // ============================================================================

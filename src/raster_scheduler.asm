@@ -441,6 +441,15 @@ SCHED_PLAYER_MASK:             .byte 0
 SCHED_X_MSB_MASK:              .byte 0
 BATCH_PLAYER_MASK:             .fill 16, 0
 BATCH_X_MSB_MASK:              .fill 16, 0
+// Top-clipped sprite bookkeeping (see buildClippedInitialSprite in main.asm).
+// Zeroed here at game start; CLIP_SHADOW_PTR=0 means the matching pool slot
+// does not currently mirror a straddler bitmap.
+CLIP_DEPTH:                    .byte 0
+CLIP_DEPTH_BYTES:              .byte 0
+CLIP_OLD_BYTES:                .byte 0
+CLIP_FULL_BUDGET:              .byte 0
+CLIP_SHADOW_PTR:               .fill 16, 0
+CLIP_SHADOW_D:                 .fill 16, 0
 RASTER_STATE_END:
 .if (RASTER_STATE_END - RASTER_STATE_BEGIN > 128) {
     .error "Raster state clear loop exceeds signed X range"

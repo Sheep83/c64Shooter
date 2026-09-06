@@ -799,3 +799,138 @@ New tests must show these pending-batch cases defer, and no-pending but residual
 full/sparse DMA cases admitted at183 finish before0. Rerun normal,long,stress,
 dense and both oracles after this guard change; earlier v2 passes alone are
 insufficient for final acceptance.
+
+## Resumption — progressive top-edge sprite clipping (Claude, 2026-09-06)
+
+### Task
+Human accepted the fixed HUD visually. Only defect: sprites POP in/out at the top
+gameplay boundary (raster ~72) instead of emerging pixel-by-pixel.
+
+Implement progressive top clipping. Do NOT touch the HUD raster scheduler, the
+scroller, the viewport `71` semantics for combat, or BUILD/LIVE. Three states:
+(1) fully above -> active but not rendered; (2) partial -> rendered at TRUE VIC Y
+with a top-clipped bitmap; (3) fully inside -> original pointer. No move-down, no
+D015 clip, no bitmap generation in the IRQ. BUILD-time gen into a fixed private
+clipped-sprite pool; pointer stored in the plan before LIVE.
+
+### Confirmed root cause (verified in source)
+`buildSortedObjectList` (main.asm ~2364) drops every object with
+`OBJECT_Y < GAMEPLAY_SPRITE_MIN_Y (71)` from SORTED entirely, so no plan entry,
+no sprite. Eligibility is whole-sprite -> instant appearance at Y=71.
+
+### Verified architecture facts for this change
+- Sprite geometry (Codex's own `check_viewport_capture.py` contract, passes on
+  HEAD): OBJECT_Y is written straight to $D001; body occupies raster
+  `OBJECT_Y+1 .. OBJECT_Y+21` (21 rows, 3 bytes/row, 63-byte bitmap). Sprites are
+  unexpanded (no $D017/$D01D writes); multicolour ($D01C=$ff) - irrelevant to
+  whole-row blanking.
+- Clip depth (bitmap rows blanked from the top) `d = max(0, 72 - (Y+1)) = 71 - Y`.
+  Straddler band: Y in [51,70] -> d in [1,20]. Y<=50 -> d>=21 -> cull. Y>=71 -> d=0.
+- Plan: `INITIAL_SPRITE[LIVE+hwslot]` (renderSprites) and `ASSIGN_SPRITE` (IRQ
+  `applyLiveRasterBatch`) are the only sprite-pointer sources written to
+  `$07F8+hwslot`. `INITIAL_Y`/`ASSIGN_Y` -> `$D001` unchanged (true Y).
+- Initial snapshot: sorted position x -> hw slot x directly (renderSprites loop).
+- **Batches never carry straddlers.** A batch reuses hw slot S only when
+  `SLOT_FREE_RASTER[S] = OBJECT_Y[initial S] + 24 <= OBJECT_Y[batch obj] - 12`.
+  With the new SORTED floor 51, an initial straddler frees its slot at >=75,
+  while any batch-straddler deadline is <=58 -> no slot -> `!cannotSchedule`
+  skips it. So clipping is needed **only in `buildInitialSpriteSnapshot`**,
+  keyed by hw slot 0..7. `buildBatchSpriteSchedule`/`applyLiveRasterBatch`/
+  `multiplexIRQ` need no change.
+- Memory: `$3400-$37FF` (1024 B) is unallocated in VIC bank 0 (map:
+  health pool $3000-$33FF, charset $3800). Use it for a double-buffered clip
+  pool: 2 plan halves x 8 hw slots x 64 B. Pointer base `$3400/64 = $D0`;
+  pool-slot pointer = `$D0 + plan_base(0/8) + hwslot`. Double-buffering by plan
+  makes BUILD writes race-free vs LIVE display and vs `rasterFrameReset` replay.
+- Shadow state (avoid full 63-byte copy every frame): per plan slot (16)
+  `CLIP_SHADOW_PTR` + `CLIP_SHADOW_D`. Same-art slots only diff the changed mask
+  rows. New/changed slots do a full copy+mask. Unused/non-straddler slots get
+  `CLIP_SHADOW_PTR=0` so they force a rebuild when reused.
+
+### Decisions
+- New const `GAMEPLAY_SPRITE_CLIP_MIN_Y = 51`; only the `buildSortedObjectList`
+  floor moves from 71 to 51. Player clamp, enemy-fire, hitscan and software
+  collision stay gated at 71 (combat semantics preserved; a half-visible enemy
+  is drawn but not yet a combat participant - matches "viewport changes
+  presentation, not logical lifetime").
+- Clip pool double-buffered, 1024 B at $3400 (guarded `< $3800`).
+- Shadow (32 B) appended to the raster scheduler state block (stays < 128 for
+  its clear loop).
+- Overflow: at most 8 straddlers get clipping (8 initial slots). A theoretical
+  9th+ simultaneous straddler (needs >=9 enemies inside a 20px Y band, extras
+  in batches) is culled as today - no HUD contamination, degrades to old pop.
+
+### Status: implementing. Files to touch:
+- src/main.asm: `GAMEPLAY_SPRITE_CLIP_MIN_Y`; `buildSortedObjectList` floor;
+  `buildInitialSpriteSnapshot` clip hook + `buildClippedInitialSprite`;
+  `$3400` pool block + guard; shadow init in startGame.
+- src/raster_scheduler.asm: 32 B shadow state.
+- tools/check_viewport_capture.py: expect straddlers in plan; clip white-pixel
+  rectangles to `max(y+1,72)..y+21`.
+- New: tools/vice_clip_cases.py or reuse vice_raster_cases viewport_* + a
+  dedicated depth/entry test.
+
+### Next step
+Implement main.asm clip pool + hook, build, then a fresh single-straddler
+capture to prove d = 71 - Y against raster pixels before scaling to 8.
+
+### Progressive top-clip — implementation complete, one stress interaction found
+
+**Implementation (uncommitted):**
+- `buildSortedObjectList` floor 71 -> `GAMEPLAY_SPRITE_CLIP_MIN_Y` (51). Combat
+  gates (player clamp, enemy fire, hitscan, software collision) stay at 71.
+- `snapshotSpritePointer` / `buildClippedInitialSprite` (new, main.asm): for a
+  straddler (Y 51..70) copies OBJECT_SPRITE's 63 bytes into
+  `CLIP_SPRITE_POOL[BUILD_PLAN + hw slot]` and zeros the top (71-Y)*3 bytes,
+  then stores pointer `$d0 + plan + slot` in `INITIAL_SPRITE`. True VIC Y
+  unchanged. Batches provably never carry straddlers (a straddler frees its slot
+  at >=75; any batch-straddler deadline is <=58), so only the initial snapshot
+  needs the hook - `buildBatchSpriteSchedule`, `applyLiveRasterBatch`,
+  `multiplexIRQ`, `renderSprites` are untouched.
+- Pool: 1024 B at $3400-$37FF (VIC bank0, free per memory map), double-buffered
+  by plan half so BUILD writes never race the LIVE bitmap the VIC / IRQ replay
+  fetches.
+- Cost control: per plan-slot shadow (`CLIP_SHADOW_PTR/_D`); an unchanged
+  straddler with immutable formation art (ptr <$c0) skips the copy entirely;
+  a moved straddler only rewrites the changed mask rows; only a genuinely new
+  bitmap does the full 63-byte copy. `CLIP_FULL_REBUILD_BUDGET` (=8) bounds
+  full rebuilds per BUILD (inert at 8 for the 8-slot engine; a knob).
+- State added to raster_scheduler.asm block: 4 scratch + 32 shadow bytes
+  (block still < 128 for its clear loop; zeroed by initRasterScheduler).
+
+**Geometry proven:** VIC body = OBJECT_Y+1 .. +21; clip depth d = 71-Y;
+straddler Y 51..70 -> visible rows 1..20 starting at raster 72, nothing above.
+`tools/vice_clip_sweep.py`: Y swept 48<->74 in the live game loop, solid /
+player / enemyA art, 54 frames each, byte-exact pool check + pixel check =
+0 failures. Smooth 1px entry and 1px upward exit; clean clipped->original
+handover at Y=71.
+
+**Regression results (fresh VICE):**
+- Normal 1500 frames, 457 with a live clipped straddler, 62 coarse transitions:
+  check_fixed_hud_capture 0 failures (89M px), check_raster_capture 0 service /
+  0 sprite-start misses, 19656 cadence, 0 replays.
+- Parked scheduler cases early24/player37/overlap55/late243/close4/zero/one/
+  eight/viewport_* + new clip_eight/clip_boundary, all 8 phases:
+  0 service / 0 sprite-start misses; viewport pixel oracle 0 (incl. 8
+  simultaneous straddlers in clip_eight).
+- Lifecycle (death/respawn/game-over/menu/restart): 0 failures; CIA jiffy
+  suspend/restore intact.
+
+**Open stress interaction (NOT resolved, needs human judgement):**
+Under `--stress` (accelerated spawner; baseline already saturates deferred=255)
+check_fixed_hud_capture reports ~20-85 `physical pixels` failures / 500-1200
+frames, 100% on frames with a straddler live, **all at raster 71..73**, <=19
+mismatched pixels, 1-frame transient, clustered in the opening spawn wave.
+NO matrix / incoming / crossing / late-display / cadence / service failures;
+2/6757 `rasterBatchMasksApplied` deadline flags at frames 488-489.
+The pixels are **terrain**, not sprite (a lag-tolerant sprite mask changed
+nothing). Cause: straddler sprite DMA in raster ~50..71 perturbs the fixed-HUD
+raster hook's cycle-timed $D011 writes - Phase C explicitly assumed "no sprite
+DMA before 71:55". The protected hook cannot be modified, and the task
+requires straddlers at true VIC Y (which necessarily puts DMA there). Options:
+(a) accept the transient top-edge flicker under synthetic overload; (b) keep
+straddler rendering out of the hook's DMA window (reduces but does not remove
+the entry pop). Left for human VICE acceptance.
+
+**Files:** src/main.asm, src/raster_scheduler.asm, tools/check_viewport_capture.py,
+tools/vice_raster_cases.py (+clip_eight/clip_boundary), tools/vice_clip_sweep.py (new).

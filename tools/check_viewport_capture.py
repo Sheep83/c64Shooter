@@ -16,7 +16,9 @@ for record in records[1:]:
     state = (a.capture/f'{frame:05d}.state').read_bytes()
     def get(name, index=0): return state[sym[name]+index-0x2000]
     live = get('LIVE_PLAN')
-    expected_ids = {i for i in range(16) if get('OBJECT_ACTIVE', i) and 71 <= get('OBJECT_Y', i) < 246}
+    # Straddlers (51..70) are rendered top-clipped; only bodies wholly above
+    # raster 72 (Y < 51) own no VIC slot.
+    expected_ids = {i for i in range(16) if get('OBJECT_ACTIVE', i) and 51 <= get('OBJECT_Y', i) < 246}
     count = get('RENDER_COUNT', live)
     assignments = sum(get('BATCH_ASSIGN_COUNT', live+i) for i in range(get('BATCH_COUNT', live)))
     actual_ids = {get(prefix+'_OBJECT', live+i) for prefix, n in [('INITIAL', count), ('ASSIGN', assignments)] for i in range(n)}
@@ -34,10 +36,21 @@ for record in records[1:]:
     for obj in expected_ids:
         x = get('OBJECT_X', obj)+256*get('OBJECT_X_MSB', obj)+8
         y = get('OBJECT_Y', obj)
-        expected.update((px, raster-16) for raster in range(y+1, min(y+22,247)) for px in range(x,x+24) if 32 <= px < 352)
+        # Body rows raster y+1..y+21, but the top 71-y rows of a straddler are
+        # blanked so nothing is drawn before raster 72 (raster 71 stays
+        # terrain-only). d = max(0, 71-y).
+        first = max(y+1, 72)
+        expected.update((px, raster-16) for raster in range(first, min(y+22,247)) for px in range(x,x+24) if 32 <= px < 352)
     actual = {(x, raster-16) for raster in range(55,247) for x in range(32,352) if im.getpixel((x,raster-16)) == (255,255,255)}
     if actual != expected:
         failures.append([frame, 'white pixels', len(expected-actual), len(actual-expected), sorted(expected-actual)[:8], sorted(actual-expected)[:8]])
+    # No sprite white in the terrain-guard band 55..71: expected holds only HUD
+    # glyph pixels there, so any straddler pixel above raster 72 lands in
+    # actual-expected above and is reported by the check just above. Record the
+    # band population for the report.
+    leak = sorted(px for px in (actual - expected) if px[1] < 72-16)
+    if leak:
+        failures.append([frame, 'sprite pixels above raster 72', leak[:12]])
     checks += 320*192
     phases.add(record['physical_fine'])
 result = dict(frames=len(records)-1, phases=sorted(phases), physical_pixel_checks=checks, failure_count=len(failures), failures=failures[:12])
