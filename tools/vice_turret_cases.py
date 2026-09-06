@@ -127,7 +127,7 @@ def main():
         expect('single kill reward',int.from_bytes(read('SCORE_LO',2),'little'),100)
         expect('one destruction',read('TURRET_DESTROYED')[0],1)
         call('publishTurretGlyphs')
-        expect('death restores exact terrain glyph bytes',read(0x3e40,32),read('turretGroundGlyphs',32))
+        expect('death restores exact terrain glyph bytes',read(sym['TURRET_GLYPH_BASE_CODE']*8+0x3800,32),read('turretGroundGlyphs',32))
         # Body never allocates: only the player is active after all hits.
         expect('no body logical allocations',list(read('OBJECT_ACTIVE',16)),[1]+[0]*15)
         put('TURRET_HEALTH',3)
@@ -173,7 +173,7 @@ def main():
         put('TURRET_DESIRED_STYLE',[7,7,7])
         for _ in range(3):call('publishTurretGlyphs')
         expect('queued publication drained',read('TURRET_SHOWN_STYLE',3),bytes([7,7,7]))
-        expect('all destroyed underlay exact',read(0x3e40,96),read('turretGroundGlyphs',96))
+        expect('all destroyed underlay exact',read(sym['TURRET_GLYPH_BASE_CODE']*8+0x3800,96),read('turretGroundGlyphs',96))
         call('initBackgroundTurrets')
         expect('new game health reset',read('TURRET_HEALTH',3),bytes([3,3,3]))
         result=dict(checks=checks,check_count=len(checks),cpu_cycles={k:dict(min=min(v),max=max(v)) for k,v in costs.items()},failures=[])

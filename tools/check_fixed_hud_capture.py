@@ -40,12 +40,15 @@ def main():
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
     turrets = 'TURRET_STATE_BEGIN' in sym
+    # Turret private glyph code base (relocated out of the 160..223 terrain
+    # namespace); exported as a label so this oracle carries no literal.
+    tbase = sym.get('TURRET_GLYPH_BASE_CODE', 200)
     placements, ground, art = [], [], b''
     if turrets:
         data = (root/'turret-placements.bin').read_bytes()
         count = len(data)//2
         placements = list(zip(data[:count],data[count:]))
-        if set((root/'metatiledefs.bin').read_bytes()) & set(range(200,200+count*4)):
+        if set((root/'metatiledefs.bin').read_bytes()) & set(range(tbase,tbase+count*4)):
             failures.append(['raw terrain uses turret private glyphs'])
         art = (root/'turret-art.bin').read_bytes()
         for col,world in placements:
@@ -56,7 +59,7 @@ def main():
         codes = list(rows(world))
         for t,(col,top) in enumerate(placements):
             dy = (world-top)%stage[2]
-            if dy < 2:codes[col:col+2] = [200+t*4+dy*2,201+t*4+dy*2]
+            if dy < 2:codes[col:col+2] = [tbase+t*4+dy*2,tbase+1+t*4+dy*2]
         return codes
     def private_pixels(styles):
         return b''.join(ground[t] if style==7 else art[style*32:(style+1)*32] for t,style in enumerate(styles))
@@ -64,7 +67,7 @@ def main():
     def expected_pixels(row, phase, hud, styles):
         current_glyphs = list(glyphs)
         private = private_pixels(styles)
-        for c in range(len(private)//8):current_glyphs[200+c] = private[c*8:c*8+8]
+        for c in range(len(private)//8):current_glyphs[tbase+c] = private[c*8:c*8+8]
         out = bytearray()
         for raster in range(55,247):
             if raster < 63:
@@ -112,7 +115,7 @@ def main():
             styles = tuple(min(style,7) for style in styles)
         if turrets:
             actual_charset = (root/f'{frame:05d}.charset').read_bytes()
-            expected_charset = charset[:1600]+private_pixels(styles)+charset[1600+32*len(placements):]
+            expected_charset = charset[:tbase*8]+private_pixels(styles)+charset[tbase*8+32*len(placements):]
             if actual_charset != expected_charset:
                 failures.append([frame,'private glyph publication/charset integrity'])
         score = get('SCORE_LO') + 256*get('SCORE_HI')

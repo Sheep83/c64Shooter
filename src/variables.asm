@@ -42,4 +42,11 @@
 // $f9/$fa are likewise free while this program owns the machine; used as the
 // indirect pointer to whichever movement-fragment table is currently active.
 .var FRAG_PTR                 = $f9
+// $f7/$f8 are free RS-232 workspace while this program owns the machine; used
+// as the colour-RAM destination pointer that moves in lockstep with TEXT_DST
+// when a decoded terrain row is written (character + per-cell colour).
+.var COLOUR_DST              = $f7
 .const BACKGROUND_COLOUR      = $D021
+.var VIC_CONTROL_2           = $d016     // MCM / CSEL / XSCROLL. Terrain uses global MC text mode.
+.var EXTRA_COLOUR_1          = $d022     // Shared multicolour bit-pair "01".
+.var EXTRA_COLOUR_2          = $d023     // Shared multicolour bit-pair "10".

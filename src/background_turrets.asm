@@ -4,7 +4,13 @@
 // pixels publish before terrain fetches at frame start. See the turret worklog.
 * = $8800
 .const TURRET_COUNT = 3
-.const TURRET_GLYPH_BASE = 200
+// Private, runtime-modified glyphs. Relocated out of the editor-owned terrain
+// namespace (160..223): they now sit between the diagnostic glyphs (224/225)
+// and the starfield (240..251). Codes 226..237, bitmaps $3F10..$3F6F.
+.const TURRET_GLYPH_BASE = 226
+// Exported so the capture oracles locate the private glyph code/charset region
+// without a hard-coded literal (KickAssembler exports labels, not .const).
+.label TURRET_GLYPH_BASE_CODE = TURRET_GLYPH_BASE
 .const TURRET_START_HEALTH = 3
 .const TURRET_FIRE_INTERVAL = 100
 .const TURRET_HIT_STYLE = 6
@@ -17,8 +23,14 @@
 .if (turretCols.size() != TURRET_COUNT || turretRows.size() != TURRET_COUNT) {
     .error "Turret placement count does not match TURRET_COUNT"
 }
-.if (TURRET_GLYPH_BASE < TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_COUNT || TURRET_GLYPH_BASE + TURRET_COUNT*4 > 224) {
-    .error "Turret private glyphs overlap terrain or diagnostic characters"
+.if (TURRET_GLYPH_BASE < TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_NAMESPACE + 2) {
+    .error "Turret private glyphs overlap the terrain namespace (160..223) or the diagnostic glyphs (224/225)"
+}
+.if (TURRET_GLYPH_BASE + TURRET_COUNT*4 > STAR_CHAR_BASE) {
+    .error "Turret private glyphs overlap the starfield glyphs (240..251)"
+}
+.if (STAR_CHARSET + (TURRET_GLYPH_BASE + TURRET_COUNT*4)*8 > STAR_CHARSET + STAR_CHAR_BASE*8) {
+    .error "Turret glyph bitmaps run into the starfield charset region"
 }
 .for (var t = 0; t < TURRET_COUNT; t++) {
     .if (turretCols.get(t) < 0 || turretCols.get(t) > 38 || turretRows.get(t) < 0 || turretRows.get(t) >= STAGE_LOGICAL_ROWS) {
@@ -136,7 +148,13 @@ initBackgroundTurrets:
     jmp publishTurretGlyphs                 // All three are ready before the first gameplay frame.
 
 // Tail of renderStageRowToScreen: TEXT_DST still addresses the installed row.
-// This O(1) hook never changes BG_INCOMING_ROW or the metatile decoder.
+// This O(1) hook never changes BG_INCOMING_ROW / BG_INCOMING_COLOUR or the
+// metatile decoder. It overwrites two CHARACTER cells only; the colour-RAM
+// values copyIncomingRowToScreen already wrote for those cells (the underlying
+// authored terrain colour) are left in place, so a turret body - alive or
+// destroyed - inherits its terrain cell's colour. The three prototype
+// placements sit on metatiles 0 / 5 / 12, whose metatileColours entries are
+// hires (0..7), so the private glyphs render as hires characters.
 installTurretRow:
     ldx BG_LOGICAL_ROW
     lda turretRowGlyph,x
