@@ -19,19 +19,24 @@ def main():
     charset = (root/'charset.bin').read_bytes()
     stage = load_metatile_stage(root/'metatiledefs.bin', root/'stagemetatilerows.bin')
     rows = make_row_codes(*stage)
-    # Private HUD glyphs 128..143: space, S, C, O, R, E, then digits 0..9.
-    stock = [32,19,3,15,18,5,48,49,50,51,52,53,54,55,56,57]
+    # Private HUD glyphs 128..145: space, S, C, O, R, E, digits 0..9, F, R.
+    stock = [32,19,3,15,18,5,48,49,50,51,52,53,54,55,56,57,6,18]
     HUD_DIGIT = 134
-    # Fixed row-0 layout; cells 8..12 are the live five-digit score (filled per frame).
+    FREE_LABEL = [144,145,133,133,128]      # "FREE " private glyphs at columns 28..32.
+    # Fixed row-0 layout: cols 8..12 = live score digits; cols 28..37 = the
+    # development FREE counter ("FREE " + five digits). The FREE numeric field is
+    # the rolling-minimum diagnostic and only refreshes ~once/second, so its five
+    # cells are trusted from screen RAM and validated structurally, not pinned to
+    # a value derived from one state snapshot.
     hud_prefix = [128,128,129,130,131,132,133,128]
-    def hud_row(score):
+    def hud_row(score, free_region):
         digits = [HUD_DIGIT + int(d) for d in f'{score % 100000:05d}']
-        return bytes(hud_prefix + digits + [128]*27)
+        return bytes(hud_prefix + digits + [128]*15 + list(free_region) + [128]*2)
     failures = []
     for i, source in enumerate(stock):
         if charset[(128+i)*8:(129+i)*8] != charset[source*8:(source+1)*8]:
             failures.append(['stock glyph copy', i, source])
-    if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,144)):
+    if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,146)):
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
     @lru_cache(maxsize=1280)
@@ -72,7 +77,15 @@ def main():
         phase = record['physical_fine']
         row, finish, live = get('SCROLL_ROW'), get('BG_COARSE_FINISH'), get('LIVE_PLAN')
         score = get('SCORE_LO') + 256*get('SCORE_HI')
-        hud = hud_row(score)
+        free_region = ram[28:38]                       # "FREE " + five digits, or ten blanks when disabled.
+        hud = hud_row(score, free_region)
+        if free_region[0] == 144:                      # FREE counter enabled: validate its structure.
+            if list(free_region[:5]) != FREE_LABEL:
+                failures.append([frame,'FREE label',list(free_region[:5])])
+            if not all(HUD_DIGIT <= b <= HUD_DIGIT+9 for b in free_region[5:]):
+                failures.append([frame,'FREE digits not private glyphs',list(free_region[5:])])
+        elif set(free_region) != {128}:
+            failures.append([frame,'FREE area not blank',list(free_region)])
         terrain = bytearray(hud)
         for r in range(1,24):terrain.extend(rows(row+r-1+(1 if finish and r>=13 else 0)))
         terrain.extend([32]*40)
@@ -109,6 +122,12 @@ def main():
                 draw.rectangle((x,y,x+23,y+20),fill=255)
         # Never excuse HUD/separator contamination as a sprite-covered pixel.
         draw.rectangle((0,0,319,15),fill=0)
+        # The five FREE digit cells (cols 33..37) are rewritten late in BUILD
+        # once per ~PAL second, so on that one frame the screenshot still shows
+        # the previous value. They are validated structurally (label + glyph
+        # range) above; exclude them from the exact HUD pixel comparison.
+        if free_region[0] == 144:
+            draw.rectangle((33*8, 0, 38*8-1, 7), fill=255)
         if frame:
             difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud)))
             difference=ImageChops.subtract(difference,mask)

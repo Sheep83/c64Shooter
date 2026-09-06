@@ -49,13 +49,22 @@
 // See docs/fixed-hud-codex-worklog.md for measured timing and acceptance status.
 // ============================================================================
 .const BG_SCREEN_A = $0400
-// Fixed HUD row0 private glyphs: codes 128..143 = space, S, C, O, R, E, 0..9.
-// Bitmaps are copied into the RAM charset by initFixedHud; the ten digit
-// glyphs live at HUD_DIGIT_GLYPH..+9. displayScore writes these codes (never
-// screen codes 48-57) into the five score cells at HUD_SCORE_CELL..+4.
+// Fixed HUD row0 private glyphs: codes 128..145 = space, S, C, O, R, E, 0..9,
+// then F and R (for the development FREE-cycle counter). Bitmaps are copied
+// into the RAM charset by initFixedHud; the ten digit glyphs live at
+// HUD_DIGIT_GLYPH..+9. displayScore / displayCycleMinimum write these codes
+// (never screen codes 48-57) into their assigned fixed HUD cells only.
 .const HUD_GLYPH_BASE = 128
-.const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6
-.const HUD_SCORE_CELL = BG_SCREEN_A + 8
+.const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6      // 134..143: private decimal digits 0..9.
+.const HUD_SCORE_CELL = BG_SCREEN_A + 8          // Row 0 cols 8..12: five live score digits.
+.const HUD_FREE_GLYPH_F = HUD_GLYPH_BASE + 16    // 144: private 'F'.
+.const HUD_FREE_GLYPH_R = HUD_GLYPH_BASE + 17    // 145: private 'R'.
+.const HUD_FREE_LABEL_CELL = BG_SCREEN_A + 28    // Row 0 cols 28..37: "FREE " + five digits.
+.const HUD_FREE_CELL = BG_SCREEN_A + 33          // Row 0 cols 33..37: five FREE-cycle digits.
+// 1 = show the approximate development free-cycle headroom (rolling 50-frame
+// minimum) at the right of the fixed HUD. 0 = leave that area blank and skip
+// the once-per-second decimal display work; the measurement itself still runs.
+.const DEBUG_SHOW_FREE_CYCLES = 1
 .const TERRAIN_COLOUR = 9                           // One fixed colour for the whole playfield - no per-cell
                                                      // colour RAM work at all, scrolling or otherwise.
 .const SCROLL_FRAME_DIVIDER = 3                     // Fine scroll advances 1px every N real frames.
@@ -3010,18 +3019,9 @@ scoreLabel:
     .byte 19,3,15,18,5,32,48,48,48,48,48  // Screen codes for "SCORE 00000".
 
 // --- Routine: setupDebugDisplay --------------------------------------------
-// Draw "FREE 00000", colour it white, and initialise the rolling cycle minimum.
+// Initialise the rolling cycle minimum. The FREE label/digits now live in the
+// fixed HUD row painted by initFixedHud, not in raw screen RAM.
 setupDebugDisplay:
-    ldx #0                                  // Start at the first character in the debug label.
-!labelLoop:
-    lda debugLabel,x                        // Load the next prebuilt screen code.
-    sta DEBUG_SCREEN,x                      // Write it into the top-left of screen RAM.
-    lda #1                                  // Use C64 colour 1: white.
-    sta DEBUG_COLOUR,x                      // Set this character's colour RAM entry.
-    inx                                     // Advance to the next debug character.
-    cpx #10                                 // Label plus five digits occupies ten characters.
-    bne !labelLoop-                         // Keep copying until all ten characters are written.
-
     lda #0                                  // Start the one-second frame counter at zero.
     sta DEBUG_FRAME_COUNT                   // Store the current debug frame count.
     lda #$ff                                // $ffff is higher than any possible PAL-frame free-cycle value.
@@ -3030,15 +3030,18 @@ setupDebugDisplay:
     rts                                     // Return to init.
 
 // --- Routine: updateCycleDebug ---------------------------------------------
-// Track the lowest approximate free-cycle count and display it every 50 frames.
+// Track the lowest approximate free-cycle count and, once per ~PAL second,
+// publish the rolling minimum into the fixed HUD FREE cells. The measurement
+// (raster sample, x63, rolling-min compare) is unchanged and always runs.
 updateCycleDebug:
     inc DEBUG_FRAME_COUNT                   // Count one completed BUILD_PLAN preparation.
     lda DEBUG_FRAME_COUNT                   // Load the updated frame count.
     cmp #DEBUG_FRAMES                       // Has roughly one PAL second elapsed?
     bne !sample+                            // If not, skip the relatively expensive decimal display update.
 
-    // No displayCycleMinimum during PLAYING: retain the RAM measurement,
-    // but the diagnostic background owns the entire screen (no fixed HUD).
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
+    jsr displayCycleMinimum                 // Publish the last interval's minimum before it is reset.
+}
     lda #0                                  // Begin a fresh 50-frame interval.
     sta DEBUG_FRAME_COUNT                   // Reset the frame counter.
     lda #$ff                                // Reset the rolling minimum to the largest possible 16-bit value.
@@ -3108,8 +3111,11 @@ updateCycleDebug:
     rts                                     // Return to the main loop.
 
 // --- Routine: displayCycleMinimum ------------------------------------------
-// Convert the 16-bit rolling minimum to five decimal digits at DEBUG_SCREEN+5.
+// Convert the 16-bit rolling minimum to five private HUD digit glyphs in the
+// fixed HUD FREE cells. Called once per ~PAL second only when the development
+// counter is enabled; the body compiles out to a bare RTS for a release build.
 displayCycleMinimum:
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
     lda DEBUG_MIN_LO                        // Copy the rolling minimum so conversion can destructively subtract.
     sta DEBUG_VALUE_LO                      // Working decimal value, low byte.
     lda DEBUG_MIN_HI                        // Copy minimum high byte.
@@ -3140,16 +3146,14 @@ displayCycleMinimum:
 
 !emitDigit:
     tya                                     // Copy the decimal digit count into A.
-    clc                                     // Clear carry before converting the digit to a screen code.
-    adc #48                                 // Screen codes 48-57 display digits 0-9.
-    sta DEBUG_SCREEN + 5,x                  // Write this digit after the "FREE " label.
+    clc                                     // Clear carry before converting to a private HUD glyph.
+    adc #HUD_DIGIT_GLYPH                    // Private HUD digit glyph 0..9 - never screen codes 48-57.
+    sta HUD_FREE_CELL,x                     // Write this digit after the fixed HUD "FREE " label.
     inx                                     // Advance to the next decimal place.
     cpx #5                                  // Five digits cover every possible PAL-frame cycle count.
     bne !digitLoop-                         // Convert the remaining decimal places.
+}
     rts                                     // Return to updateCycleDebug.
-
-debugLabel:
-    .byte 6,18,5,5,32,48,48,48,48,48       // Screen codes for "FREE 00000".
 
 debugDivisorLo:
     .byte $10,$e8,$64,$0a,$01              // Low bytes: 10000, 1000, 100, 10, 1.
@@ -5115,8 +5119,8 @@ STAGE_TEST_END:
 }
 
 // Fixed matrix row0, private stock glyphs (see HUD_GLYPH_BASE near the top):
-// space, S, C, O, R, E, then the ten decimal digits 0..9.
-.var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57)
+// space, S, C, O, R, E, the ten decimal digits 0..9, then F and R.
+.var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57, 6,18)
 initFixedHud:
     ldx #7
 !glyph:
@@ -5143,14 +5147,27 @@ initFixedHud:
     dex
     bpl !text-
     jsr displayScore                        // Fill the five digit cells from SCORE_LO/HI (0 at game start).
+.if (DEBUG_SHOW_FREE_CYCLES == 1) {
+    ldx #9                                  // "FREE " + five private 0 digits at columns 28..37.
+!free:
+    lda fixedHudFreeLabel,x
+    sta HUD_FREE_LABEL_CELL,x
+    dex
+    bpl !free-
+}
     rts
 fixedHudText:
     .byte 129,130,131,132,133,128,134,134,134,134,134 // "SCORE " + private 00000; digits overwritten by displayScore.
+fixedHudFreeLabel:
+    .byte HUD_FREE_GLYPH_F, HUD_FREE_GLYPH_R, 133, 133, 128, 134,134,134,134,134 // "FREE 00000" (private glyphs).
 .if (HUD_GLYPH_BASE + hudStockCodes.size() > 224) {
     .error "Fixed HUD glyphs overlap terrain charset allocation"
 }
 .if (HUD_DIGIT_GLYPH + 9 >= HUD_GLYPH_BASE + hudStockCodes.size()) {
     .error "Fixed HUD digit glyphs 0..9 do not all fit the private allocation"
+}
+.if (HUD_FREE_GLYPH_R >= HUD_GLYPH_BASE + hudStockCodes.size()) {
+    .error "Fixed HUD FREE letter glyphs do not fit the private allocation"
 }
 .if (STAR_CHARSET + HUD_GLYPH_BASE*8 < CLIP_SPRITE_POOL_END) {
     .error "Fixed HUD glyph bitmaps overlap the clipped sprite pool"
