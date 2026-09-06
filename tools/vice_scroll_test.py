@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--trace', action='store_true')
     parser.add_argument('--stress', action='store_true', help='Accelerate the existing spawner through monitor data writes')
     parser.add_argument('--dense', action='store_true', help='Seed16 stationary legal objects producing8 closely spaced batches; keep real scrolling/main loop')
+    parser.add_argument('--turret-playtest', action='store_true', help='Aim real player cannons at turret0 near a coarse transition and turret2 near bottom exit; capture subsequent wraps')
     parser.add_argument('--symbols', type=Path, default=Path('build/main.vs'))
     parser.add_argument('--out', type=Path, default=Path('build/scroll-test'))
     parser.add_argument('--prg', type=Path, default=Path('build/shooter.prg'))
@@ -111,6 +112,9 @@ def main():
                     mon.cmd(f'trace exec {sym[name]:04x}')
             mon.cmd('trace store d012 d012')
             mon.cmd('trace store d011 d011')
+        for name in ('publishTurretGlyphs', 'backgroundTurretGlyphsPublished', 'installTurretRow'):
+            if name in sym:
+                mon.cmd(f'trace exec {sym[name]:04x}')
     physical_break = None
     if args.physical:
         # Replace the presentation breakpoint; tracepoints remain installed.
@@ -122,6 +126,8 @@ def main():
         mon.cmd('x')
     mon.cmd(f'> {sym["PLAYER_LIVES"]:04x} ff')  # Long-run test stock; combat/death/respawn stay active.
     records = []
+    turret_events = []
+    attacking = None
     for frame in range(args.frames):
         if args.stress:
             for name in ('SPAWN_TIMER', 'WAVE_GAP_TIMER'):
@@ -131,6 +137,9 @@ def main():
         mon.cmd(f'bsave "{out / f"{frame:05d}.state"}" 0 2000 23ff')
         mon.cmd(f'screenshot "{out / f"{frame:05d}.png"}" 2')
         mon.cmd(f'bsave "{out / f"{frame:05d}.bg"}" 0 2920 2fff')
+        if 'TURRET_STATE_BEGIN' in sym:
+            mon.cmd(f'bsave "{out / f"{frame:05d}.turret"}" 0 {sym["TURRET_STATE_BEGIN"]:04x} {sym["TURRET_STATE_END"]-1:04x}')
+            mon.cmd(f'bsave "{out / f"{frame:05d}.charset"}" 0 3800 3fff')
         if 'RASTER_STATE_BEGIN' in sym:
             mon.cmd(f'bsave "{out / f"{frame:05d}.raster"}" 0 {sym["RASTER_STATE_BEGIN"]:04x} {sym["RASTER_STATE_END"]-1:04x}')
         record = {'frame': frame, 'registers': regs}
@@ -145,7 +154,32 @@ def main():
         if frame % 100 == 0:
             print(f'Captured {frame}/{args.frames}', flush=True)
         direction = 4 if (frame // 70) % 2 else 8
-        mon.cmd('jpdb 1 ff' if args.dense else f'jpdb 1 {255 ^ (16 | direction):02x}')
+        if args.turret_playtest:
+            turret = (out / f'{frame:05d}.turret').read_bytes()
+            def turret_get(name, index):
+                return turret[sym[name]-sym['TURRET_STATE_BEGIN']+index]
+            if attacking is not None and not turret_get('TURRET_HEALTH', attacking):
+                turret_events.append(dict(frame=frame, destroyed=attacking, y=turret_get('TURRET_Y',attacking)))
+                attacking = None
+            if attacking is None:
+                for t, minimum_y in ((0,112),(2,224)):
+                    if (turret_get('TURRET_HEALTH',t) and turret_get('TURRET_VISIBLE',t)
+                            and turret_get('TURRET_Y',t) >= minimum_y
+                            and (t == 2 or record['physical_fine'] == 7)):
+                        attacking = t
+                        turret_events.append(dict(frame=frame, attack=t, y=turret_get('TURRET_Y',t)))
+                        break
+            if attacking is not None:
+                x = turret_get('TURRET_X_LO',attacking)+256*turret_get('TURRET_X_HI',attacking)-4
+                mon.cmd(f'> {sym["OBJECT_X"]:04x} {x&255:02x}')
+                mon.cmd(f'> {sym["OBJECT_X_MSB"]:04x} {x>>8:02x}')
+                mon.cmd(f'> {sym["OBJECT_Y"]:04x} f0')
+                mon.cmd('jpdb 1 ef')
+            else:
+                mon.cmd(f'jpdb 1 {255 ^ direction:02x}')
+            (out/'turret-events.json').write_text(json.dumps(turret_events,indent=2))
+        else:
+            mon.cmd('jpdb 1 ff' if args.dense else f'jpdb 1 {255 ^ (16 | direction):02x}')
         if args.physical:
             mon.cmd(f'condition {physical_break} if RL == $000')
             mon.cmd('x')
@@ -154,6 +188,11 @@ def main():
     (out / 'frames.json').write_text(json.dumps(records, indent=2))
     (out / 'symbols.json').write_text(json.dumps(sym, indent=2))
     mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
+    if 'TURRET_STATE_BEGIN' in sym:
+        for name, low, high in [('turret-placements.bin',sym['turretWorldCol'],sym['turretWorldXLo']-1),
+                                ('turret-art.bin',sym['turretArt'],sym['turretArtEnd']-1),
+                                ('turret-ground.bin',sym['turretGroundGlyphs'],sym['turretGroundGlyphs']+95)]:
+            mon.cmd(f'bsave "{out / name}" 0 {low:04x} {high:04x}')
     # Raw ground truth for the checker: the literal metatile definitions and
     # stage metatile-row IDs actually assembled into the program, dumped from
     # the running emulator rather than retyped in Python. Table sizes are

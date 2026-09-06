@@ -39,8 +39,32 @@ def main():
     if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,146)):
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
+    turrets = 'TURRET_STATE_BEGIN' in sym
+    placements, ground, art = [], [], b''
+    if turrets:
+        data = (root/'turret-placements.bin').read_bytes()
+        count = len(data)//2
+        placements = list(zip(data[:count],data[count:]))
+        if set((root/'metatiledefs.bin').read_bytes()) & set(range(200,200+count*4)):
+            failures.append(['raw terrain uses turret private glyphs'])
+        art = (root/'turret-art.bin').read_bytes()
+        for col,world in placements:
+            ground.append(b''.join(glyphs[rows(world+dy)[col+dx]] for dy in range(2) for dx in range(2)))
+        if (root/'turret-ground.bin').read_bytes() != b''.join(ground):
+            failures.append(['turret underlay cache differs from stage/charset'])
+    def visual_rows(world):
+        codes = list(rows(world))
+        for t,(col,top) in enumerate(placements):
+            dy = (world-top)%stage[2]
+            if dy < 2:codes[col:col+2] = [200+t*4+dy*2,201+t*4+dy*2]
+        return codes
+    def private_pixels(styles):
+        return b''.join(ground[t] if style==7 else art[style*32:(style+1)*32] for t,style in enumerate(styles))
     @lru_cache(maxsize=1280)
-    def expected_pixels(row, phase, hud):
+    def expected_pixels(row, phase, hud, styles):
+        current_glyphs = list(glyphs)
+        private = private_pixels(styles)
+        for c in range(len(private)//8):current_glyphs[200+c] = private[c*8:c*8+8]
         out = bytearray()
         for raster in range(55,247):
             if raster < 63:
@@ -50,9 +74,9 @@ def main():
                 continue
             else:
                 terrain_row, gy = divmod(raster-(64+phase),8)
-                codes, colour = rows(row+terrain_row), bytes((119,83,0))
+                codes, colour = visual_rows(row+terrain_row), bytes((119,83,0))
             for code in codes:
-                bits = glyphs[code][gy]
+                bits = current_glyphs[code][gy]
                 for bit in range(7,-1,-1):
                     out.extend(colour if bits & (1<<bit) else bytes(3))
         return Image.frombytes('RGB',(320,192),bytes(out))
@@ -63,19 +87,34 @@ def main():
     clocks, phases, positions = [], [], []
     checks = hud_checks = edge_checks = wraps = max_active = max_batches = max_deferred = 0
     previous = previous_mask = None
+    previous_styles, previous_origin = (), None
+    previous_score = None
+    delayed_scores = []
     for record in records:
         frame = record['frame']
         state = (root/f'{frame:05d}.state').read_bytes()
         bg = (root/f'{frame:05d}.bg').read_bytes()
         raster_state = (root/f'{frame:05d}.raster').read_bytes()
+        turret_state = (root/f'{frame:05d}.turret').read_bytes() if turrets else b''
         ram = (root/f'{frame:05d}.ram').read_bytes()
         def get(name,index=0):
             addr = sym[name]+index
             if 0x2000 <= addr < 0x2400:return state[addr-0x2000]
             if 0x2920 <= addr < 0x3000:return bg[addr-0x2920]
+            if turrets and sym['TURRET_STATE_BEGIN'] <= addr < sym['TURRET_STATE_END']:
+                return turret_state[addr-sym['TURRET_STATE_BEGIN']]
             return raster_state[addr-sym['RASTER_STATE_BEGIN']]
         phase = record['physical_fine']
         row, finish, live = get('SCROLL_ROW'), get('BG_COARSE_FINISH'), get('LIVE_PLAN')
+        styles = tuple(get('TURRET_SHOWN_STYLE',t) for t in range(len(placements)))
+        if any(style>7 for style in styles):
+            failures.append([frame,'uninitialized turret glyph style',styles])
+            styles = tuple(min(style,7) for style in styles)
+        if turrets:
+            actual_charset = (root/f'{frame:05d}.charset').read_bytes()
+            expected_charset = charset[:1600]+private_pixels(styles)+charset[1600+32*len(placements):]
+            if actual_charset != expected_charset:
+                failures.append([frame,'private glyph publication/charset integrity'])
         score = get('SCORE_LO') + 256*get('SCORE_HI')
         free_region = ram[28:38]                       # "FREE " + five digits, or ten blanks when disabled.
         hud = hud_row(score, free_region)
@@ -87,14 +126,14 @@ def main():
         elif set(free_region) != {128}:
             failures.append([frame,'FREE area not blank',list(free_region)])
         terrain = bytearray(hud)
-        for r in range(1,24):terrain.extend(rows(row+r-1+(1 if finish and r>=13 else 0)))
+        for r in range(1,24):terrain.extend(visual_rows(row+r-1+(1 if finish and r>=13 else 0)))
         terrain.extend([32]*40)
         if ram[:1000] != terrain:
             failures.append([frame,'matrix',[i for i in range(1000) if ram[i] != terrain[i]][:12]])
         if finish:
             if bytes(get('BG_INCOMING_ROW',i) for i in range(40)) != bytes(rows(row)):
                 failures.append([frame,'incoming buffer'])
-            if bytes(get('BG_CROSSING_ROW',i) for i in range(40)) != bytes(rows(row+12)):
+            if bytes(get('BG_CROSSING_ROW',i) for i in range(40)) != bytes(visual_rows(row+12)):
                 failures.append([frame,'crossing buffer'])
         if get('RASTER_DISPLAY_LATE'):
             failures.append([frame,'late display event',get('RASTER_DISPLAY_LATE')])
@@ -129,9 +168,19 @@ def main():
         if free_region[0] == 144:
             draw.rectangle((33*8, 0, 38*8-1, 7), fill=255)
         if frame:
-            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud)))
+            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud,styles)))
             difference=ImageChops.subtract(difference,mask)
             bad=difference.getbbox()
+            if bad and previous_score is not None and score != previous_score:
+                # A real kill can update score RAM AFTER row0's badline55 fetch.
+                # Allow exactly the complete prior score for that one frame;
+                # still compare every HUD pixel (no score-area exclusion).
+                old_hud=hud_row(previous_score,free_region)
+                old_diff=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,old_hud,styles)))
+                old_diff=ImageChops.subtract(old_diff,mask)
+                if not old_diff.getbbox():
+                    delayed_scores.append(frame)
+                    bad=None
             if bad:failures.append([frame,'physical pixels',bad,difference.histogram()[255]])
             checks+=320*192-mask.histogram()[255]
             hud_checks+=320*16
@@ -139,15 +188,29 @@ def main():
             # Newly entering row71 is checked above against stage pixels. For
             # rows72..78 and240..246, one fine step must move prior pixels down1.
             if previous is not None and phase==(phases[-1]+1)%8:
+                current_edge_mask,old_edge_mask = mask.copy(),previous_mask.copy()
+                for t,(col,world) in enumerate(placements):
+                    if styles[t] == previous_styles[t]:continue
+                    # A deliberate aim/hit/death change is still checked by the
+                    # absolute pixel oracle; only its motion comparison differs.
+                    for target,origin,fine in [(current_edge_mask,(row+finish)%stage[2],phase),
+                                               (old_edge_mask,previous_origin,phases[-1])]:
+                        offset=(world-origin)%stage[2]
+                        if offset==stage[2]-1:offset=-1
+                        if -1<=offset<23:
+                            top=64+fine+8*offset-55
+                            ImageDraw.Draw(target).rectangle((col*8,max(16,top),col*8+15,top+15),fill=255)
                 for lo,hi in [(72,79),(240,247)]:
                     box=(0,lo-55,320,hi-55)
                     prevbox=(0,lo-56,320,hi-56)
                     diff=nonzero(ImageChops.difference(im.crop(box),previous.crop(prevbox)))
-                    excluded=ImageChops.lighter(mask.crop(box),previous_mask.crop(prevbox))
+                    excluded=ImageChops.lighter(current_edge_mask.crop(box),old_edge_mask.crop(prevbox))
                     diff=ImageChops.subtract(diff,excluded)
                     edge_checks+=320*(hi-lo)-excluded.histogram()[255]
                     if diff.getbbox():failures.append([frame,'edge motion',lo,diff.getbbox()])
         previous,previous_mask=im,mask
+        previous_styles,previous_origin=styles,(row+finish)%stage[2]
+        previous_score=score
         phases.append(phase)
     deltas=sorted(set(b-a for a,b in zip(clocks,clocks[1:])))
     if deltas != [19656]:failures.append(['PAL cadence',deltas])
@@ -155,8 +218,10 @@ def main():
                 stage_circuits=wraps/stage[2],max_active=max_active,max_batches=max_batches,
                 deferred=max_deferred,frame_cycle_deltas=deltas,pixel_checks=checks,
                 unmasked_hud_separator_checks=hud_checks,physical_edge_motion_checks=edge_checks,
+                score_visible_next_frame=delayed_scores,
                 failure_count=len(failures),failures=failures[:24])
     (root/'fixed-hud-verification.json').write_text(json.dumps(result,indent=2))
+    (root/'fixed-hud-failures.json').write_text(json.dumps(failures,indent=2))
     print(json.dumps(result,indent=2))
     raise SystemExit(bool(failures))
 

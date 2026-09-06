@@ -400,16 +400,19 @@ mainLoop:
 // lost every life (PLAYER_STATE_GAME_OVER).
 gameLoop:
     jsr waitForGameFrame                    // Coordinate this presentation with the physical-frame IRQ.
+    jsr publishTurretGlyphs                 // Bounded private-glyph publication before any terrain fetch.
     jsr applyFineScroll                     // Publish the terrain phase for the shared display event.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
     jsr armFirstBatch                       // Call armFirstBatch; return here when it executes RTS.
     jsr finishBackgroundCoarse              // Update lower rows ahead of the beam; sprite IRQ is already armed.
 
 !frameLoop:
+    jsr positionBackgroundTurrets           // Presented world coordinates for this frame's hitscan.
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
     jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
     jsr updateEnemyFire                     // Let at most one eligible enemy launch an aimed projectile.
+    jsr updateBackgroundTurrets             // World bodies share the existing projectile cap.
     jsr updatePlayerState                   // Advance explosion/respawn state and consume any player-hit event.
 
     lda PLAYER_STATE                        // Has the last life just been spent?
@@ -430,6 +433,7 @@ gameLoop:
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
 
     jsr waitForGameFrame                    // Coordinate this presentation with the physical-frame IRQ.
+    jsr publishTurretGlyphs                 // Bounded private-glyph publication before any terrain fetch.
     jsr applyFineScroll                     // Publish the terrain phase for the shared display event.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
     jsr renderSprites                       // Call renderSprites; return here when it executes RTS.
@@ -1575,7 +1579,7 @@ updatePlayerFire:
     sta HITSCAN_X_MSB
     jsr tracePlayerCannon                   // X = nearest intersected enemy when carry is clear.
     bcs !rightCannon+
-    jsr hitEnemyFromLeft                    // Left-side impact kicks the enemy slightly right/down.
+    jsr hitCannonTarget                     // Closest eligible enemy or world turret, one target per cannon.
 
 !rightCannon:
     lda OBJECT_X                            // Build the right-cannon 9-bit world X coordinate.
@@ -1587,7 +1591,7 @@ updatePlayerFire:
     sta HITSCAN_X_MSB
     jsr tracePlayerCannon
     bcs !done+
-    jsr hitEnemyFromRight                   // Right-side impact kicks the enemy slightly left/down.
+    jsr hitCannonTarget                     // Damage the selected enemy or world turret.
 
 !done:
     rts
@@ -1638,6 +1642,7 @@ tracePlayerCannon:
     cpx #MAX_OBJECTS
     bne !scan-
 
+    jsr traceTurretCannon                   // Extend nearest-target selection without allocating body objects.
     ldx HITSCAN_TARGET
     cpx #$ff
     beq !miss+
@@ -1983,21 +1988,34 @@ updateEnemyFire:
 // Horizontal speed is quantised to -2,-1,0,+1,+2 so every bullet moves smoothly
 // every frame instead of using a visibly irregular fractional stepping pattern.
 spawnEnemyBullet:
-    jsr findFreeObject                      // Bullets share the logical pool and renderer with every other sprite.
-    bcc !allocated+                         // Keep the short relative branch local.
-    jmp !failed+                            // Absolute jump handles the longer failure path safely.
-
-!allocated:
-    stx ENEMY_BULLET_OBJECT                 // X now belongs to the newly allocated projectile.
-    ldy ENEMY_FIRE_SOURCE                   // Y addresses the enemy that actually fired.
-
-    lda OBJECT_X,y                          // Launch from the shooter's sprite origin.
-    sta OBJECT_X,x
+    ldy ENEMY_FIRE_SOURCE
+    lda OBJECT_X,y
+    sta BULLET_SPAWN_X_LO
     lda OBJECT_X_MSB,y
-    sta OBJECT_X_MSB,x
+    sta BULLET_SPAWN_X_HI
     lda OBJECT_Y,y
     clc
-    adc #12                                 // Start just below the enemy body.
+    adc #12
+    sta BULLET_SPAWN_Y
+
+// Explicit origin for world turrets; all projectile ownership remains shared.
+spawnEnemyBulletAt:
+    lda ENEMY_BULLET_COUNT
+    cmp #MAX_ENEMY_BULLETS
+    bcc !capacity+
+    sec
+    rts
+!capacity:
+    jsr findFreeObject                      // Generic allocation always starts at logical slot1.
+    bcc !allocated+
+    jmp !failed+
+!allocated:
+    stx ENEMY_BULLET_OBJECT
+    lda BULLET_SPAWN_X_LO
+    sta OBJECT_X,x
+    lda BULLET_SPAWN_X_HI
+    sta OBJECT_X_MSB,x
+    lda BULLET_SPAWN_Y
     sta OBJECT_Y,x
 
     lda #TYPE_ENEMY_BULLET
@@ -4846,6 +4864,7 @@ initBackground:
     inx
     cpx #64
     bne !terrainGlyphLoop-
+    jsr initBackgroundTurrets               // Capture only the12 replaced glyph underlays; reset per-game health.
 
     ldx #0
 !colourFill:
@@ -4886,7 +4905,7 @@ renderStageRowToScreen:
     sta BG_LOGICAL_ROW
     jsr decodeStageCharacterRow             // Expand the metatile stage into BG_INCOMING_ROW.
     jsr copyIncomingRowToScreen              // Then copy that generic 40-byte buffer to screen.
-    rts
+    jmp installTurretRow                    // Safe world-character installation; raw incoming buffer is unchanged.
 
 // --- Routine: decodeStageCharacterRow -----------------------------------------
 // Entry: BG_LOGICAL_ROW (0..STAGE_LOGICAL_ROWS-1) = absolute logical
@@ -5270,3 +5289,6 @@ fixedHudFreeLabel:
 
 // The shared event dispatcher has its own guarded resident allocation.
 #import "raster_scheduler.asm"
+
+// Separate CPU allocation; no overlap with VIC-bank data or diagnostic callers.
+#import "background_turrets.asm"

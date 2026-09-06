@@ -40,7 +40,8 @@ def main():
     parser.add_argument('--prg', type=Path, default=Path('build/shooter.prg'))
     parser.add_argument('--symbols', type=Path, default=Path('build/main.vs'))
     parser.add_argument('--prepare-at', type=int, help='After capture, call real coarse prepare at this physical raster under the seeded LIVE schedule')
-    parser.add_argument('--copy-cpu', action='store_true', help='Measure prepare CPU cycles for all80 stage origins with DEN/sprites/IRQs off')
+    parser.add_argument('--copy-cpu', action='store_true', help='Measure prepare CPU cycles for all stage origins with DEN/sprites/IRQs off')
+    parser.add_argument('--publish-turret', action='store_true', help='Measure a worst-index dirty glyph publication before real LIVE initial sprite writes')
     parser.add_argument('--beam-race', action='store_true', help='Inject an overdue LIVE event across255->256 at32 instruction alignments')
     parser.add_argument('--out', type=Path, default=Path('build/raster-scheduler/cases'))
     args = parser.parse_args()
@@ -129,6 +130,37 @@ def main():
         (out/'frames.json').write_text(json.dumps(records, indent=2))
         (out/'symbols.json').write_text(json.dumps(sym, indent=2))
         mon.cmd(f'bsave "{out / "charset.bin"}" 0 3800 3fff')
+        if args.publish_turret:
+            mon.cmd(f'delete {bp}')
+            put('TURRET_DESIRED_STYLE',[4,4,0])
+            put('TURRET_SHOWN_STYLE',[4,4,4])
+            entry_label=sym['publishTurretGlyphs']
+            entry_bp=int(re.search(r'BREAK: (\d+)',mon.cmd(f'break {entry_label:04x}'))[1])
+            mon.cmd(f'r pc={sym["gameLoop"]:04x}, sp=ff')
+            mon.cmd('x')
+            entry=mon.cmd('r')
+            mon.cmd(f'delete {entry_bp}')
+            end_bp=int(re.search(r'BREAK: (\d+)',mon.cmd(f'break {sym["backgroundTurretGlyphsPublished"]:04x}'))[1])
+            mon.cmd('x')
+            end=mon.cmd('r')
+            mon.cmd(f'delete {end_bp}')
+            ready_bp=int(re.search(r'BREAK: (\d+)',mon.cmd(f'break {presentation:04x}'))[1])
+            mon.cmd('x')
+            ready=mon.cmd('r')
+            mon.cmd(f'delete {ready_bp}')
+            def beam(reg):
+                m=re.search(r'\.;.*? (\d+)\s+(\d+)\s+(\d+)\n',reg)
+                return tuple(map(int,m.groups()))
+            a,b,c=map(beam,(entry,end,ready))
+            # Earliest legal visible-ingress DMA starts Y51. Sprite writes and
+            # display arming must complete before then, even with eight slots.
+            assert b[0]<55 and c[0]<51,(name,a,b,c)
+            result=dict(entry=entry,exit=end,presented=ready,publication_cycles=b[2]-a[2])
+            (out/'turret-publication.json').write_text(json.dumps(result,indent=2))
+            print(name,'glyph cycles',b[2]-a[2],'presentation raster',c[0],flush=True)
+            # This probe intentionally leaves main at presentation. Do not
+            # combine it with probes depending on the old parked-loop bp.
+            assert not (args.copy_cpu or args.beam_race or args.prepare_at is not None)
         if args.beam_race:
             # A direct dispatcher call models a delayed event; IRQs stay masked
             # during each call. No event may escape by arming a past compare.
@@ -168,7 +200,8 @@ def main():
             addr = sym['prepareBackgroundCoarse']
             mon.cmd(f'> 7000 20 {addr & 255:02x} {addr >> 8:02x} 4c 03 70')
             results = []
-            for row in range(80):
+            logical_rows = (sym['STAGE_METATILE_ROWS_END']-sym['stageMetatileRows'])//10*4
+            for row in range(logical_rows):
                 mon.cmd('delete')
                 mon.cmd('break exec 0000 ffff if RL == $0b4')
                 mon.cmd('x')
