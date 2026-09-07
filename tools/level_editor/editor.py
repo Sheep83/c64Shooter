@@ -735,9 +735,12 @@ class LevelEditor(tk.Tk):
 def find_repo_root():
     here = Path(__file__).resolve()
     for parent in (here.parent, *here.parents):
-        if (parent / "src" / "main.asm").is_file() and (parent / "src" / "stage_test.asm").is_file():
+        if (parent / "src" / "main.asm").is_file() and \
+                (parent / "src" / "generated" / "stage_test.asm").is_file():
             return parent
-    raise FileNotFoundError("Could not find repo root containing src/main.asm and src/stage_test.asm")
+    raise FileNotFoundError(
+        "Could not find repo root containing src/main.asm and src/generated/stage_test.asm"
+    )
 
 
 def main():

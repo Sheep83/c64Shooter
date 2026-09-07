@@ -74,6 +74,8 @@ def check_capture(root):
             state = (root / f'{n:05d}.state').read_bytes()
             bg = (root / f'{n:05d}.bg').read_bytes()
             row = state[sym['SCROLL_ROW']-0x2000]
+            if 'SCROLL_ROW_HI' in sym:              # 16-bit LE above 255 logical rows
+                row += 256 * state[sym['SCROLL_ROW_HI']-0x2000]
             finish = bg[sym['BG_COARSE_FINISH']-0x2920]
             pix, masked = im.load(), mask.load()
             bad = []

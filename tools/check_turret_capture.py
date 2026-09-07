@@ -44,7 +44,9 @@ def main():
             if 0x2920<=addr<0x3000:return bg[addr-0x2920]
             return turret[addr-sym['TURRET_STATE_BEGIN']]
         phase=record['physical_fine']
-        origin=(get('SCROLL_ROW')+get('BG_COARSE_FINISH'))%stage_rows
+        # SCROLL_ROW is 16-bit LE for stages above 255 logical rows.
+        scroll_row=get('SCROLL_ROW')+(256*get('SCROLL_ROW_HI') if 'SCROLL_ROW_HI' in sym else 0)
+        origin=(scroll_row+get('BG_COARSE_FINISH'))%stage_rows
         if previous_phase==7 and phase==0:coarse+=1
         previous_phase=phase
         deferred=get('BG_COARSE_DEFERRED')

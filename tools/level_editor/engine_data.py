@@ -26,6 +26,14 @@ DEFAULT_PALETTE = {
 DEFAULT_SCROLL_FRAME_DIVIDER = 2
 
 
+# Generated build inputs owned by the level editor (see tools/level_editor/
+# ka_export.py). After the engine integration these are the single source of
+# truth for stage height / terrain palette / scroll speed and the stage map;
+# main.asm no longer defines them.
+GENERATED_CONFIG_REL = "src/generated/stage_config.asm"
+GENERATED_STAGE_REL = "src/generated/stage_test.asm"
+
+
 @dataclass
 class EngineData:
     glyphs: dict[int, list[int]]
@@ -35,6 +43,7 @@ class EngineData:
     source_stage_rows: int
     source_palette: dict[str, int]
     source_scroll_frame_divider: int
+    source_colour_ram: int
 
 
 def _strip_comment(line):
@@ -93,24 +102,78 @@ def _parse_const_int(text, name):
     raise ValueError(f"Unsupported numeric expression for {name}: {expression}")
 
 
+def _parse_generated_config(path):
+    """Parse the constants-only generated stage_config.asm.
+
+    Ownership after the engine integration: stage height, terrain palette and
+    scroll speed live here, NOT in main.asm. TERRAIN_COLOUR_RAM must derive from
+    TERRAIN_CHARACTER_COLOUR (the fourth palette value is a named constant, not a
+    hidden literal); this validates that.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    rows = _parse_const_int(text, "STAGE_METATILE_ROWS")
+    divider = _parse_const_int(text, "SCROLL_FRAME_DIVIDER")
+    background = _parse_const_int(text, "TERRAIN_BACKGROUND_COLOUR")
+    mc1 = _parse_const_int(text, "TERRAIN_MC_COLOUR_1")
+    mc2 = _parse_const_int(text, "TERRAIN_MC_COLOUR_2")
+    character = _parse_const_int(text, "TERRAIN_CHARACTER_COLOUR")
+
+    cram_match = re.search(
+        r"^\s*\.const\s+TERRAIN_COLOUR_RAM\s*=\s*([^/\r\n]+)", text, flags=re.MULTILINE
+    )
+    if not cram_match:
+        raise ValueError(f"{path}: missing .const TERRAIN_COLOUR_RAM")
+    cram_expr = cram_match.group(1).strip()
+    expected_expr = "8 | TERRAIN_CHARACTER_COLOUR"
+    if cram_expr != expected_expr:
+        # Also accept the fully-resolved literal form, but require it to agree.
+        try:
+            cram_value = _parse_const_int(text, "TERRAIN_COLOUR_RAM")
+        except ValueError:
+            cram_value = None
+        if cram_value != (8 | character):
+            raise ValueError(
+                f"{path}: TERRAIN_COLOUR_RAM must be '{expected_expr}' "
+                f"(8 | TERRAIN_CHARACTER_COLOUR); got '{cram_expr}'"
+            )
+    colour_ram = 8 | character
+
+    if not 0 <= character <= 7:
+        raise ValueError(f"{path}: TERRAIN_CHARACTER_COLOUR must be 0..7; got {character}")
+    for name, value in (("TERRAIN_BACKGROUND_COLOUR", background),
+                        ("TERRAIN_MC_COLOUR_1", mc1),
+                        ("TERRAIN_MC_COLOUR_2", mc2)):
+        if not 0 <= value <= 15:
+            raise ValueError(f"{path}: {name} must be 0..15; got {value}")
+
+    palette = {
+        "background": background,
+        "multicolour1": mc1,
+        "multicolour2": mc2,
+        "character": character,
+    }
+    return rows, divider, palette, colour_ram
+
+
 def load_engine_data(repo_root):
     repo_root = Path(repo_root)
     main_asm = repo_root / "src" / "main.asm"
-    stage_asm = repo_root / "src" / "stage_test.asm"
+    config_asm = repo_root / GENERATED_CONFIG_REL
+    stage_asm = repo_root / GENERATED_STAGE_REL
     main_text = main_asm.read_text(encoding="utf-8")
 
+    # Glyph bitmap data + geometry stay hand-authored / engine-owned for now.
     glyph_count = _parse_const_int(main_text, "TERRAIN_GLYPH_COUNT")
-    source_stage_rows = _parse_const_int(main_text, "STAGE_METATILE_ROWS")
-    source_scroll_divider = _parse_const_int(main_text, "SCROLL_FRAME_DIVIDER")
-    mc1 = _parse_const_int(main_text, "TERRAIN_MC_COLOUR_1")
-    mc2 = _parse_const_int(main_text, "TERRAIN_MC_COLOUR_2")
-    colour_ram = _parse_const_int(main_text, "TERRAIN_COLOUR_RAM")
-    source_palette = {
-        "background": 0,  # Current engine still writes literal #0 to $D021.
-        "multicolour1": mc1,
-        "multicolour2": mc2,
-        "character": colour_ram & 7,
-    }
+
+    # Stage height / terrain palette / scroll speed are owned by the generated
+    # level config. There is deliberately no fallback to stale main.asm values.
+    if not config_asm.exists():
+        raise ValueError(
+            f"Generated level config not found: {config_asm}. "
+            f"Export a project with tools/level_editor first."
+        )
+    (source_stage_rows, source_scroll_divider,
+     source_palette, source_colour_ram) = _parse_generated_config(config_asm)
 
     if not 1 <= glyph_count <= TERRAIN_GLYPH_NAMESPACE or glyph_count % 8:
         raise ValueError(
@@ -164,4 +227,5 @@ def load_engine_data(repo_root):
         source_stage_rows=source_stage_rows,
         source_palette=source_palette,
         source_scroll_frame_divider=source_scroll_divider,
+        source_colour_ram=source_colour_ram,
     )

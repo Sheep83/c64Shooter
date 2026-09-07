@@ -214,3 +214,30 @@ change appears to require an unapproved:
 
 A technically honest stop with measured blockers is preferable to an
 unvalidated implementation.
+
+## VICE launch / focus discipline
+
+Automated VICE testing must not steal macOS keyboard focus from the user.
+
+When launching VICE/x64sc for automated tests on macOS:
+
+- launch it without intentionally activating, foregrounding or focusing the
+  VICE application/window
+- avoid launch methods such as `open -a` that normally activate the GUI
+- prefer direct/background process launch methods that leave the user's
+  currently active application focused
+- automated tests must not depend on VICE having keyboard focus
+- use the VICE remote monitor, test harness, process control or other
+  programmatic interfaces rather than simulated keyboard input
+- do not send arbitrary user keyboard input to the emulated C64
+- where practical, centralise VICE process launching in the test tooling so
+  all automated tests inherit the non-focus-stealing behaviour
+- do not hide, minimise, terminate or otherwise manipulate an unrelated
+  user-launched VICE instance in order to achieve this
+
+A VICE window may remain visible during testing; the requirement is that an
+automatically launched instance must not deliberately take keyboard focus.
+
+If reliable non-activating launch is not possible for a particular test,
+stop and report the limitation rather than introducing fragile focus-stealing
+automation.

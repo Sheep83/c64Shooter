@@ -127,7 +127,10 @@ def main():
                 return turret_state[addr-sym['TURRET_STATE_BEGIN']]
             return raster_state[addr-sym['RASTER_STATE_BEGIN']]
         phase = record['physical_fine']
-        row, finish, live = get('SCROLL_ROW'), get('BG_COARSE_FINISH'), get('LIVE_PLAN')
+        # SCROLL_ROW is 16-bit little-endian once a stage exceeds 255 logical
+        # rows (SCROLL_ROW_HI absent in pre-widening captures -> plain byte).
+        row = get('SCROLL_ROW') + (256 * get('SCROLL_ROW_HI') if 'SCROLL_ROW_HI' in sym else 0)
+        finish, live = get('BG_COARSE_FINISH'), get('LIVE_PLAN')
         styles = tuple(get('TURRET_SHOWN_STYLE',t) for t in range(len(placements)))
         if any(style>7 for style in styles):
             failures.append([frame,'uninitialized turret glyph style',styles])
