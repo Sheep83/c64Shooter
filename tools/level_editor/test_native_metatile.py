@@ -10,6 +10,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+from engine_data import TERRAIN_GLYPH_BASE as GB  # noqa: E402
 from native_metatile import (                                       # noqa: E402
     CELLS_PER_METATILE, GLYPH_BYTES, NATIVE_H, NATIVE_W,
     GlyphBudgetExceeded, GlyphSet, NativeMetatileError,
@@ -97,11 +98,11 @@ ok("GlyphSet: identical 8-byte glyphs deduplicate to one index")
 flat = blank_pixels(1)                         # all 16 cells identical
 packed_flat = pack_metatiles([flat])
 assert packed_flat["glyphCount"] == 1, packed_flat["glyphCount"]
-assert packed_flat["metatileDefs"][0] == [160] * 16
+assert packed_flat["metatileDefs"][0] == [GB] * 16
 
 two_same = pack_metatiles([flat, flat])
 assert two_same["glyphCount"] == 1
-assert two_same["metatileDefs"] == [[160] * 16, [160] * 16]
+assert two_same["metatileDefs"] == [[GB] * 16, [GB] * 16]
 
 half = blank_pixels(1)
 for y in range(NATIVE_H):
@@ -110,8 +111,8 @@ for y in range(NATIVE_H):
 packed_half = pack_metatiles([flat, half])
 # flat needs 1 glyph; half reuses it for its left 8 cells, 1 new for its right 8
 assert packed_half["glyphCount"] == 2, packed_half["glyphCount"]
-assert packed_half["metatileDefs"][1].count(160) == 8
-assert packed_half["metatileDefs"][1].count(161) == 8
+assert packed_half["metatileDefs"][1].count(GB) == 8
+assert packed_half["metatileDefs"][1].count(GB + 1) == 8
 ok("dedup: repeats within a metatile and across metatiles both reuse glyph IDs")
 
 # 6. > capacity unique glyphs fails cleanly (no silent drop/alias)

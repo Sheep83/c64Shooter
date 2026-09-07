@@ -467,3 +467,189 @@ Committed fixture: `tools/level_editor/testdata/synthetic_tileset.png`.
 Terrain metatiles stay terrain. Gameplay objects (turrets today) remain a
 separate authored layer. No object-placement, boss-editor, wave-authoring-beyond-
 triggers, runtime charset streaming or bank-switching work is in scope here.
+
+---
+
+## Milestone: Terrain Asset Workshop - final usability + memory-safety pass
+
+**Status: done, uncommitted.** Full report:
+`reports/terrain-workshop-final-usability-pass.md`. Five bounded amendments; no
+system redesign.
+
+### Memory-layout fix: terrain glyph block relocated to $5c00
+
+`#import "generated/level1/stage_charset.asm"` (the `terrainGlyphs` byte block,
+`TERRAIN_GLYPH_COUNT * 8` bytes, 384 at 48 glyphs, **512 at the full 64-glyph
+budget**) used to sit INSIDE the `$2920` background-control code segment. Its
+size displaced every routine after it, so a valid full-budget level pushed
+`BACKGROUND_CONTROL_END` past `HEALTH_SPRITE_BASE` ($3000):
+`Error: Background control code overlaps health sprite RAM`.
+
+It is now `* = $5c00` in its own fixed segment (like the metatile stage tables
+at `$6600`) - the previously-empty `$56xx..$5fff` window before
+`raster_scheduler` at `$6000`. `initBackground` copies it to `$3D00` by absolute
+addressing, so bank/placement below `$A000` is unconstrained. New guards:
+`.if (* > $5c00)` on the background/HUD code, `.if ($5c00 +
+TERRAIN_GLYPH_NAMESPACE*8 > $6000)` (worst-case reservation), and
+`.if (TERRAIN_CHARSET_END > $6000)`. The `$2920` segment now ends at `$2e51`
+(was `$2fd1`): ~430 bytes clear of `$3000` instead of 47. The only remaining
+`TERRAIN_GLYPH_COUNT` dependency in that segment is the `initBackground` copy
+unroll (<= 8 steps), and the existing `BACKGROUND_CONTROL_END` guard proves the
+worst case still clears the boundary.
+
+### Editor: persistent PNG import session
+
+The `ImportDialog` is now kept alive (hidden between uses) as an editor-runtime
+import session: source PNG path, decoded+sliced sheet, tile geometry and last
+selected cell. A `WorkshopDialog` opened from a picked tile has a
+**"Back to Source"** button that re-shows the same dialog without
+reopening/re-reading the file. Choosing a different PNG replaces the session in
+place. Never persisted to level/project files.
+
+### Editor: native tile Mirror H / Flip V
+
+`NativeMetatileEditor` gains **Mirror Horizontal** and **Flip Vertical**,
+operating on the 16x32 logical-pixel artwork before glyph decomposition (the
+source PNG, glyph IDs and packed bytes are untouched). Each is exactly one
+undoable edit; mirror-twice / flip-twice are identities; no rotation.
+
+### Editor: VIC-II 2:1 aspect-ratio display
+
+`NativeMetatileEditor` renders each logical multicolour pixel `2*unit` wide by
+`unit` tall, so a 16x32 logical metatile appears as a 32x32 physical square
+instead of a squashed strip. Stored data stays 16x32 logical / values 0..3 /
+serialisation unchanged. Painting, hit-testing and 4x4 guides map mouse
+coordinates back to the 16x32 cells (`zx`/`zy` split, no duplicated pixels).
+
+### Editor: individual repository rename / delete
+
+The repository picker is now a small manager: **Add snapshot to level**,
+**Rename...** (artwork/id unchanged; empty rejected, duplicate display names
+confirmed), **Delete** (explicit confirmation). Repository assets and level
+metatiles stay separate snapshot concepts: rename/delete never touch metatiles
+already copied into any level package. Changes persist to `repository.json`
+immediately (no destructive "Clear Repository").
+
+### Generated Level 1 re-synced (pre-existing inconsistency)
+
+Commit `3a72c13` committed `src/generated/level1/*.asm` inconsistent with the
+authored `tools/level_editor/levels/level1/level.json`
+(`STAGE_METATILE_COUNT = 17` vs the level's 16; `WAVE_TRIGGER_COUNT = 0` vs 5).
+The generated files were re-exported straight from the committed `level.json`
+via `load_project` + `export_level` (not `build_levels.py`, whose `build_level1`
+reconstructs from a hard-coded Python spec + the stale `stage_test.asm` and so
+could not break the loop). `level.json` was not modified. `test_metatile_capacity.py`
+(which hard-asserted a 16-def engine baseline) and `make_stage_fixture.py` /
+`vice_bottom_origin_probe.py` (which hard-read a 256-byte / 16-def metatile
+table) were made count-agnostic.
+
+### Tests
+
+New: `tools/check_terrain_glyph_budget.py` (assembles a full 64-glyph level,
+asserts every reserved-region guard). `test_editor_workshop_gui.py` extended to
+9 checks (2:1 aspect + hit-test, mirror/flip idempotence + undo, persistent
+import session, repository rename/delete vs level snapshots). Full editor suite
++ VICE battery (raster/scroll/HUD/turret/wave-trigger/bottom-origin/level1
+smoke) green; PAL cadence exactly `[19656]`; the known `--stress`
+scroll-capture pixel hiccup at y=55 is unchanged in character.
+
+---
+
+## Milestone: terrain glyph capacity 64 -> 128, unused-metatile delete, native tiles
+
+**Status: done, uncommitted.** Full report:
+`reports/terrain-authoring-blockers-and-native-tiles-report.md`.
+
+### Charset audit + terrain glyph capacity 64 -> 128
+
+Audited every screen code stamped into the `$0400` matrix in any game state.
+Menu / gameplay / GAME OVER / hi-score text uses only codes 1..26 (letters),
+32 (space) and 48..57 (digits) - the highest is **54** ('6'). Codes **55..127**
+of the resident ROM copy are never displayed anywhere; nor are 146..159
+(old reserved HUD band), 230..239, 252..255.
+
+New charset map (`$3800`, 256 codes):
+
+| codes | region |
+|---|---|
+| 1..54 (57 resident) | ROM text glyphs - menu / GAME OVER / hi-score |
+| 64..81 | **HUD private glyphs** (`HUD_GLYPH_BASE` 128 -> **64**) - dead ROM space |
+| 82..95 | reserved (HUD expansion) |
+| **96..223** | **terrain glyph namespace** (`TERRAIN_GLYPH_BASE` 160 -> **96**, `TERRAIN_GLYPH_NAMESPACE` 64 -> **128**), bitmaps **`$3B00..$3EFF`** = exactly half the charset |
+| 224..225 | diagnostic rail/diagonal |
+| 226..229 | shared turret body glyphs |
+| 240..251 | starfield |
+
+Only the HUD private block moved (into never-displayed ROM space); the terrain
+namespace grew *downward* to code 96 and *up to* 223 (unchanged ceiling).
+Diagnostic / turret / starfield are untouched. `HUD_GLYPH_BASE_CODE`,
+`TERRAIN_GLYPH_BASE_CODE`, `TERRAIN_GLYPH_NAMESPACE_CODE` are exported for the
+capture oracles (no literals). Two hard-coded HUD `.byte` rows now use the
+constants.
+
+`initBackground`'s terrain glyph copy is now a **fixed-size runtime loop**
+(count only in the page/tail terminators), so the `$2920` timing segment length
+no longer depends on the glyph count at all. The terrain glyph data segment
+moved `$5c00 -> $5a00`; at the 128-glyph worst case it fills `$5a00..$5e00`,
+512 bytes clear of `raster_scheduler` at `$6000`, and `BACKGROUND_CONTROL_END`
+is `$2e56` - 426 bytes below `HEALTH_SPRITE_BASE $3000`. Guards updated for the
+1024-byte block; `check_terrain_glyph_budget.py` now assembles a full 128-glyph
+level and asserts every reserved-region boundary.
+
+### Project format 5
+
+`FORMAT_VERSION = 5`, `SUPPORTED = (1..5)`. A tileset saved by formatVersion <= 4
+stored metatile-def glyph codes at base 160; `_migrate_tileset` shifts them to
+`TERRAIN_GLYPH_BASE` (96) on load. Native `levelMetatileSet` pixels are
+base-independent (no change). `load_engine_data` also auto-detects a stale
+generated tree's base and remaps. `engine_data.TERRAIN_GLYPH_BASE_LEGACY = 160`.
+
+### Unused-metatile deletion fixed
+
+**Root cause:** `_metatile_remove_unused` only ever considered *trailing*
+metatiles and refused every deletion the moment the *highest* metatile ID was
+still painted - it had no notion of deleting a chosen unused metatile with
+renumbering. **Fix:** `project.remove_metatile(project, index)` - refuses if the
+map references `index`, else drops the set entry, shifts later entries down one,
+and decrements every map cell whose ID was `> index` (cells `< index`
+unchanged), keeping the painted stage identical. Turrets store grid positions
+and wave triggers store world rows - never scenery metatile IDs - so they are
+deliberately untouched. Editor: a per-selection **"Delete"** button plus a
+"Trim unused" batch built on the same primitive. `MetatileInUseError`.
+`test_metatile_delete.py` covers end / middle / just-below-highest-used
+removal, refusal of a used tile, turret/wave immunity, and
+save/reload/export determinism.
+
+### Generated native bas-relief terrain (`native_terrain_tiles.py`)
+
+31 original metallic-industrial-panel metatiles authored directly in the native
+16x32 logical-multicolour format from ~40 reusable 4x8 cells (plate, edge
+light/shadow, bevels TL/TR/BL/BR, recess corners, H/V seams, ribs, vent,
+grille, H/V conduit + elbow, rivet, diagonal brace, hazard chevron, pit walls,
+glowing core). Lighting convention: `0` void, `1` mid body, `2` shadow
+(bevels facing away / seams / recess), `3` highlight (bevels facing the
+top-left light / rivet gleam / conduit crown). No external PNG / conversion
+step. **31 metatiles -> 36 unique terrain glyphs after dedupe (naive would be
+496 - ~14x denser)** - proving purpose-designed native art is far more
+charset-efficient than imported 32x32 pixel art. `--sheet` prints an ASCII
+contact sheet (no image deps).
+
+`install_level1_terrain.py` swaps Level 1's metatile set for the 31 native
+tiles (the old 16 `METATILE_NAMES` "riveted hull" tiles were the pre-workshop
+test baseline), remaps the painted test map old-id -> new-id so the scroller
+stays structured, lays a 3-row demo patch (rows 2-4, previously blank, no
+turrets/triggers nearby) showing all 31 tiles side by side, and re-exports.
+**Turrets (9), wave definitions/triggers (5), palette, height, scroll divider
+unchanged.** Level 1 now: 31 metatiles, 40 packed terrain glyphs (of 128).
+Level 2 artwork unchanged (its codes re-based 160 -> 96 on export only).
+
+### Tests / VICE
+
+New: `test_metatile_delete.py` (7), `test_native_terrain_tiles.py` (8);
+`check_terrain_glyph_budget.py` rewritten for 128; `check_fixed_hud_capture.py`
+parameterised on the exported base labels. 94 editor checks green. VICE on the
+new Level 1: raster `[19656]` / 0 service failures / 0 sprite-start misses,
+scroll 0 failures / 64.8M pixel checks / 74 wraps, HUD 0, turret 0, wave-trigger
+/ bottom-origin / level1 smoke all PASS; `run_stage_fixture 768 64` decodes ID
+63 byte-exact, `769 64` rejected. The known `--stress` y=55 pixel hiccup
+persists unchanged in character.

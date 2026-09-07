@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from engine_data import load_engine_data                       # noqa: E402
+from engine_data import TERRAIN_GLYPH_BASE, load_engine_data     # noqa: E402
 from ka_export import export_level                             # noqa: E402
 from project import LevelProject, save_project                 # noqa: E402
 import level2_tileset                                          # noqa: E402
@@ -117,7 +117,7 @@ def build_level1(engine):
 
     tileset = {
         "glyphCount": engine.glyph_count,
-        "glyphs": [list(engine.glyphs[160 + i]) for i in range(engine.glyph_count)],
+        "glyphs": [list(engine.glyphs[TERRAIN_GLYPH_BASE + i]) for i in range(engine.glyph_count)],
         "metatileDefs": [list(m) for m in engine.metatiles],
     }
     return LevelProject(

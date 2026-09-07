@@ -23,6 +23,8 @@ which is exactly what src/main.asm's decodeStageCharacterRow / the VIC expect.
 """
 from __future__ import annotations
 
+from engine_data import TERRAIN_GLYPH_BASE, TERRAIN_GLYPH_NAMESPACE
+
 NATIVE_W = 16
 NATIVE_H = 32
 CHARS_PER_SIDE = 4
@@ -140,7 +142,7 @@ def glyphs_to_pixels(glyphs):
 
 class GlyphBudgetExceeded(ValueError):
     """Adding an asset would need more unique terrain glyphs than the live
-    namespace (codes 160..223, 64 slots) can hold."""
+    namespace (codes 96..223, 128 slots) can hold."""
 
     def __init__(self, needed, capacity, existing):
         self.needed = needed
@@ -161,7 +163,7 @@ class GlyphSet:
     """An ordered, de-duplicated collection of 8-byte terrain glyph bitmaps.
     Index i == char code TERRAIN_GLYPH_BASE + i once compiled into a level."""
 
-    def __init__(self, glyphs=None, capacity=64):
+    def __init__(self, glyphs=None, capacity=TERRAIN_GLYPH_NAMESPACE):
         self.capacity = capacity
         self._list = []
         self._index = {}
@@ -219,7 +221,7 @@ class GlyphSet:
         return [self._index[k] for k in keys]
 
 
-def pack_metatiles(native_grids, *, capacity=64, glyph_base=160):
+def pack_metatiles(native_grids, *, capacity=TERRAIN_GLYPH_NAMESPACE, glyph_base=TERRAIN_GLYPH_BASE):
     """Turn an ordered list of native pixel grids (one per level metatile) into
     a packed tileset:
 

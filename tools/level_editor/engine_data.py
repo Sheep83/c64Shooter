@@ -33,8 +33,14 @@ METATILE_CAPACITY = 64
 # built-in / baseline count". It equals len(METATILE_NAMES) and is only the
 # *default* set size for a fresh project, never a hard limit.
 METATILE_DEF_COUNT = 16
-TERRAIN_GLYPH_BASE = 160
-TERRAIN_GLYPH_NAMESPACE = 64
+# Terrain glyph namespace. Expanded 160/64 -> 96/128: the charset audit found
+# screen codes 55..95 unused in every game state, so the HUD private glyphs moved
+# 128 -> 64 and terrain now owns codes 96..223 (bitmaps $3B00..$3EFF, exactly
+# half the $3800 charset). Metatile-def glyph code = TERRAIN_GLYPH_BASE + index.
+# Pre-v5 project tilesets stored codes at base 160 and are remapped on load.
+TERRAIN_GLYPH_BASE = 96
+TERRAIN_GLYPH_NAMESPACE = 128
+TERRAIN_GLYPH_BASE_LEGACY = 160        # base used by formatVersion <= 4 tilesets
 # Safe maximum stage height. Recalculated from the real assembled layout for the
 # 64-metatile worst case: metatileDefs+stageMetatileRows occupy $6600..$8800
 # ($2200 = 8704 bytes); a full 64-entry def table is 1024 bytes, leaving
@@ -361,12 +367,21 @@ def load_engine_data(repo_root):
     expected_glyph_bytes = glyph_count * 8
     if len(glyph_bytes) != expected_glyph_bytes:
         raise ValueError(f"Expected {expected_glyph_bytes} terrain glyph bytes, got {len(glyph_bytes)}")
+
+    metatile_bytes_raw = _read_table(stage_asm, "metatileDefs", "METATILE_DEFS_END")
+    # Generated files built before the 96/128 namespace expansion stored glyph
+    # codes at base 160. Detect the actual base from the def bytes and remap to
+    # the current TERRAIN_GLYPH_BASE so a stale generated tree still loads.
+    _emitted_base = min(metatile_bytes_raw) if metatile_bytes_raw else TERRAIN_GLYPH_BASE
+    if _emitted_base in (TERRAIN_GLYPH_BASE, TERRAIN_GLYPH_BASE_LEGACY):
+        _shift = TERRAIN_GLYPH_BASE - _emitted_base
+    else:
+        _shift = 0
+    metatile_bytes = [c + _shift for c in metatile_bytes_raw]
     glyphs = {
         TERRAIN_GLYPH_BASE + i: glyph_bytes[i * 8:(i + 1) * 8]
         for i in range(glyph_count)
     }
-
-    metatile_bytes = _read_table(stage_asm, "metatileDefs", "METATILE_DEFS_END")
     bytes_per_def = METATILE_W * METATILE_H
     # The def table is variable length now. Prefer the level-owned
     # STAGE_METATILE_COUNT; fall back to the byte count for pre-const files.

@@ -11,7 +11,9 @@ Multicolour bit pairs per pixel: 0 = $D021 background, 1 = $D022, 2 = $D023,
 dusky planet: background dark, 1 = ochre rock, 2 = pale dust, 3 = bright rim.
 """
 
-TERRAIN_GLYPH_BASE = 160
+from engine_data import TERRAIN_GLYPH_BASE          # output base (96 since fmt v5)
+
+_AUTHOR_BASE = 160         # arbitrary key base for the _def() vocabulary below
 GLYPH_COUNT = 48
 METATILE_DEF_COUNT = 16
 
@@ -166,7 +168,7 @@ for _c in range(204, 208):
 
 def glyphs():
     """List of 48 8-byte glyph bitmaps for codes 160..207."""
-    return [list(_GLYPHS[TERRAIN_GLYPH_BASE + i]) for i in range(GLYPH_COUNT)]
+    return [list(_GLYPHS[_AUTHOR_BASE + i]) for i in range(GLYPH_COUNT)]
 
 
 # ---- metatile defs: 16 x (4x4 glyph codes), row-major within the 4x4 ---------

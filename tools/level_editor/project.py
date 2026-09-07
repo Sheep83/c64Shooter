@@ -22,6 +22,7 @@ metatile is edited in the Terrain Asset Workshop.
 """
 from dataclasses import dataclass, field
 import json
+import re
 from pathlib import Path
 
 from engine_data import (
@@ -37,6 +38,7 @@ from engine_data import (
     METATILE_W,
     METATILES_PER_ROW,
     TERRAIN_GLYPH_BASE,
+    TERRAIN_GLYPH_BASE_LEGACY,
     TERRAIN_GLYPH_NAMESPACE,
     TURRET_POOL,
     VIEWPORT_ROWS,
@@ -53,8 +55,12 @@ from native_metatile import (
     validate_pixels,
 )
 
-FORMAT_VERSION = 4
-SUPPORTED_FORMAT_VERSIONS = (1, 2, 3, 4)
+FORMAT_VERSION = 5
+SUPPORTED_FORMAT_VERSIONS = (1, 2, 3, 4, 5)
+# formatVersion 5: the terrain glyph namespace expanded 160/64 -> 96/128. A
+# tileset saved by formatVersion <= 4 stored metatile-def glyph codes at base
+# 160; on load they are shifted to the current TERRAIN_GLYPH_BASE. Native
+# levelMetatileSet pixels are base-independent and need no migration.
 MIN_STAGE_ROWS = 1
 MAX_STAGE_ROWS = ENGINE_MAX_STAGE_ROWS
 DEFAULT_STAGE_ROWS = 188
@@ -137,9 +143,10 @@ class LevelProject:
     objects: list = field(default_factory=list)
     metatile_metadata: dict = field(default_factory=dict)
     # Per-level PACKED terrain tileset: {"glyphCount": N, "glyphs": [[8]...],
-    # "metatileDefs": [[16]...]}. Up to 64 metatile defs now. Codes run
-    # 160..160+glyphCount-1. Derived from level_metatile_set whenever a native
-    # metatile is edited; kept verbatim for migrated V1-V3 levels until then.
+    # "metatileDefs": [[16]...]}. Up to 64 metatile defs. Glyph codes run
+    # TERRAIN_GLYPH_BASE..+glyphCount-1 (96.. since formatVersion 5; pre-v5 files
+    # stored 160.. and are shifted on load). Derived from level_metatile_set
+    # whenever a native metatile is edited; kept verbatim for migrated levels.
     tileset: dict = None
     # Editable NATIVE representation: up to 64 entries, each
     #   {"name": str,
@@ -359,6 +366,94 @@ def ensure_level_metatile_set(project):
     return project.level_metatile_set
 
 
+def metatile_id_usage(project):
+    """{metatile ID -> number of map cells using it} for the current map."""
+    counts = {}
+    for row in project.metatile_rows:
+        for c in row:
+            counts[c] = counts.get(c, 0) + 1
+    return counts
+
+
+class MetatileInUseError(ProjectValidationError):
+    """Raised when a metatile that the map still references is deleted."""
+
+
+def remove_metatile(project, index):
+    """Delete metatile `index` from the level metatile set and keep the painted
+    map visually/logically identical:
+      * refuse if the map still references metatile `index`;
+      * drop the set entry, shifting every later metatile down by one;
+      * decrement every map cell whose ID was > index (cells < index unchanged;
+        cells == index cannot exist - it is unused).
+    Turrets and wave triggers store grid positions / world rows, never scenery
+    metatile IDs, so they are deliberately untouched. Caller repacks the tileset.
+    Returns the removed entry."""
+    entries = ensure_level_metatile_set(project)
+    if not 0 <= index < len(entries):
+        raise ProjectValidationError(f"metatile index {index} out of range 0..{len(entries) - 1}")
+    if len(entries) <= 1:
+        raise ProjectValidationError("a level must keep at least one metatile")
+    usage = metatile_id_usage(project)
+    if usage.get(index, 0):
+        raise MetatileInUseError(
+            f"Metatile {index} ('{entries[index]['name']}') is still used by "
+            f"{usage[index]} map cell(s). Repaint them onto another metatile first."
+        )
+    removed = entries.pop(index)
+    project.metatile_rows = [
+        [c - 1 if c > index else c for c in row] for row in project.metatile_rows
+    ]
+    return removed
+
+
+_COPY_RE = re.compile(r"^(?P<stem>.+?)_COPY(?:_(?P<n>\d+))?$")
+
+
+def unique_metatile_name(project, base):
+    """A level-metatile name not already used by the level metatile set, derived
+    from `base` with the conventional `_COPY` / `_COPY_2` / `_COPY_3` ... suffix.
+    An already-suffixed base ('WALL_COPY') keeps the same stem ('WALL_COPY_2')."""
+    entries = project.level_metatile_set or []
+    taken = {e.get("name") for e in entries}
+    m = _COPY_RE.match(str(base).strip() or "M")
+    stem = m.group("stem") if m else (str(base).strip() or "M")
+    first = f"{stem}_COPY"
+    if first not in taken:
+        return first
+    n = 2
+    while f"{stem}_COPY_{n}" in taken:
+        n += 1
+    return f"{stem}_COPY_{n}"
+
+
+def duplicate_metatile(project, index, *, name=None):
+    """Deep-copy level metatile `index` and append it as a NEW metatile.
+
+    Existing metatile IDs and every painted map cell are left untouched (the copy
+    takes the next free ID). The copy is fully independent - editing it never
+    mutates the source. Provenance/source metadata is carried across verbatim so
+    a duplicated repository-derived tile still records where its artwork came
+    from. Caller repacks the tileset and enforces the 128-glyph budget.
+    Returns the new metatile's index."""
+    entries = ensure_level_metatile_set(project)
+    if not 0 <= index < len(entries):
+        raise ProjectValidationError(f"metatile index {index} out of range 0..{len(entries) - 1}")
+    if len(entries) >= METATILE_CAPACITY:
+        raise ProjectValidationError(
+            f"a level may hold at most {METATILE_CAPACITY} metatiles; this level already has {len(entries)}"
+        )
+    src = canonical_metatile_set_entry(entries[index], index=index)
+    copy_name = (name or "").strip() or unique_metatile_name(project, src["name"])
+    new_entry = canonical_metatile_set_entry({
+        "name": copy_name,
+        "native": {"pixels": [row[:] for row in src["native"]["pixels"]]},
+        "source": (dict(src["source"]) if isinstance(src["source"], dict) else None),
+    }, index=len(entries))
+    entries.append(new_entry)
+    return len(entries) - 1
+
+
 def repack_tileset_from_metatile_set(project):
     """Regenerate project.tileset (deduplicated glyphs + metatile defs) from the
     authored native level metatile set. Raises GlyphBudgetExceeded if the set
@@ -385,7 +480,7 @@ def metatile_set_glyph_cost(project, candidate_pixels=None):
 
     Returns a dict:
       used            unique terrain glyphs the current level metatile set needs
-      capacity        TERRAIN_GLYPH_NAMESPACE (64)
+      capacity        TERRAIN_GLYPH_NAMESPACE (128)
       candidate_new   new unique glyphs `candidate_pixels` would additionally need
       candidate_reuse how many of its 16 cells reuse an existing glyph
     `candidate_pixels` is a native 16x32 grid being considered for addition."""
@@ -669,7 +764,7 @@ def _validate_waves(project, errors):
 def export_readiness_errors(project):
     """Extra checks required before generating engine-facing ASM. 0 turrets is
     fine now; a per-level tileset is required (the charset export needs it), and
-    the level's native metatiles must fit the 64-glyph terrain namespace."""
+    the level's native metatiles must fit the terrain glyph namespace."""
     errors = validate_project(project)
     if project.tileset is None:
         errors.append("A per-level tileset is required before export (open/save via the editor).")
@@ -695,10 +790,14 @@ def _require_key(data, key):
     return data[key]
 
 
-def _migrate_tileset(raw, default_tileset):
+def _migrate_tileset(raw, default_tileset, *, format_version=FORMAT_VERSION):
     if isinstance(raw, dict) and raw.get("glyphs") and raw.get("metatileDefs"):
         glyphs = [list(int(b) & 0xFF for b in g) for g in raw["glyphs"]]
         defs = [list(int(c) for c in d) for d in raw["metatileDefs"]]
+        # formatVersion <= 4 stored glyph codes at TERRAIN_GLYPH_BASE_LEGACY (160).
+        if format_version <= 4:
+            shift = TERRAIN_GLYPH_BASE - TERRAIN_GLYPH_BASE_LEGACY
+            defs = [[c + shift for c in d] for d in defs]
         return {"glyphCount": int(raw.get("glyphCount", len(glyphs))),
                 "glyphs": glyphs, "metatileDefs": defs}
     if default_tileset is not None:
@@ -751,7 +850,8 @@ def project_from_dict(data, *, default_tileset=None):
     if not isinstance(raw_defs, list) or not isinstance(raw_triggers, list):
         raise ProjectValidationError("waveDefinitions / waveTriggers must be lists.")
 
-    tileset = _migrate_tileset(data.get("tileset"), default_tileset)
+    tileset = _migrate_tileset(data.get("tileset"), default_tileset,
+                               format_version=format_version)
 
     # levelMetatileSet (formatVersion 4+). For older files, derive a native view
     # from the packed tileset with no visual change; keep `tileset` verbatim so a

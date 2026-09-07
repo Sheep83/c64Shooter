@@ -108,12 +108,17 @@
 // See docs/fixed-hud-codex-worklog.md for measured timing and acceptance status.
 // ============================================================================
 .const BG_SCREEN_A = $0400
-// Fixed HUD row0 private glyphs: codes 128..145 = space, S, C, O, R, E, 0..9,
-// then F and R (for the development FREE-cycle counter). Bitmaps are copied
-// into the RAM charset by initFixedHud; the ten digit glyphs live at
-// HUD_DIGIT_GLYPH..+9. displayScore / displayCycleMinimum write these codes
-// (never screen codes 48-57) into their assigned fixed HUD cells only.
-.const HUD_GLYPH_BASE = 128
+// Fixed HUD row0 private glyphs: 18 codes = space, S, C, O, R, E, 0..9, then F
+// and R (for the development FREE-cycle counter). Bitmaps are copied into the
+// RAM charset by initFixedHud; the ten digit glyphs live at HUD_DIGIT_GLYPH..+9.
+// displayScore / displayCycleMinimum write these codes (never screen codes
+// 48-57) into their assigned fixed HUD cells only.
+//
+// Relocated 128 -> 64: the terrain glyph namespace grew from 64 to 128 codes
+// (96..223) and needed the 128..159 band. Screen codes 55..95 are never
+// displayed in any game state (menu / gameplay / GAME OVER / hi-score text uses
+// only codes 1..26, 32, 48..57), so codes 64..81 are dead ROM-copy space here.
+.const HUD_GLYPH_BASE = 64
 .const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6      // 134..143: private decimal digits 0..9.
 .const HUD_SCORE_CELL = BG_SCREEN_A + 8          // Row 0 cols 8..12: five live score digits.
 .const HUD_FREE_GLYPH_F = HUD_GLYPH_BASE + 16    // 144: private 'F'.
@@ -207,20 +212,20 @@
 .const STAGE_START_ROW = STAGE_LOGICAL_ROWS - 23    // 16-bit initial SCROLL_ROW (bottom origin).
 
 // Editor-owned terrain character art occupies its own permanent namespace,
-// character codes 160..223 (64 glyphs), bitmaps $3D00..$3EFF. 146..159 stay
-// reserved for future HUD expansion; 224/225 stay as the diagnostic
-// rail/diagonal glyphs; 226..237 are the turret private glyphs (see
-// background_turrets.asm); 240..251 stay as the starfield.
-.const TERRAIN_GLYPH_BASE = 160                     // First editor-owned terrain art char code ($A0).
-.const TERRAIN_GLYPH_NAMESPACE = 64                 // Permanent editor-owned range: codes 160..223.
+// character codes 96..223 (128 glyphs), bitmaps $3B00..$3EFF. Codes 64..81 are
+// the relocated HUD private glyphs; 82..95 stay reserved for future HUD
+// expansion; 224/225 stay as the diagnostic rail/diagonal glyphs; 226..229 are
+// the shared turret body glyphs (see background_turrets.asm); 240..251 stay as
+// the starfield. The charset audit (menu / gameplay / GAME OVER / hi-score text
+// uses only codes 1..26, 32, 48..57) confirms 55..95 are otherwise unused, so
+// this expansion reclaims dead ROM-copy space, not runtime charset switching.
+.const TERRAIN_GLYPH_BASE = 96                      // First editor-owned terrain art char code.
+.const TERRAIN_GLYPH_NAMESPACE = 128                // Permanent editor-owned range: codes 96..223.
 // TERRAIN_GLYPH_COUNT is LEVEL-owned now: declared in generated/level1/
 // stage_config.asm (imported above) and the matching bitmaps live in
 // generated/level1/stage_charset.asm (imported at the terrainGlyphs data slot).
-.if (TERRAIN_GLYPH_BASE < 160) {
-    .error "TERRAIN_GLYPH_BASE must be >= 160"
-}
-.if (TERRAIN_GLYPH_BASE <= HUD_GLYPH_BASE + 31) {
-    .error "terrain glyphs must clear the 146..159 HUD-expansion reserve (start >= 160)"
+.if (TERRAIN_GLYPH_BASE < HUD_GLYPH_BASE + 18) {
+    .error "terrain glyphs must clear the 18 HUD private codes"
 }
 .if (TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_NAMESPACE - 1 > 223) {
     .error "terrain glyph namespace runs past code 223 (into diagnostic glyphs 224/225)"
@@ -231,14 +236,21 @@
 .if ((TERRAIN_GLYPH_COUNT & 7) != 0) {
     .error "TERRAIN_GLYPH_COUNT must be a multiple of 8 (glyph copy works in 64-byte chunks)"
 }
+// Exported for the capture oracles / editor cross-checks (no literals there).
+.label HUD_GLYPH_BASE_CODE = HUD_GLYPH_BASE
+.label TERRAIN_GLYPH_BASE_CODE = TERRAIN_GLYPH_BASE
+.label TERRAIN_GLYPH_NAMESPACE_CODE = TERRAIN_GLYPH_NAMESPACE
 
 .const STAR_COUNT = 16                              // Two-layer background stars; no hardware sprites consumed.
 .const STAR_CHARSET = $3800                         // RAM copy of normal charset in VIC bank 0.
-.if (STAR_CHARSET + TERRAIN_GLYPH_BASE * 8 != $3d00) {
-    .error "terrain glyph bitmaps must begin at $3D00"
+.if (STAR_CHARSET + TERRAIN_GLYPH_BASE * 8 != $3b00) {
+    .error "terrain glyph bitmaps must begin at $3B00"
 }
 .if (STAR_CHARSET + (TERRAIN_GLYPH_BASE + TERRAIN_GLYPH_NAMESPACE) * 8 > $3f00) {
     .error "terrain glyph namespace bitmaps run past $3EFF (into diagnostic glyph 224 at $3F00)"
+}
+.if (STAR_CHARSET + HUD_GLYPH_BASE * 8 < $3800 + $200) {
+    .error "HUD private glyphs overlap the resident text glyph range"
 }
 .const STAR_CHAR_BASE = 240                         // Custom chars 240-251 = 3 sizes x 4 phases.
 .const STAR_GLYPH_BYTES = 96
@@ -5113,15 +5125,44 @@ initBackground:
     dex
     bpl !glyphLoop-
 
-    ldx #0                                  // Editor-owned terrain art: TERRAIN_GLYPH_COUNT glyphs
-!terrainGlyphLoop:                          // (TERRAIN_GLYPH_COUNT*8 bytes, a multiple of 64) from
-    .for (var b = 0; b < TERRAIN_GLYPH_COUNT / 8; b++) {  // terrainGlyphs into the RAM charset at
-        lda terrainGlyphs + b*64,x                        // TERRAIN_GLYPH_BASE ($3D00). One x pass (0..63)
-        sta STAR_CHARSET + TERRAIN_GLYPH_BASE*8 + b*64,x  // covers one 64-byte chunk per unrolled step.
-    }
-    inx
-    cpx #64
-    bne !terrainGlyphLoop-
+    // Editor-owned terrain art: copy TERRAIN_GLYPH_COUNT*8 bytes (a multiple of
+    // 64, up to TERRAIN_GLYPH_NAMESPACE*8 = 1024) from terrainGlyphs (its own
+    // $5a00 segment) into the RAM charset at TERRAIN_GLYPH_BASE*8 ($3B00). This
+    // is a FIXED-SIZE runtime loop - the generated glyph count appears only in
+    // the page/tail terminators, never as an unrolled length - so no
+    // generated-data size can change this ($2920) segment's length. Runs once
+    // per game; not frame-timing-critical. Reuses TEXT_SRC/TEXT_DST (idle here).
+    lda #<terrainGlyphs
+    sta TEXT_SRC
+    lda #>terrainGlyphs
+    sta TEXT_SRC + 1
+    lda #<(STAR_CHARSET + TERRAIN_GLYPH_BASE * 8)
+    sta TEXT_DST
+    lda #>(STAR_CHARSET + TERRAIN_GLYPH_BASE * 8)
+    sta TEXT_DST + 1
+    ldx #>(TERRAIN_GLYPH_COUNT * 8)         // whole 256-byte pages (0..4)
+    beq !terrainTail+
+!terrainPage:
+    ldy #0
+!terrainPageByte:
+    lda (TEXT_SRC),y
+    sta (TEXT_DST),y
+    iny
+    bne !terrainPageByte-
+    inc TEXT_SRC + 1
+    inc TEXT_DST + 1
+    dex
+    bne !terrainPage-
+!terrainTail:
+    ldy #<(TERRAIN_GLYPH_COUNT * 8)         // remaining bytes (0 / 64 / 128 / 192)
+    beq !terrainCopyDone+
+!terrainTailByte:
+    dey
+    lda (TEXT_SRC),y
+    sta (TEXT_DST),y
+    tya
+    bne !terrainTailByte-
+!terrainCopyDone:
     jsr initBackgroundTurrets               // Capture only the12 replaced glyph underlays; reset per-game health.
 
     // Global multicolour text mode for the playfield. $D016 is otherwise unused
@@ -5375,15 +5416,13 @@ bgDiagnosticGlyphs:                          // Rail (224) and diagonal (225) gl
     .byte $18,$18,$18,$18,$18,$18,$18,$18   // the metatile test stage below.
     .byte $80,$40,$20,$10,$08,$04,$02,$01
 
-// --- Editor-owned terrain glyphs -----------------------------------------------
-// The terrain glyph bitmaps are LEVEL-owned (part of the level package's
-// tileset) and are generated by tools/level_editor. This include provides
-// terrainGlyphs: .. terrainGlyphsEnd: (TERRAIN_GLYPH_COUNT * 8 bytes) plus its
-// own size guard. It lands here, inside the background-control segment, at the
-// same program counter the hand-authored block used to occupy. A future
-// multiload transition replaces exactly this byte block with the next level's
-// tileset (see docs/level-editor-worklog.md).
-#import "generated/level1/stage_charset.asm"
+// NOTE: the LEVEL-owned terrain glyph bitmaps (terrainGlyphs) used to be
+// #import-ed HERE, inside the $2920 background-control code segment. That block
+// is variable length - TERRAIN_GLYPH_COUNT * 8 bytes, up to
+// TERRAIN_GLYPH_NAMESPACE * 8 = 1024 bytes for a full 128-glyph level - so a
+// valid full-budget level pushed BACKGROUND_CONTROL_END past HEALTH_SPRITE_BASE
+// ($3000). It is now in its own fixed segment ($5a00, below), like the metatile
+// stage tables at $6600, so its size never displaces timing code.
 
 // --- Routine: updateBackgroundScroll ---------------------------------------
 // Advance 1px every SCROLL_FRAME_DIVIDER frames. A wrap is only published
@@ -5937,6 +5976,10 @@ countActiveEnemies:
     rts
 
 BACKGROUND_CONTROL_END:
+// The variable-size terrain glyph block is #import-ed into its own $5a00
+// segment, and the initBackground terrain-glyph copy is now a fixed-size
+// runtime loop, so NOTHING in this segment's length depends on the generated
+// glyph count. This guard is a permanent belt-and-braces boundary check.
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"
 }
@@ -6119,10 +6162,16 @@ initFixedHud:
     bpl !free-
 }
     rts
+.const HUD_G_SPACE = HUD_GLYPH_BASE + 0
+.const HUD_G_S     = HUD_GLYPH_BASE + 1
+.const HUD_G_C     = HUD_GLYPH_BASE + 2
+.const HUD_G_O     = HUD_GLYPH_BASE + 3
+.const HUD_G_R     = HUD_GLYPH_BASE + 4
+.const HUD_G_E     = HUD_GLYPH_BASE + 5
 fixedHudText:
-    .byte 129,130,131,132,133,128,134,134,134,134,134 // "SCORE " + private 00000; digits overwritten by displayScore.
+    .byte HUD_G_S, HUD_G_C, HUD_G_O, HUD_G_R, HUD_G_E, HUD_G_SPACE, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH  // "SCORE " + private 00000; digits overwritten by displayScore.
 fixedHudFreeLabel:
-    .byte HUD_FREE_GLYPH_F, HUD_FREE_GLYPH_R, 133, 133, 128, 134,134,134,134,134 // "FREE 00000" (private glyphs).
+    .byte HUD_FREE_GLYPH_F, HUD_FREE_GLYPH_R, HUD_G_E, HUD_G_E, HUD_G_SPACE, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH // "FREE 00000" (private glyphs).
 .if (HUD_GLYPH_BASE + hudStockCodes.size() > 224) {
     .error "Fixed HUD glyphs overlap terrain charset allocation"
 }
@@ -6138,8 +6187,33 @@ fixedHudFreeLabel:
 .if (STAR_CHARSET + (HUD_GLYPH_BASE + hudStockCodes.size())*8 > STAR_CHARSET + $800) {
     .error "Fixed HUD glyph bitmaps run past the charset"
 }
+.const TERRAIN_CHARSET_SEGMENT = $5a00
+.if (* > TERRAIN_CHARSET_SEGMENT) {
+    .error "Background/HUD code overlaps the terrain glyph block at $5a00"
+}
 .if (* > $6000) {
     .error "Background/HUD code overlaps raster scheduler"
+}
+
+// --- Editor-owned terrain glyph bitmaps ---------------------------------------
+// LEVEL-owned tileset data, generated by tools/level_editor. Provides
+// terrainGlyphs: .. terrainGlyphsEnd: (TERRAIN_GLYPH_COUNT * 8 bytes) plus its
+// own size guard. In its own dedicated fixed segment (NOT inside the $2920 code
+// segment): the block is variable length, up to a full 128-glyph level's
+// TERRAIN_GLYPH_NAMESPACE * 8 = 1024 bytes; inside a code segment its size would
+// displace later routines. initBackground copies it to $3B00 by pointer/absolute
+// addressing, so its placement below $A000 / its VIC bank is unconstrained.
+// A future multiload transition replaces exactly this byte block.
+* = TERRAIN_CHARSET_SEGMENT
+#import "generated/level1/stage_charset.asm"
+TERRAIN_CHARSET_END:
+// The RESERVED window must hold a full 128-glyph block for ANY valid level, not
+// just this one - so this guard is deliberately worst-case (namespace, not count).
+.if (TERRAIN_CHARSET_SEGMENT + TERRAIN_GLYPH_NAMESPACE * 8 > $6000) {
+    .error "reserved terrain glyph window ($5a00) cannot hold a full 128-glyph block before $6000"
+}
+.if (TERRAIN_CHARSET_END > $6000) {
+    .error "terrain glyph block overruns its reserved window (into the raster scheduler at $6000)"
 }
 
 // The shared event dispatcher has its own guarded resident allocation.

@@ -23,12 +23,20 @@ from engine_data import (
     METATILE_NAMES,
     METATILE_W,
     METATILES_PER_ROW,
+    TERRAIN_GLYPH_BASE,
+    TERRAIN_GLYPH_NAMESPACE,
     VIEWPORT_ROWS,
     load_engine_data,
 )
 from ka_export import export_level
 from native_metatile import GlyphBudgetExceeded, blank_pixels
+from recover_generated_terrain import recover_generated_set
 from terrain_repository import TerrainRepository, default_repo_path
+from wave_repository import (
+    WaveRepository,
+    WaveRepositoryError,
+    default_repo_path as default_wave_repo_path,
+)
 from workshop_ui import ImportDialog, WorkshopDialog
 from project import (
     DEFAULT_STAGE_ROWS,
@@ -43,7 +51,11 @@ from project import (
     clamp_viewport_top,
     composition_size,
     default_viewport_top,
+    duplicate_metatile,
+    MetatileInUseError,
     ensure_level_metatile_set,
+    metatile_id_usage,
+    remove_metatile,
     export_readiness_errors,
     iter_turrets,
     load_project,
@@ -106,6 +118,19 @@ class LevelEditor(tk.Tk):
             self.repository = TerrainRepository.load(self.repo_path)
         except Exception:                                 # noqa: BLE001 - start empty on a bad file
             self.repository = TerrainRepository(path=self.repo_path)
+        # Global Wave Definition Repository - persists across sessions/projects,
+        # independent of any level. Levels keep their own waveDefinitions;
+        # library copies are snapshots (see wave_repository.py).
+        self.wave_repo_path = default_wave_repo_path(self.repo_root / "tools" / "level_editor")
+        try:
+            self.wave_repository = WaveRepository.load(self.wave_repo_path)
+        except Exception:                                 # noqa: BLE001 - start empty on a bad file
+            self.wave_repository = WaveRepository(path=self.wave_repo_path)
+        # Persistent PNG import session: the ImportDialog is kept alive (hidden
+        # between uses) so the user can return to an already-open spritesheet and
+        # pick another tile without reopening/re-reading the file. Editor/runtime
+        # state only - never persisted into level/project files.
+        self._import_dialog = None
         self.project_path = None
         self.viewport_top = default_viewport_top(self.project)
 
@@ -154,7 +179,7 @@ class LevelEditor(tk.Tk):
     def _baseline_tileset(self):
         return {
             "glyphCount": self.data.glyph_count,
-            "glyphs": [list(self.data.glyphs[160 + i]) for i in range(self.data.glyph_count)],
+            "glyphs": [list(self.data.glyphs[TERRAIN_GLYPH_BASE + i]) for i in range(self.data.glyph_count)],
             "metatileDefs": [list(m) for m in self.data.metatiles],
         }
 
@@ -308,16 +333,22 @@ class LevelEditor(tk.Tk):
         self._bind_mousewheel(self.palette_canvas)
         mt_btns = ttk.Frame(palette_frame)
         mt_btns.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        for txt, cmd in (("Workshop…", self._metatile_edit_workshop),
-                         ("New", self._metatile_new_blank),
-                         ("Import PNG…", self._metatile_import_png)):
+        for txt, cmd in (("Edit Selected", self._metatile_edit_workshop),
+                         ("Duplicate", self._metatile_duplicate_selected),
+                         ("New Tile", self._metatile_new_blank)):
             ttk.Button(mt_btns, text=txt, width=11, command=cmd).pack(side="left", padx=1)
         mt_btns2 = ttk.Frame(palette_frame)
         mt_btns2.grid(row=3, column=0, columnspan=2, sticky="ew")
-        for txt, cmd in (("From repo…", self._metatile_from_repo),
-                         ("Rename…", self._metatile_rename),
-                         ("Trim unused", self._metatile_remove_unused)):
+        for txt, cmd in (("Import PNG…", self._metatile_import_png),
+                         ("Save to Repo", self._metatile_save_to_repository),
+                         ("Rename…", self._metatile_rename)):
             ttk.Button(mt_btns2, text=txt, width=11, command=cmd).pack(side="left", padx=1)
+        mt_btns3 = ttk.Frame(palette_frame)
+        mt_btns3.grid(row=4, column=0, columnspan=2, sticky="ew")
+        for txt, cmd in (("Repository…", self._metatile_from_repo),
+                         ("Delete", self._metatile_delete_selected),
+                         ("Trim unused", self._metatile_remove_unused)):
+            ttk.Button(mt_btns3, text=txt, width=11, command=cmd).pack(side="left", padx=1)
 
         self.level_frame = ttk.LabelFrame(body, text="Working stage", padding=6)
         self.level_frame.grid(row=0, column=1, sticky="nsew")
@@ -357,9 +388,18 @@ class LevelEditor(tk.Tk):
         self.wd_list.pack(fill="x")
         self.wd_list.bind("<<ListboxSelect>>", self._on_wave_def_select)
         wd_btns = ttk.Frame(self.wave_frame)
-        wd_btns.pack(fill="x", pady=(2, 6))
-        ttk.Button(wd_btns, text="Add def", command=self._add_wave_def).pack(side="left")
-        ttk.Button(wd_btns, text="Delete def", command=self._delete_wave_def).pack(side="left", padx=(4, 0))
+        wd_btns.pack(fill="x", pady=(2, 2))
+        ttk.Button(wd_btns, text="New", width=8, command=self._add_wave_def).pack(side="left")
+        ttk.Button(wd_btns, text="Duplicate", width=9,
+                   command=self._duplicate_wave_def).pack(side="left", padx=(3, 0))
+        ttk.Button(wd_btns, text="Delete", width=8,
+                   command=self._delete_wave_def).pack(side="left", padx=(3, 0))
+        wd_btns2 = ttk.Frame(self.wave_frame)
+        wd_btns2.pack(fill="x", pady=(0, 6))
+        ttk.Button(wd_btns2, text="Add from Library…", width=17,
+                   command=self._wave_library_dialog).pack(side="left")
+        ttk.Button(wd_btns2, text="Save to Library", width=15,
+                   command=self._wave_def_save_to_library).pack(side="left", padx=(3, 0))
 
         form = ttk.Frame(self.wave_frame)
         form.pack(fill="x")
@@ -377,7 +417,7 @@ class LevelEditor(tk.Tk):
                     textvariable=self.wd_count_var).grid(row=3, column=1, sticky="w")
         ttk.Label(form, text="Spawn interval").grid(row=4, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.wd_interval_var, width=8).grid(row=4, column=1, sticky="w")
-        ttk.Button(form, text="Apply to def", command=self._apply_wave_def_form).grid(
+        ttk.Button(form, text="Apply changes", command=self._apply_wave_def_form).grid(
             row=5, column=1, sticky="e", pady=(4, 0))
         form.columnconfigure(1, weight=1)
 
@@ -459,11 +499,11 @@ class LevelEditor(tk.Tk):
         c.delete("viewport")
         y0 = self.viewport_top * CHAR_SIZE
         y1 = (self.viewport_top + VIEWPORT_ROWS) * CHAR_SIZE
-        # faint fill band
-        c.create_rectangle(0, y0, LEVEL_WIDTH, y1, outline="", fill=VIEWPORT_EDGE,
-                           stipple="gray12", tags="viewport")
-        for yy in (y0, y1):
-            c.create_line(0, yy, LEVEL_WIDTH, yy, fill=VIEWPORT_EDGE, width=1, tags="viewport")
+        # Outline ONLY - a transparent aperture so the terrain underneath stays
+        # readable. Blue rectangle around the exact 23-logical-row gameplay
+        # aperture (geometry unchanged); no fill / tint.
+        c.create_rectangle(0, y0, LEVEL_WIDTH - 1, y1, outline=VIEWPORT_EDGE,
+                           fill="", width=2, tags="viewport")
         # top edge = the wave activation line (SCROLL_ROW == worldRow)
         c.create_line(0, y0, LEVEL_WIDTH, y0, fill=VIEWPORT_ACTIVATION, width=2, tags="viewport")
         c.create_text(3, y0 + 2, anchor="nw", fill=VIEWPORT_ACTIVATION,
@@ -480,9 +520,8 @@ class LevelEditor(tk.Tk):
         return C64_COLOURS[(p["background"], p["multicolour1"], p["multicolour2"], p["character"])[pair]]
 
     def _glyph_bitmap(self, code):
-        base = 160
         glyphs = self.project.tileset["glyphs"]
-        idx = code - base
+        idx = code - TERRAIN_GLYPH_BASE
         if 0 <= idx < len(glyphs):
             return glyphs[idx]
         raise ValueError(f"No terrain glyph bitmap for character {code} in this level's tileset")
@@ -642,6 +681,80 @@ class LevelEditor(tk.Tk):
         self._push_undo(before)
         self._refresh_all()
 
+    def _metatile_duplicate_selected(self):
+        """Deep-copy the selected level metatile as a new, independent metatile
+        (NAME_COPY / NAME_COPY_2 ...). Existing metatile IDs and every painted
+        map cell are unchanged; the copy takes the next free ID and is selected.
+        Repacks through the normal path and enforces the 128-glyph budget."""
+        ensure_level_metatile_set(self.project)
+        idx = self.selected_tile
+        if not 0 <= idx < len(self.project.level_metatile_set):
+            return
+        if self._metatile_count() >= METATILE_CAPACITY:
+            self.bell()
+            self.status_text.set(
+                f"This level already has {METATILE_CAPACITY} metatiles (the vocabulary limit).")
+            return
+        before = self._project_state()
+        try:
+            new_idx = duplicate_metatile(self.project, idx)
+        except ProjectValidationError as exc:
+            messagebox.showerror("Duplicate metatile", str(exc), parent=self)
+            return
+        if not self._repack_after_metatile_edit():
+            self.project.level_metatile_set.pop()
+            return
+        self.selected_tile = new_idx
+        self._push_undo(before)
+        self._refresh_all()
+        self.status_text.set(
+            f"Duplicated metatile {idx} -> {new_idx} "
+            f"'{self.project.level_metatile_set[new_idx]['name']}' (independent copy).")
+
+    def _metatile_save_to_repository(self):
+        """Snapshot the selected level metatile into the Terrain Asset
+        Repository. The repository copy and the level copy are independent
+        thereafter - editing/renaming/deleting either never touches the other."""
+        ensure_level_metatile_set(self.project)
+        idx = self.selected_tile
+        if not 0 <= idx < len(self.project.level_metatile_set):
+            return
+        entry = self.project.level_metatile_set[idx]
+        default = entry.get("name") or f"M{idx}"
+        name = simpledialog.askstring(
+            "Save to Terrain Repository",
+            f"Repository asset name for level metatile {idx}:",
+            initialvalue=default, parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror("Save to Repository", "Name cannot be empty.", parent=self)
+            return
+        clash = [a for a in self.repository.list() if a["name"] == name]
+        if clash and not messagebox.askyesno(
+                "Duplicate name",
+                f"The repository already has an asset called '{name}' ({clash[0]['id']}).\n\n"
+                f"Names are labels only - a new, independent asset with its own id "
+                f"will be created. Continue?", parent=self):
+            return
+        prov = {"sourcePack": f"promoted from level '{self.project.name}' metatile {idx} ({default})"}
+        src = entry.get("source") or {}
+        src_prov = src.get("provenance") or {}
+        if src_prov.get("sourcePack"):
+            prov["licenceNote"] = f"original artwork source: {src_prov['sourcePack']}"
+        try:
+            asset = self.repository.add_asset(
+                name, [row[:] for row in entry["native"]["pixels"]],
+                provenance=prov, tags=["from-level"])
+            self.repository.save()
+        except Exception as exc:                          # noqa: BLE001
+            messagebox.showerror("Save to Repository", str(exc), parent=self)
+            return
+        self.status_text.set(
+            f"Saved metatile {idx} '{default}' to the terrain repository as "
+            f"{asset['id']} '{name}' (independent snapshot).")
+
     def _metatile_edit_workshop(self):
         idx = self.selected_tile
         ensure_level_metatile_set(self.project)
@@ -654,7 +767,8 @@ class LevelEditor(tk.Tk):
             self.project.level_metatile_set[idx] = metatile_set_entry_from_native(
                 pixels, name=name, source=entry.get("source"))
             if not self._repack_after_metatile_edit():
-                return "This metatile would push the level past 64 unique terrain glyphs."
+                return (f"This metatile would push the level past {TERRAIN_GLYPH_NAMESPACE} "
+                        f"unique terrain glyphs.")
             self._push_undo(before)
             self._refresh_all()
             return None
@@ -665,65 +779,116 @@ class LevelEditor(tk.Tk):
             cost_fn=lambda px: metatile_set_glyph_cost(self.project, candidate_pixels=px),
             on_save=on_save)
 
+    def _import_session_pick(self, rgb_rows, provenance, dialog):
+        """One tile chosen from the persistent import session -> open the
+        Workshop. The import dialog is hidden (not destroyed) so 'Back to
+        Source' can return to it without re-reading the PNG."""
+        from terrain_convert import source_tile_to_native
+        native = source_tile_to_native(rgb_rows, self.project.palette)
+        before = self._project_state()
+        dialog.hide()
+
+        def on_save(name, pixels):
+            if self._metatile_count() >= 64:
+                return "This level already has 64 metatiles."
+            ensure_level_metatile_set(self.project)
+            self.project.level_metatile_set.append(metatile_set_entry_from_native(
+                pixels, name=name, source={"provenance": provenance}))
+            if not self._repack_after_metatile_edit():
+                self.project.level_metatile_set.pop()
+                return (f"Adding this metatile would exceed the {TERRAIN_GLYPH_NAMESPACE}-glyph "
+                        f"terrain budget.")
+            self.selected_tile = self._metatile_count() - 1
+            self._push_undo(before)
+            self._refresh_all()
+            return None
+
+        def repo_save(name, pixels):
+            try:
+                self.repository.add_asset(name, pixels, provenance=provenance)
+                self.repository.save()
+            except Exception as exc:                       # noqa: BLE001
+                return str(exc)
+            return None
+
+        WorkshopDialog(
+            self, self.project.palette, title="Workshop — imported source tile",
+            name="imported", pixels=native, source_rgb=rgb_rows,
+            cost_fn=lambda px: metatile_set_glyph_cost(self.project, candidate_pixels=px),
+            on_save=on_save, allow_repo_save=repo_save,
+            on_back=self._reopen_import_session)
+
+    def _reopen_import_session(self):
+        if self._import_dialog is not None and self._import_dialog.winfo_exists():
+            self._import_dialog.show()
+        else:
+            self._metatile_import_png()
+
+    def _close_import_session(self):
+        if self._import_dialog is not None:
+            try:
+                self._import_dialog.destroy()
+            except Exception:                              # noqa: BLE001
+                pass
+        self._import_dialog = None
+
     def _metatile_import_png(self):
-        def on_pick(rgb_rows, provenance):
-            native = None
-            from terrain_convert import source_tile_to_native
-            native = source_tile_to_native(rgb_rows, self.project.palette)
-            before = self._project_state()
-
-            def on_save(name, pixels):
-                if self._metatile_count() >= 64:
-                    return "This level already has 64 metatiles."
-                ensure_level_metatile_set(self.project)
-                self.project.level_metatile_set.append(metatile_set_entry_from_native(
-                    pixels, name=name, source={"provenance": provenance}))
-                if not self._repack_after_metatile_edit():
-                    self.project.level_metatile_set.pop()
-                    return "Adding this metatile would exceed the 64-glyph terrain budget."
-                self.selected_tile = self._metatile_count() - 1
-                self._push_undo(before)
-                self._refresh_all()
-                return None
-
-            def repo_save(name, pixels):
-                try:
-                    self.repository.add_asset(name, pixels, provenance=provenance)
-                    self.repository.save()
-                except Exception as exc:                  # noqa: BLE001
-                    return str(exc)
-                return None
-
-            WorkshopDialog(self, self.project.palette, title="Workshop — imported source tile",
-                           name="imported", pixels=native, source_rgb=rgb_rows,
-                           cost_fn=lambda px: metatile_set_glyph_cost(self.project, candidate_pixels=px),
-                           on_save=on_save, allow_repo_save=repo_save)
-
-        ImportDialog(self, on_pick=on_pick, initial_dir=str(self.repo_root))
+        # Reuse the live session if one is already open (Back to Source / re-invoke).
+        if self._import_dialog is not None and self._import_dialog.winfo_exists():
+            self._import_dialog.show()
+            return
+        prev = self._import_dialog
+        sheet = prev.sheet if prev is not None else None
+        select_index = prev.last_index if prev is not None else None
+        self._import_dialog = ImportDialog(
+            self, on_pick=self._import_session_pick, initial_dir=str(self.repo_root),
+            sheet=sheet, select_index=select_index)
+        self._import_dialog.protocol("WM_DELETE_WINDOW", self._close_import_session)
+        self._import_dialog.show()
 
     def _metatile_from_repo(self):
-        if not len(self.repository):
-            messagebox.showinfo("Terrain repository",
-                                "The terrain repository is empty. Import a source tile first.",
-                                parent=self)
-            return
+        """Terrain Asset Repository manager: add a snapshot to the level, and
+        rename / delete individual repository assets. Repository assets and
+        level metatiles are separate snapshot-based concepts: renaming or
+        deleting a repository asset never touches metatiles already copied into
+        any level package."""
         picker = tk.Toplevel(self)
-        picker.title("Add metatile from repository")
+        picker.title("Terrain Asset Repository")
         picker.transient(self)
-        lb = tk.Listbox(picker, width=44, height=14)
-        lb.pack(fill="both", expand=True, padx=8, pady=8)
-        assets = self.repository.list()
-        for a in assets:
-            lb.insert("end", f"{a['id']}  {a['name']}")
+        picker.grab_set()
+        ttk.Label(picker, text="Repository assets (snapshots; independent of level metatiles)",
+                  padding=(8, 8, 8, 2)).pack(anchor="w")
+        lb = tk.Listbox(picker, width=48, height=14, exportselection=False)
+        lb.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        state = {"assets": []}
+
+        def refresh(select_id=None):
+            state["assets"] = self.repository.list()
+            lb.delete(0, "end")
+            for a in state["assets"]:
+                used = sum(1 for e in (self.project.level_metatile_set or [])
+                           if (e.get("source") or {}).get("repositoryAssetId") == a["id"])
+                tag = f"  · in this level x{used}" if used else ""
+                lb.insert("end", f"{a['id']}  {a['name']}{tag}")
+            if select_id is not None:
+                for i, a in enumerate(state["assets"]):
+                    if a["id"] == select_id:
+                        lb.selection_set(i)
+                        lb.see(i)
+                        break
+
+        def selected():
+            sel = lb.curselection()
+            return state["assets"][sel[0]] if sel else None
 
         def add():
-            sel = lb.curselection()
-            if not sel:
+            asset = selected()
+            if asset is None:
                 return
             if self._metatile_count() >= 64:
                 messagebox.showerror("Full", "This level already has 64 metatiles.", parent=picker)
                 return
-            asset = assets[sel[0]]
             snap = self.repository.snapshot(asset["id"])
             before = self._project_state()
             ensure_level_metatile_set(self.project)
@@ -739,7 +904,171 @@ class LevelEditor(tk.Tk):
             self._refresh_all()
             picker.destroy()
 
-        ttk.Button(picker, text="Add snapshot to level", command=add).pack(pady=(0, 8))
+        def rename():
+            asset = selected()
+            if asset is None:
+                return
+            new = simpledialog.askstring("Rename repository asset",
+                                         f"New name for {asset['id']}:",
+                                         initialvalue=asset["name"], parent=picker)
+            if new is None:
+                return
+            new = new.strip()
+            if not new:
+                messagebox.showerror("Rename", "Name cannot be empty.", parent=picker)
+                return
+            if new == asset["name"]:
+                return
+            dupes = [a["name"] for a in state["assets"] if a["id"] != asset["id"]]
+            if new in dupes and not messagebox.askyesno(
+                    "Duplicate name",
+                    f"Another repository asset is already called '{new}'. "
+                    f"Names are labels only ({asset['id']} stays the identity). Use it anyway?",
+                    parent=picker):
+                return
+            try:
+                self.repository.update_asset(asset["id"], name=new)   # artwork/id unchanged
+                self.repository.save()
+            except Exception as exc:                       # noqa: BLE001
+                messagebox.showerror("Rename", str(exc), parent=picker)
+                return
+            refresh(select_id=asset["id"])
+
+        def delete():
+            asset = selected()
+            if asset is None:
+                return
+            used = sum(1 for e in (self.project.level_metatile_set or [])
+                       if (e.get("source") or {}).get("repositoryAssetId") == asset["id"])
+            msg = (f"Delete repository asset {asset['id']} ('{asset['name']}')?\n\n"
+                   "The reusable repository copy is removed. Metatiles already "
+                   "copied into level packages are independent snapshots and are "
+                   "NOT changed.")
+            if used:
+                msg += f"\n\n(This level currently uses {used} snapshot(s) of it - unaffected.)"
+            if not messagebox.askyesno("Delete repository asset", msg, parent=picker):
+                return
+            row = lb.curselection()[0]
+            self.repository.remove(asset["id"])
+            self.repository.save()
+            refresh()
+            n = lb.size()
+            if n:
+                lb.selection_set(min(row, n - 1))
+
+        def edit_asset():
+            asset = selected()
+            if asset is None:
+                return
+
+            def on_save(name, pixels):
+                try:
+                    self.repository.update_asset(asset["id"], name=name, native_pixels=pixels)
+                    self.repository.save()
+                except Exception as exc:                   # noqa: BLE001
+                    return str(exc)
+                refresh(select_id=asset["id"])
+                return None
+
+            WorkshopDialog(
+                picker, self.project.palette,
+                title=f"Edit repository asset {asset['id']} ({asset['name']})",
+                name=asset["name"], pixels=asset["native"]["pixels"],
+                cost_fn=None, on_save=on_save)
+
+        def import_from_project():
+            path = filedialog.askopenfilename(
+                title="Import metatiles from another project (V4/V5 level JSON)",
+                initialdir=self.levels_dir, parent=picker,
+                filetypes=(("Level JSON", "*.json"), ("All files", "*.*")))
+            if not path:
+                return
+            try:
+                src = load_project(path, default_tileset=self._baseline_tileset())
+            except (OSError, ProjectValidationError) as exc:
+                messagebox.showerror("Import from project", f"Cannot read that project:\n{exc}",
+                                     parent=picker)
+                return
+            entries = ensure_level_metatile_set(src)
+            if not entries:
+                messagebox.showinfo("Import from project",
+                                    "That project defines no metatiles.", parent=picker)
+                return
+            self._import_project_metatiles_dialog(picker, src, entries, refresh)
+
+        def recover_generated():
+            before = len(self.repository)
+            res = recover_generated_set(self.repository)
+            if res["added"]:
+                self.repository.save()
+            refresh()
+            messagebox.showinfo(
+                "Recover generated terrain set",
+                f"Generated set: {res['generated']} native metatiles.\n"
+                f"Repository: {before} -> {len(self.repository)} assets.\n"
+                f"Added {len(res['added'])}; {len(res['existing'])} identical asset(s) "
+                f"already present were left untouched.", parent=picker)
+
+        btns = ttk.Frame(picker)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Add snapshot to level", command=add).pack(side="left")
+        ttk.Button(btns, text="Edit asset…", command=edit_asset).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Rename…", command=rename).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Delete", command=delete).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Close", command=picker.destroy).pack(side="right")
+        btns2 = ttk.Frame(picker)
+        btns2.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns2, text="Import from Project…", command=import_from_project).pack(side="left")
+        ttk.Button(btns2, text="Recover generated set", command=recover_generated).pack(
+            side="left", padx=(8, 0))
+        refresh()
+
+    def _import_project_metatiles_dialog(self, parent, src_project, entries, on_done):
+        """Pick metatiles from another project's levelMetatileSet and import them
+        into the Terrain Asset Repository as independent snapshots. The source
+        project is never modified."""
+        dlg = tk.Toplevel(parent)
+        dlg.title(f"Import from '{src_project.name}' ({len(entries)} metatiles)")
+        dlg.transient(parent)
+        dlg.grab_set()
+        ttk.Label(dlg, text=f"{src_project.name}: select metatiles to snapshot into the repository",
+                  padding=(8, 8, 8, 2)).pack(anchor="w")
+        lb = tk.Listbox(dlg, width=44, height=16, selectmode="extended", exportselection=False)
+        lb.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        for i, e in enumerate(entries):
+            lb.insert("end", f"{i:2d}  {e.get('name') or f'M{i}'}")
+
+        def do_import():
+            picks = list(lb.curselection())
+            if not picks:
+                messagebox.showinfo("Import", "Select one or more metatiles first.", parent=dlg)
+                return
+            added = []
+            try:
+                for i in picks:
+                    e = entries[i]
+                    prov = {"sourcePack": f"imported from project '{src_project.name}' "
+                                          f"metatile {i} ({e.get('name') or f'M{i}'})"}
+                    added.append(self.repository.add_asset(
+                        e.get("name") or f"M{i}",
+                        [row[:] for row in e["native"]["pixels"]],
+                        provenance=prov, tags=["imported"])["id"])
+                self.repository.save()
+            except Exception as exc:                        # noqa: BLE001
+                messagebox.showerror("Import failed", str(exc), parent=dlg)
+                return
+            on_done()
+            messagebox.showinfo("Import from project",
+                                f"Imported {len(added)} metatile(s) as new repository assets "
+                                f"({', '.join(added)}).", parent=dlg)
+            dlg.destroy()
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bar, text="Select All",
+                   command=lambda: lb.selection_set(0, "end")).pack(side="left")
+        ttk.Button(bar, text="Import selected", command=do_import).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side="right")
 
     def _metatile_rename(self):
         idx = self.selected_tile
@@ -757,36 +1086,68 @@ class LevelEditor(tk.Tk):
         self._draw_palette()
         self._update_status()
 
-    def _metatile_remove_unused(self):
+    def _metatile_delete_selected(self):
+        """Delete the SELECTED metatile if the map does not reference it,
+        renumbering later definitions and map cells so the painted stage stays
+        visually identical. Rejects deletion of a metatile still in use."""
         ensure_level_metatile_set(self.project)
-        count = len(self.project.level_metatile_set)
-        if count <= 16:
-            messagebox.showinfo("Remove unused",
-                                "Keeping at least the first 16 metatiles (historical IDs).",
+        idx = self.selected_tile
+        if not 0 <= idx < self._metatile_count():
+            return
+        if self._metatile_count() <= 1:
+            messagebox.showinfo("Delete metatile", "A level must keep at least one metatile.",
                                 parent=self)
             return
-        used = self._metatile_row_usage()
-        # Only trailing unused metatiles can be dropped without renumbering the
-        # painted map. Never silently renumber IDs.
-        removable = []
-        for i in range(count - 1, 15, -1):
-            if i in used:
-                break
-            removable.append(i)
-        if not removable:
-            messagebox.showinfo(
-                "Remove unused",
-                "The highest metatile ID is still used by the map. Removing a "
-                "metatile below it would renumber painted cells, which is not done "
-                "automatically. Repaint those cells first.", parent=self)
+        name = self._metatile_name(idx)
+        used = metatile_id_usage(self.project).get(idx, 0)
+        if used:
+            messagebox.showerror(
+                "Metatile in use",
+                f"Metatile {idx} ('{name}') is used by {used} map cell(s). "
+                f"Repaint those cells onto another metatile first, then delete it.",
+                parent=self)
             return
         if not messagebox.askyesno(
-                "Remove unused",
-                f"Remove {len(removable)} trailing unused metatile(s) "
-                f"(IDs {min(removable)}..{max(removable)})?", parent=self):
+                "Delete metatile",
+                f"Delete metatile {idx} ('{name}')?\n\n"
+                f"It is unused. Metatiles above it shift down by one and the "
+                f"painted map is renumbered to match (no visible change).",
+                parent=self):
             return
         before = self._project_state()
-        del self.project.level_metatile_set[min(removable):]
+        try:
+            remove_metatile(self.project, idx)
+        except MetatileInUseError as exc:
+            messagebox.showerror("Metatile in use", str(exc), parent=self)
+            return
+        self._repack_after_metatile_edit()
+        self.selected_tile = max(0, min(idx, self._metatile_count() - 1))
+        self._push_undo(before)
+        self._refresh_all()
+
+    def _metatile_remove_unused(self):
+        """Delete every metatile the map does not reference, from the highest ID
+        down so the renumbering stays stable. Built on remove_metatile()."""
+        ensure_level_metatile_set(self.project)
+        unused = [i for i in range(self._metatile_count())
+                  if not metatile_id_usage(self.project).get(i, 0)]
+        if not unused:
+            messagebox.showinfo("Trim unused", "Every metatile is used by the map.", parent=self)
+            return
+        if self._metatile_count() - len(unused) < 1:
+            unused = unused[1:]                       # always keep at least one
+        if not messagebox.askyesno(
+                "Trim unused",
+                f"Delete {len(unused)} unused metatile(s) (IDs "
+                f"{', '.join(map(str, unused))}) and renumber the map to match?",
+                parent=self):
+            return
+        before = self._project_state()
+        for i in sorted(unused, reverse=True):
+            try:
+                remove_metatile(self.project, i)
+            except (MetatileInUseError, ProjectValidationError):
+                pass
         self._repack_after_metatile_edit()
         self.selected_tile = min(self.selected_tile, self._metatile_count() - 1)
         self._push_undo(before)
@@ -1023,6 +1384,142 @@ class LevelEditor(tk.Tk):
         self._refresh_wave_panel()
         self._draw_wave_triggers()
         self._update_document_ui()
+
+    def _duplicate_wave_def(self):
+        """Deep-copy the selected LOCAL wave definition as a new local definition
+        with a fresh local id. Triggers are unchanged (they still reference the
+        original). The copy is independent of the source."""
+        if self.selected_wave_def is None or not 0 <= self.selected_wave_def < len(self.project.wave_definitions):
+            return
+        src = self.project.wave_definitions[self.selected_wave_def]
+        before = self._project_state()
+        wd = {
+            "id": _next_id("wd", self.project.wave_definitions),
+            "name": f"{src.get('name', src['id'])} copy",
+            "attackId": int(src.get("attackId", 0)),
+            "composition": [dict(c) for c in (src.get("composition") or [{"enemyType": 0, "count": 5}])],
+            "spawnInterval": src.get("spawnInterval"),
+        }
+        self.project.wave_definitions.append(wd)
+        self.selected_wave_def = len(self.project.wave_definitions) - 1
+        self._push_undo(before)
+        self._refresh_wave_panel()
+        self._update_document_ui()
+
+    def _wave_def_save_to_library(self):
+        """Snapshot the selected LOCAL wave definition into the global Wave
+        Definition Repository. Level and library copies are independent
+        thereafter; no `worldRow` (trigger placement) is stored globally."""
+        if self.selected_wave_def is None or not 0 <= self.selected_wave_def < len(self.project.wave_definitions):
+            messagebox.showinfo("Save to Library", "Select a wave definition first.", parent=self)
+            return
+        wd = self.project.wave_definitions[self.selected_wave_def]
+        default = wd.get("name") or wd["id"]
+        name = simpledialog.askstring("Save to Wave Library",
+                                      "Library name for this wave definition:",
+                                      initialvalue=default, parent=self)
+        if name is None:
+            return
+        name = name.strip() or default
+        try:
+            asset = self.wave_repository.add_from_level_definition(wd, name=name, tags=["from-level"])
+            self.wave_repository.save()
+        except WaveRepositoryError as exc:
+            messagebox.showerror("Save to Library", str(exc), parent=self)
+            return
+        self.status_text.set(
+            f"Saved wave definition '{default}' to the library as {asset['id']} '{name}'.")
+
+    def _wave_library_dialog(self):
+        """Global Wave Definition Repository manager: copy a library definition
+        into this level (as an independent local snapshot), rename a library
+        definition, or delete one. Library edits never alter a level's local
+        copies (snapshot semantics)."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Wave Definition Library (global)")
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text="Reusable wave definitions ('what'); no trigger placement stored here",
+                  padding=(8, 8, 8, 2)).pack(anchor="w")
+        lb = tk.Listbox(dlg, width=52, height=14, exportselection=False)
+        lb.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        state = {"defs": []}
+
+        def refresh(select_id=None):
+            state["defs"] = self.wave_repository.list()
+            lb.delete(0, "end")
+            for d in state["defs"]:
+                atk = self.attack_name_by_id.get(int(d["attackId"]), f"attack {d['attackId']}")
+                size = sum(int(c.get("count", 0)) for c in d["composition"])
+                lb.insert("end", f"{d['id']}  {d['name']}  [{atk}]  x{size}")
+            if select_id is not None:
+                for i, d in enumerate(state["defs"]):
+                    if d["id"] == select_id:
+                        lb.selection_set(i)
+                        lb.see(i)
+                        break
+
+        def selected():
+            sel = lb.curselection()
+            return state["defs"][sel[0]] if sel else None
+
+        def copy_to_level():
+            d = selected()
+            if d is None:
+                return
+            local_id = _next_id("wd", self.project.wave_definitions)
+            snap = self.wave_repository.snapshot(d["id"], local_id=local_id)
+            before = self._project_state()
+            self.project.wave_definitions.append(snap)
+            errs = validate_project(self.project)
+            if errs:
+                self.project.wave_definitions.pop()
+                messagebox.showerror("Add from Library", "\n".join(errs), parent=dlg)
+                return
+            self.selected_wave_def = len(self.project.wave_definitions) - 1
+            self._push_undo(before)
+            self._refresh_wave_panel()
+            self._update_document_ui()
+            self.status_text.set(
+                f"Copied library wave '{d['name']}' into the level as local def {local_id}.")
+
+        def rename():
+            d = selected()
+            if d is None:
+                return
+            new = simpledialog.askstring("Rename library wave", f"New name for {d['id']}:",
+                                         initialvalue=d["name"], parent=dlg)
+            if not new or not new.strip() or new.strip() == d["name"]:
+                return
+            try:
+                self.wave_repository.update_definition(d["id"], name=new.strip())
+                self.wave_repository.save()
+            except WaveRepositoryError as exc:
+                messagebox.showerror("Rename", str(exc), parent=dlg)
+                return
+            refresh(select_id=d["id"])
+
+        def delete():
+            d = selected()
+            if d is None:
+                return
+            if not messagebox.askyesno(
+                    "Delete library wave",
+                    f"Delete library wave definition {d['id']} ('{d['name']}')?\n\n"
+                    "Levels that already copied it keep their own independent "
+                    "local definition - they are NOT affected.", parent=dlg):
+                return
+            self.wave_repository.remove(d["id"])
+            self.wave_repository.save()
+            refresh()
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bar, text="Add to level (snapshot)", command=copy_to_level).pack(side="left")
+        ttk.Button(bar, text="Rename…", command=rename).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Delete", command=delete).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Close", command=dlg.destroy).pack(side="right")
+        refresh()
 
     # ---- wave triggers -------------------------------------------------
     def _trigger_at(self, event):
@@ -1458,6 +1955,7 @@ class LevelEditor(tk.Tk):
 
     def _on_close(self):
         if self._confirm_discard():
+            self._close_import_session()
             self.destroy()
         return "break"
 

@@ -14,10 +14,10 @@
 //   waveTriggerSprite    - WAVE_SPRITE_INDEX seed = enemyType * 8
 //   waveTriggerInterval  - frames between members (def override or attack default)
 // ============================================================================
-.const WAVE_TRIGGER_COUNT = 0
-.var waveTriggerRowLo = List()
-.var waveTriggerRowHi = List()
-.var waveTriggerAttackId = List()
-.var waveTriggerCount = List()
-.var waveTriggerSprite = List()
-.var waveTriggerInterval = List()
+.const WAVE_TRIGGER_COUNT = 16
+.var waveTriggerRowLo = List().add(121, 104, 56, 36, 20, 0, 240, 196, 176, 160, 144, 128, 88, 69, 48, 32)
+.var waveTriggerRowHi = List().add(1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+.var waveTriggerAttackId = List().add(11, 10, 10, 3, 10, 10, 11, 3, 2, 10, 11, 10, 3, 2, 3, 10)
+.var waveTriggerCount = List().add(6, 6, 6, 5, 6, 6, 6, 5, 5, 6, 6, 6, 5, 5, 5, 6)
+.var waveTriggerSprite = List().add(8, 0, 0, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 0, 0)
+.var waveTriggerInterval = List().add(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)

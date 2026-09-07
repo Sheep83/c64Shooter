@@ -83,8 +83,9 @@ def main():
         total = sym['TURRET_TOTAL_CODE']
         rows_len = sym['STAGE_METATILE_ROWS_END'] - sym['stageMetatileRows']
         slr = rows_len // 10 * 4
-        defs = rd('metatileDefs', 256)
-        metatile_defs = [defs[i:i + 16] for i in range(0, 256, 16)]
+        defs_len = sym['METATILE_DEFS_END'] - sym['metatileDefs']   # variable: 1..64 defs
+        defs = rd('metatileDefs', defs_len)
+        metatile_defs = [defs[i:i + 16] for i in range(0, defs_len, 16)]
         raw = rd('stageMetatileRows', rows_len)
         stage_rows = [raw[i:i + 10] for i in range(0, rows_len, 10)]
         a_lo = rd('turretAuthRowLo', total)

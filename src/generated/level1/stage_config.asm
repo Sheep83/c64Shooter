@@ -18,12 +18,12 @@
 // stage_charset.asm); it is declared here so the engine's early glyph-
 // namespace guards resolve before the byte block is imported.
 // ============================================================================
-.const STAGE_METATILE_ROWS     = 100
+.const STAGE_METATILE_ROWS     = 105
 .const SCROLL_FRAME_DIVIDER    = 2
-.const STAGE_METATILE_COUNT   = 17
-.const TERRAIN_BACKGROUND_COLOUR = 0
+.const STAGE_METATILE_COUNT   = 34
+.const TERRAIN_BACKGROUND_COLOUR = 12
 .const TERRAIN_MC_COLOUR_1     = 15
-.const TERRAIN_MC_COLOUR_2     = 12
+.const TERRAIN_MC_COLOUR_2     = 11
 .const TERRAIN_CHARACTER_COLOUR = 1
 .const TERRAIN_COLOUR_RAM      = 8 | TERRAIN_CHARACTER_COLOUR
-.const TERRAIN_GLYPH_COUNT     = 48
+.const TERRAIN_GLYPH_COUNT     = 72

@@ -20,24 +20,28 @@ def main():
     charset = (root/'charset.bin').read_bytes()
     stage = load_metatile_stage(root/'metatiledefs.bin', root/'stagemetatilerows.bin')
     rows = make_row_codes(*stage)
-    # Private HUD glyphs 128..145: space, S, C, O, R, E, digits 0..9, F, R.
+    # Private HUD glyphs HB..HB+17: space, S, C, O, R, E, digits 0..9, F, R.
+    # HB (HUD_GLYPH_BASE) relocated 128 -> 64 when the terrain namespace grew.
+    HB = sym.get('HUD_GLYPH_BASE_CODE', 128)
+    TB = sym.get('TERRAIN_GLYPH_BASE_CODE', 160)
+    TN = sym.get('TERRAIN_GLYPH_NAMESPACE_CODE', 64)
     stock = [32,19,3,15,18,5,48,49,50,51,52,53,54,55,56,57,6,18]
-    HUD_DIGIT = 134
-    FREE_LABEL = [144,145,133,133,128]      # "FREE " private glyphs at columns 28..32.
+    HUD_DIGIT = HB + 6
+    FREE_LABEL = [HB+16, HB+17, HB+5, HB+5, HB+0]  # "FREE " private glyphs at columns 28..32.
     # Fixed row-0 layout: cols 8..12 = live score digits; cols 28..37 = the
     # development FREE counter ("FREE " + five digits). The FREE numeric field is
     # the rolling-minimum diagnostic and only refreshes ~once/second, so its five
     # cells are trusted from screen RAM and validated structurally, not pinned to
     # a value derived from one state snapshot.
-    hud_prefix = [128,128,129,130,131,132,133,128]
+    hud_prefix = [HB+0, HB+0, HB+1, HB+2, HB+3, HB+4, HB+5, HB+0]  # cols 0,1 blank; 2..6 "SCORE"; 7 space
     def hud_row(score, free_region):
         digits = [HUD_DIGIT + int(d) for d in f'{score % 100000:05d}']
-        return bytes(hud_prefix + digits + [128]*15 + list(free_region) + [128]*2)
+        return bytes(hud_prefix + digits + [HB+0]*15 + list(free_region) + [HB+0]*2)
     failures = []
     for i, source in enumerate(stock):
-        if charset[(128+i)*8:(129+i)*8] != charset[source*8:(source+1)*8]:
+        if charset[(HB+i)*8:(HB+i+1)*8] != charset[source*8:(source+1)*8]:
             failures.append(['stock glyph copy', i, source])
-    if set((root/'metatiledefs.bin').read_bytes()) & set(range(128,146)):
+    if set((root/'metatiledefs.bin').read_bytes()) & set(range(HB, HB+18)):
         failures.append(['terrain/HUD charset collision'])
     glyphs = [charset[c*8:(c+1)*8] for c in range(256)]
     # Mixed hires / global-multicolour render model. The playfield runs global
@@ -52,8 +56,9 @@ def main():
     if cfg.hud_cram & 0x08:
         failures.append(['HUD colour RAM is not hires', cfg.hud_cram])
     stage_codes = {code for r in range(stage[2]) for code in rows(r)}
-    if stage_codes - set(range(160, 224)):
-        failures.append(['terrain glyph outside 160..223', sorted(stage_codes - set(range(160, 224)))])
+    terrain_range = set(range(TB, TB + TN))
+    if stage_codes - terrain_range:
+        failures.append([f'terrain glyph outside {TB}..{TB+TN-1}', sorted(stage_codes - terrain_range)])
     terrain_cram_seen = set()
     turrets = 'TURRET_STATE_BEGIN' in sym
     # Turret private glyph code base (relocated out of the 160..223 terrain
@@ -204,12 +209,12 @@ def main():
         score = get('SCORE_LO') + 256*get('SCORE_HI')
         free_region = ram[28:38]                       # "FREE " + five digits, or ten blanks when disabled.
         hud = hud_row(score, free_region)
-        if free_region[0] == 144:                      # FREE counter enabled: validate its structure.
+        if free_region[0] == HB+16:                      # FREE counter enabled: validate its structure.
             if list(free_region[:5]) != FREE_LABEL:
                 failures.append([frame,'FREE label',list(free_region[:5])])
             if not all(HUD_DIGIT <= b <= HUD_DIGIT+9 for b in free_region[5:]):
                 failures.append([frame,'FREE digits not private glyphs',list(free_region[5:])])
-        elif set(free_region) != {128}:
+        elif set(free_region) != {HB+0}:
             failures.append([frame,'FREE area not blank',list(free_region)])
         terrain = bytearray(hud)
         for r in range(1,24):terrain.extend(visual_rows(row+r-1+(1 if finish and r>=13 else 0), slots))
@@ -279,7 +284,7 @@ def main():
         # once per ~PAL second, so on that one frame the screenshot still shows
         # the previous value. They are validated structurally (label + glyph
         # range) above; exclude them from the exact HUD pixel comparison.
-        if free_region[0] == 144:
+        if free_region[0] == HB+16:
             draw.rectangle((33*8, 0, 38*8-1, 7), fill=255)
         # Turret private-glyph cells pulse the fourth multicolour colour; read
         # this frame's pulse value (all turrets pulse in phase). Fall back to the

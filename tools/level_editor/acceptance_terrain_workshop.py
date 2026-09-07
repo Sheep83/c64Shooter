@@ -167,7 +167,8 @@ def main():
                     if l.strip().startswith(".const STAGE_METATILE_COUNT")][0]
             return int(line.split("=", 1)[1].strip())
         n1, n2 = _count(cfg1), _count(cfg2)
-        assert n1 == 17 and n2 == 16, (n1, n2)
+        assert n1 == l1_set_len_before + 1, (n1, l1_set_len_before)
+        assert n2 == len(l2.level_metatile_set), (n2,)
         assert (out1 / "stage_test.asm").read_text() != (out2 / "stage_test.asm").read_text()
         # re-export is deterministic
         p1b = export_level(l1, d / "gen2" / "level1", engine_data=engine)

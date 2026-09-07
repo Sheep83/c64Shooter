@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from engine_data import (                                           # noqa: E402
+from engine_data import (TERRAIN_GLYPH_BASE,                                            # noqa: E402
     ENGINE_MAX_STAGE_ROWS, METATILE_CAPACITY, METATILE_NAMES, load_engine_data,
 )
 from native_metatile import blank_pixels                            # noqa: E402
@@ -36,7 +36,7 @@ def ok(msg):
 ENGINE = load_engine_data(REPO)
 BASE_TILESET = {
     "glyphCount": ENGINE.glyph_count,
-    "glyphs": [list(ENGINE.glyphs[160 + i]) for i in range(ENGINE.glyph_count)],
+    "glyphs": [list(ENGINE.glyphs[TERRAIN_GLYPH_BASE + i]) for i in range(ENGINE.glyph_count)],
     "metatileDefs": [list(m) for m in ENGINE.metatiles],
 }
 
@@ -122,8 +122,14 @@ with tempfile.TemporaryDirectory() as d:
     assert ".const STAGE_METATILE_COUNT   = 20" in (Path(d) / "stage_config.asm").read_text()
 ok("STAGE_METATILE_COUNT is the level's real metatile count (20), no magic 16/64")
 
-# 5. legacy 0..15 metatiles migrate: a V2 file (16 defs) -> V4 with a 16-entry
-#    native set, and the packed tileset is preserved so visuals are unchanged
+# 5. legacy 0..15 metatiles migrate: a formatVersion-2 file (16 defs, glyph codes
+#    at the LEGACY base 160) -> current format with a 16-entry native set. The
+#    glyph BITMAPS are unchanged (identical visuals); the def CODES shift to the
+#    current TERRAIN_GLYPH_BASE (96).
+from engine_data import TERRAIN_GLYPH_BASE_LEGACY                    # noqa: E402
+assert len(BASE_TILESET["metatileDefs"]) >= 16
+_legacy_shift = TERRAIN_GLYPH_BASE_LEGACY - TERRAIN_GLYPH_BASE
+legacy_defs = [[c + _legacy_shift for c in m] for m in BASE_TILESET["metatileDefs"][:16]]
 v2 = {
     "formatVersion": 2, "name": "legacy16", "width": 10, "height": 30,
     "scrollFrameDivider": 2,
@@ -131,32 +137,32 @@ v2 = {
     "metatileRows": [[i % 16 for i in range(10)] for _ in range(30)],
     "tileset": {"glyphCount": BASE_TILESET["glyphCount"],
                 "glyphs": [list(g) for g in BASE_TILESET["glyphs"]],
-                "metatileDefs": [list(m) for m in BASE_TILESET["metatileDefs"]]},
+                "metatileDefs": legacy_defs},
 }
 mp = project_from_dict(v2)
 assert validate_project(mp) == []
 assert mp.level_metatile_set is not None and len(mp.level_metatile_set) == 16
 # names default to the historical METATILE_NAMES
 assert [e["name"] for e in mp.level_metatile_set] == list(METATILE_NAMES)
-# the packed tileset is UNCHANGED (byte-identical) -> identical visuals
-assert mp.tileset["metatileDefs"] == v2["tileset"]["metatileDefs"]
-assert mp.tileset["glyphs"] == v2["tileset"]["glyphs"]
-# and the derived native set re-packs to an equivalent render of the same tiles
+# codes are re-based; glyph bitmaps preserved -> identical rendered tiles
+assert mp.tileset["metatileDefs"] == [list(m) for m in BASE_TILESET["metatileDefs"][:16]]
+assert mp.tileset["glyphs"] == BASE_TILESET["glyphs"]
+assert min(c for m in mp.tileset["metatileDefs"] for c in m) >= TERRAIN_GLYPH_BASE
 re_derived = derive_metatile_set_from_tileset(mp.tileset)
 assert len(re_derived) == 16
-ok("legacy 16-metatile V2 migrates to V4: native set derived, packed tileset byte-identical")
+ok("legacy V2 (base-160 codes) migrates: native set derived, codes re-based, bitmaps preserved")
 
-# 6. round-trip: save a migrated project (now V4) and reload deterministically
+# 6. round-trip: save a migrated project (now current format) and reload deterministically
 with tempfile.TemporaryDirectory() as d:
     a, b = Path(d) / "a.json", Path(d) / "b.json"
     save_project(mp, a)
     reloaded = json.loads(a.read_text())
-    assert reloaded["formatVersion"] == FORMAT_VERSION == 4
+    assert reloaded["formatVersion"] == FORMAT_VERSION
     assert "levelMetatileSet" in reloaded and len(reloaded["levelMetatileSet"]) == 16
     mp2 = project_from_dict(reloaded)
     save_project(mp2, b)
     assert a.read_text() == b.read_text(), "migrated project save is not deterministic"
-ok("migrated project saves as V4 and re-saves byte-identically (deterministic)")
+ok("migrated project saves at the current formatVersion and re-saves byte-identically")
 
 # 7. editor MAX_STAGE_ROWS is the recalculated 768 (64-metatile worst case)
 assert ENGINE_MAX_STAGE_ROWS == 768 == MAX_STAGE_ROWS

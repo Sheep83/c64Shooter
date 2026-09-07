@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from engine_data import TURRET_POOL, load_engine_data                    # noqa: E402
+from engine_data import TERRAIN_GLYPH_BASE, TURRET_POOL, load_engine_data  # noqa: E402
 from ka_export import render_stage_turrets, export_project               # noqa: E402
 from project import (                                                    # noqa: E402
     MAX_TURRETS, LevelProject, export_readiness_errors, iter_turrets,
@@ -37,7 +37,7 @@ def fail(msg):
 def _baseline_tileset():
     d = load_engine_data(REPO)
     return {"glyphCount": d.glyph_count,
-            "glyphs": [list(d.glyphs[160 + i]) for i in range(d.glyph_count)],
+            "glyphs": [list(d.glyphs[TERRAIN_GLYPH_BASE + i]) for i in range(d.glyph_count)],
             "metatileDefs": [list(m) for m in d.metatiles]}
 
 

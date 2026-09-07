@@ -29,9 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def real_metatile_defs():
-    # The 16-tile tileset from the live generated stage (its metatileDefs block
-    # is the real, engine-consumed tileset). run_stage_fixture.sh backs up and
-    # restores the generated files around the fixture run.
+    # The real, engine-consumed tileset from the live generated stage. However
+    # many metatile defs the committed Level 1 currently ships (>= 1, each 16
+    # bytes) - run_stage_fixture.sh backs up and restores the generated files
+    # around the fixture run.
     text = (ROOT / 'src' / 'generated' / 'level1' / 'stage_test.asm').read_text(encoding='utf-8')
     block = text.split('metatileDefs:', 1)[1].split('METATILE_DEFS_END', 1)[0]
     rows = []
@@ -40,7 +41,7 @@ def real_metatile_defs():
         nums = re.findall(r'\d+', line)
         if nums:
             rows.append([int(n) for n in nums])
-    assert len(rows) == BASE_DEF_COUNT, f'expected {BASE_DEF_COUNT} metatile defs, got {len(rows)}'
+    assert 1 <= len(rows) <= 64, f'expected 1..64 metatile defs, got {len(rows)}'
     for r in rows:
         assert len(r) == 16, f'metatile def is not 16 bytes: {r}'
     return rows
@@ -48,14 +49,13 @@ def real_metatile_defs():
 
 def metatile_defs(def_count):
     defs = real_metatile_defs()
-    if def_count <= BASE_DEF_COUNT:
+    if def_count <= len(defs):
         return defs[:def_count]
-    # Synthesise defs 16..def_count-1 from the glyph codes the real defs use, so
-    # every byte stays a valid terrain glyph code. Each synthetic def is a
-    # distinct rotation/permutation so a wrong (truncated) id decodes visibly
-    # wrong bytes.
+    # Synthesise the extra defs from the glyph codes the real defs use, so every
+    # byte stays a valid terrain glyph code. Each synthetic def is a distinct
+    # rotation/permutation so a wrong (truncated) id decodes visibly wrong bytes.
     pool = sorted({b for d in defs for b in d})
-    for i in range(BASE_DEF_COUNT, def_count):
+    for i in range(len(defs), def_count):
         d = [pool[(i * 7 + k * 13 + (k // 4) * 3) % len(pool)] for k in range(16)]
         defs.append(d)
     return defs

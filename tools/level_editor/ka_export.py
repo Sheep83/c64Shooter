@@ -104,9 +104,9 @@ def render_stage_config(project):
 
 
 def render_stage_charset(project):
-    """The level's own terrain glyph bitmaps. This is the swappable 512-byte
-    tileset unit: char codes TERRAIN_GLYPH_BASE .. TERRAIN_GLYPH_BASE+COUNT-1
-    ($3D00..). A future multiload transition replaces exactly this block."""
+    """The level's own terrain glyph bitmaps. This is the swappable tileset unit
+    (up to 1024 bytes): char codes TERRAIN_GLYPH_BASE .. TERRAIN_GLYPH_BASE+COUNT-1
+    ($3B00..). A future multiload transition replaces exactly this block."""
     _require_valid(project)
     if not project.tileset:
         raise ProjectValidationError("Level has no tileset; cannot render stage_charset.asm.")
@@ -118,10 +118,11 @@ def render_stage_charset(project):
         f"// Level: {project.name}",
         "//",
         "// LEVEL-OWNED terrain glyph bitmaps - the swappable tileset unit. Codes",
-        "// 160..223 are the permanent terrain glyph namespace ($3D00-$3EFF, 64",
-        f"// slots); this level authors the first {count}. initBackground copies",
-        "// TERRAIN_GLYPH_COUNT glyphs (declared in stage_config.asm) to $3D00.",
-        "// A future multiload transition replaces exactly this byte block.",
+        f"// {TERRAIN_GLYPH_BASE}..223 are the permanent terrain glyph namespace",
+        f"// ($3B00-$3EFF, 128 slots); this level authors the first {count}.",
+        "// initBackground copies TERRAIN_GLYPH_COUNT glyphs (declared in",
+        "// stage_config.asm) to $3B00. A future multiload transition replaces",
+        "// exactly this byte block.",
         "// ============================================================================",
         "terrainGlyphs:",
     ]
