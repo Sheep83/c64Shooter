@@ -23,6 +23,26 @@
 .const ENEMY_BULLET_SPEED_Y = 3              // Fixed downward speed; X is quantised to a smooth -2..+2 slope.
 .const ENEMY_BULLET_COLOUR = 7               // Yellow individual sprite colour for the first projectile pass.
 
+// ---------------------------------------------------------------------------
+// Calmer normal-scrolling encounter budget (gameplay policy, NOT a renderer
+// limit - see docs/encounter-budget-worklog.md). The multiplexer, MAX_OBJECTS
+// and MAX_ENEMY_BULLETS are unchanged; these only shape what the normal
+// scrolling wave director / enemy-fire selector are allowed to put on screen.
+// Future non-scrolling boss/set-piece encounters can raise or ignore them.
+.const NORMAL_WAVE_SIZE       = 5            // EVERY normal scrolling wave is exactly this many enemies.
+                                              // Atomic: turret/object pressure never truncates a wave to
+                                              // 1..4; it can only defer the START of the next wave.
+                                              // (attackEnemyCount keeps its authored values; a build guard
+                                              // asserts every attack has >= NORMAL_WAVE_SIZE members.)
+.const NORMAL_SHOOTER_BUDGET  = 2            // Max DISTINCT mobile enemies that may become shooters.
+.const TURRET_SHOOTER_BUDGET  = 1            // ... while a turret is in its meaningful combat window.
+.const TURRET_PRESSURE_MAX_Y  = 180          // Turret screen Y AT/ABOVE which it stops throttling normal
+                                              // waves and stops reducing the shooter budget. Y < 180 =>
+                                              // pressure; Y >= 180 => no pressure. Turret keeps firing /
+                                              // colliding / taking damage normally regardless.
+.const ENEMY_SHOOTER_SLOTS    = 2            // Physical size of the designated-shooter id list (>= both budgets).
+.const POLICY_DIAG            = 1            // 1 = compile the raw development policy counters (no HUD, no decimal).
+
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
@@ -86,6 +106,11 @@
     .error "TERRAIN_COLOUR_RAM must be a multicolour colour-RAM value 8..15"
 }
 .const SCROLL_FRAME_DIVIDER = 2                     // Fine scroll advances 1px every N real frames.
+                                                     // 2 is the intended gameplay value: human testing found
+                                                     // divider 1 so fast that background turrets sink past a
+                                                     // useful firing position before they arm. Divider 1 is
+                                                     // retained as an explicit stress-test config only. Same
+                                                     // algorithm; fine/coarse semantics unchanged.
 .const BG_COARSE_LATEST_START = 184                // Exclusive; no remaining sprite batches may interrupt the copy.
 
 // 4x4 character metatile stage (stage_test.asm): a metatile stage row is
@@ -379,6 +404,7 @@ startGame:
     sta ENEMY_BULLET_COUNT                  // No hostile projectiles exist at game start.
     lda #ENEMY_FIRE_INTERVAL
     sta ENEMY_FIRE_TIMER                    // Give the opening wave a short grace period before the first shot.
+    jsr initEncounterPolicy                 // Reset the calmer-encounter shooter list / turret mode / counters.
 
     lda #1                                  // Load A from #1.
     sta OBJECT_ACTIVE                       // Object 0 = player
@@ -441,6 +467,7 @@ gameLoop:
 !frameLoop:
     jsr positionBackgroundTurrets           // Presented world coordinates for this frame's hitscan.
     jsr pulseTurretColour                   // Static-turret fourth-colour pulse; turret colour RAM only.
+    jsr updateTurretPressure                // Set TURRET_PRESSURE_ACTIVE from fresh TURRET_VISIBLE/HEALTH/Y.
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
     jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
@@ -1994,6 +2021,9 @@ updateEnemyFire:
     cmp #MAX_ENEMY_BULLETS
     bcs !done+
 
+    jsr refreshShooterBudget               // Set ENEMY_SHOOTER_BUDGET (normal 2 / turret-active 1) and
+                                            // drop designated-shooter ids whose enemy has left.
+
     lda CIA1_TIMER_A_LO                     // Cheap changing seed is sufficient for choosing a shooter.
     and #%00001111                          // Restrict candidate logical index to 0..15.
     bne !haveStart+
@@ -2019,6 +2049,9 @@ updateEnemyFire:
     bcc !next+
     cmp #190
     bcs !next+
+
+    jsr shooterEligible                     // Designated-shooter budget: distinct mobile shooters this
+    bcc !next+                              // encounter are limited (2 normal / 1 turret-active).
 
     stx ENEMY_FIRE_SOURCE                   // Preserve shooter while the allocator searches for a bullet slot.
     jsr spawnEnemyBullet
@@ -3716,8 +3749,12 @@ startRandomWave:
     lda attackSpriteStart,y                 // Read this attack's first visual-sequence entry.
     sta WAVE_SPRITE_INDEX                   // Seed sprite/colour selection for its first member.
 
-    lda attackEnemyCount,y                  // Read number of enemies in this attack.
-    sta WAVE_ENEMY_COUNT                    // Store target number of successful spawns.
+    // Normal scrolling waves are ALWAYS exactly NORMAL_WAVE_SIZE enemies. The
+    // authored attackEnemyCount[y] is left for future boss/set-piece directors;
+    // a compile-time guard (near the attack tables) asserts every attack has at
+    // least NORMAL_WAVE_SIZE members so this never reads past a formation's data.
+    lda #NORMAL_WAVE_SIZE
+    sta WAVE_ENEMY_COUNT                    // Target number of successful spawns for this wave.
 
     lda attackInterval,y                    // Read frames between attack members.
     sta WAVE_SPAWN_INTERVAL                 // Preserve interval for each timer reload.
@@ -3847,15 +3884,34 @@ spawnEnemy:
 updateSpawner:
     lda WAVE_SPAWNED                        // Read how many members of this formation have spawned.
     cmp WAVE_ENEMY_COUNT                    // Compare against the current attack's requested count.
-    bcc !waveActive+                        // Carry clear means this attack still has members to spawn.
+    bcc !waveActive+                        // Carry clear: this wave is mid-flight -> ALWAYS keep spawning
+                                            // it (atomic). Turret pressure never truncates it.
 
-    lda WAVE_GAP_TIMER                      // Attack is complete: read inter-attack delay.
-    beq !startNext+                         // Zero means the director may choose another attack now.
+    lda WAVE_GAP_TIMER                      // Wave complete: read inter-attack delay.
+    beq !mayStart+                          // Zero means the gap has elapsed.
     dec WAVE_GAP_TIMER                      // Consume one frame of breathing room between attacks.
     bne !done+                              // Keep waiting while any gap remains.
 
+!mayStart:
+    // Whole-wave gate: while a turret is exerting encounter pressure, hold the
+    // START of the next full five-enemy wave rather than dribbling out a partial
+    // one. Nothing is despawned; WAVE_SPAWNED stays 0 for the not-yet-started
+    // wave; the next complete wave begins once pressure clears (turret Y >= 180
+    // or the turret dies / leaves).
+    lda TURRET_PRESSURE_ACTIVE
+    beq !startNext+
+.if (POLICY_DIAG == 1) {
+    inc WAVE_START_DEFERRED
+    bne !startDeferNoted+
+    inc WAVE_START_DEFERRED + 1
+!startDeferNoted:
+}
+    lda #1
+    sta WAVE_GAP_TIMER                      // Re-check next frame; do not call startRandomWave.
+    rts
+
 !startNext:
-    jsr startRandomWave                     // Choose a fresh curated attack.
+    jsr startRandomWave                     // Choose a fresh curated attack (WAVE_ENEMY_COUNT = 5).
 
 !waveActive:
     lda SPAWN_TIMER                         // Read frames remaining until the next formation member.
@@ -4584,6 +4640,16 @@ randomAttackMap:
     }
     .if ((attackSpriteStartData.get(i) + attackEnemyCountData.get(i)) > ENEMY_SPRITE_SEQUENCE_LEN) {
         .error "attack " + toIntString(i) + " sprite window runs past enemySpriteSequence"
+    }
+    // Normal scrolling forces WAVE_ENEMY_COUNT = NORMAL_WAVE_SIZE for every
+    // attack, so each attack must have at least that many authored members and
+    // its visual window must hold that many entries - otherwise a normal wave
+    // would read past the formation's data.
+    .if (attackEnemyCountData.get(i) < NORMAL_WAVE_SIZE) {
+        .error "attack " + toIntString(i) + " has fewer than NORMAL_WAVE_SIZE authored members"
+    }
+    .if ((attackSpriteStartData.get(i) + NORMAL_WAVE_SIZE) > ENEMY_SPRITE_SEQUENCE_LEN) {
+        .error "attack " + toIntString(i) + " visual window cannot hold NORMAL_WAVE_SIZE members"
     }
 }
 
@@ -5580,6 +5646,207 @@ SUPPRESS_THIS_FRAME:    .byte 0   // Nonzero if a projectile was suppressed this
 SUPPRESS_PRE_DEFER:     .byte 0   // BG_COARSE_DEFERRED snapshot taken just before prepareBackgroundCoarse.
 SUPPRESS_STATE_END:
 
+// ===========================================================================
+// Calmer normal-scrolling encounter budget
+// ===========================================================================
+// Gameplay policy only. Nothing here touches the renderer, the scheduler, the
+// coarse-scroll gate, BUILD/LIVE, turret rendering/HP/pulse/aim or the
+// projectile cap. It fixes (a) normal wave size at exactly NORMAL_WAVE_SIZE,
+// (b) how many DISTINCT mobile enemies may become shooters, and (c) whether the
+// START of the next full wave is held while a turret is in its combat window.
+
+// Declared unconditionally (KickAssembler .if {} blocks are a local scope, so
+// labels inside one are invisible to code inside another). POLICY_DIAG only
+// gates the few cycles that maintain the counters, never their storage.
+ENCOUNTER_POLICY_BEGIN:
+TURRET_PRESSURE_ACTIVE:  .byte 0            // 1 while >=1 turret is alive, visible AND Y < TURRET_PRESSURE_MAX_Y.
+ENEMY_SHOOTER_BUDGET:    .byte 0            // Distinct-shooter allowance this fire tick (2 normal / 1 pressure).
+ENEMY_SHOOTER_ID:        .fill ENEMY_SHOOTER_SLOTS, $ff  // Logical ids of the designated mobile shooters.
+ENEMY_ACTIVE_COUNT:      .byte 0            // Last countActiveEnemies result (utility; fixtures call it directly).
+POLICY_MAX_ENEMIES:      .byte 0            // Peak countActiveEnemies result seen (POLICY_DIAG; only when called).
+POLICY_MAX_BULLETS:      .byte 0            // Peak ENEMY_BULLET_COUNT (POLICY_DIAG).
+POLICY_MAX_SORTED:       .byte 0            // Peak SORTED_COUNT (POLICY_DIAG).
+POLICY_TURRET_FRAMES:    .word 0            // Frames with TURRET_PRESSURE_ACTIVE == 1 (POLICY_DIAG).
+WAVE_START_DEFERRED:     .word 0            // Whole five-enemy wave STARTS held back by turret pressure (POLICY_DIAG).
+ENEMY_SPAWN_DEFERRED:    .word 0            // Individual formation-member spawn defers (POLICY_DIAG; expected 0 now).
+ENEMY_FIRE_REJECT_NORMAL:.word 0            // Fire opportunities refused by the 2-shooter normal budget (POLICY_DIAG).
+ENEMY_FIRE_REJECT_TURRET:.word 0            // Fire opportunities refused by the 1-shooter pressure budget (POLICY_DIAG).
+ENCOUNTER_POLICY_END:
+.if (ENCOUNTER_POLICY_END - ENCOUNTER_POLICY_BEGIN > 128) {
+    .error "Encounter-policy state block exceeds the signed-X clear loop range"
+}
+
+// Reset at game start (init).
+initEncounterPolicy:
+    lda #0
+    ldx #ENCOUNTER_POLICY_END - ENCOUNTER_POLICY_BEGIN - 1
+!clear:
+    sta ENCOUNTER_POLICY_BEGIN,x
+    dex
+    bpl !clear-
+    ldx #ENEMY_SHOOTER_SLOTS - 1
+    lda #$ff
+!id:
+    sta ENEMY_SHOOTER_ID,x
+    dex
+    bpl !id-
+    rts
+
+// Per-frame turret-pressure test. A turret throttles normal-wave admission and
+// the mobile-shooter budget only while it is genuinely dangerous: alive
+// (TURRET_HEALTH != 0), visible (TURRET_VISIBLE - its full body is inside the
+// raster-72..231 combat aperture) AND still high enough on screen to have a
+// useful firing solution (TURRET_Y < TURRET_PRESSURE_MAX_Y = 180). Below the
+// threshold - i.e. TURRET_Y >= 180 - the turret keeps firing / colliding /
+// taking damage exactly as before but no longer imposes encounter pressure.
+// This reads only the existing screen-space TURRET_Y; no world-row / stage-map
+// work. TURRET_VISIBLE's own meaning is unchanged.
+updateTurretPressure:
+    ldx #2                                  // TURRET_COUNT - 1 (KA cannot forward-resolve the .const from
+                                            // the later #import here; guarded after the import).
+!scan:
+    lda TURRET_VISIBLE,x
+    beq !next+
+    lda TURRET_HEALTH,x
+    beq !next+
+    lda TURRET_Y,x
+    cmp #TURRET_PRESSURE_MAX_Y              // carry clear => TURRET_Y < 180 => this turret exerts pressure.
+    bcs !next+                              // TURRET_Y >= 180 => no pressure from this one.
+    lda #1
+    sta TURRET_PRESSURE_ACTIVE
+    jmp !diag+
+!next:
+    dex
+    bpl !scan-
+    lda #0
+    sta TURRET_PRESSURE_ACTIVE
+!diag:
+.if (POLICY_DIAG == 1) {
+    // Cheap per-frame gauges only (~15 cycles). Peak active enemies / peak
+    // designated shooters are reconstructed by the test tooling from the
+    // per-frame object dumps, so the engine does not scan the pool here.
+    lda TURRET_PRESSURE_ACTIVE
+    beq !bullets+
+    inc POLICY_TURRET_FRAMES
+    bne !bullets+
+    inc POLICY_TURRET_FRAMES + 1
+!bullets:
+    lda ENEMY_BULLET_COUNT
+    cmp POLICY_MAX_BULLETS
+    bcc !sorted+
+    sta POLICY_MAX_BULLETS
+!sorted:
+    lda SORTED_COUNT
+    cmp POLICY_MAX_SORTED
+    bcc !diagDone+
+    sta POLICY_MAX_SORTED
+!diagDone:
+}
+    rts
+
+// Recompute the distinct-shooter allowance and prune designated ids whose
+// enemy is gone. X preserved-not-required (caller reloads). Clobbers A, X, Y.
+refreshShooterBudget:
+    lda TURRET_PRESSURE_ACTIVE
+    beq !normal+
+    lda #TURRET_SHOOTER_BUDGET
+    bne !store+                             // TURRET_SHOOTER_BUDGET is 1 (nonzero)
+!normal:
+    lda #NORMAL_SHOOTER_BUDGET
+!store:
+    sta ENEMY_SHOOTER_BUDGET
+    ldx #ENEMY_SHOOTER_SLOTS - 1
+!prune:
+    ldy ENEMY_SHOOTER_ID,x
+    cpy #$ff
+    beq !pruneNext+
+    lda OBJECT_ACTIVE,y
+    beq !drop+
+    lda OBJECT_TYPE,y
+    cmp #TYPE_ENEMY
+    beq !pruneNext+
+!drop:
+    lda #$ff
+    sta ENEMY_SHOOTER_ID,x
+!pruneNext:
+    dex
+    bpl !prune-
+    rts
+
+// Entry: X = candidate logical enemy id. Exit: carry set = may fire (id is a
+// designated shooter, claiming a free slot within budget if needed); carry
+// clear = refused. X preserved. Clobbers A, Y.
+shooterEligible:
+    ldy #0                                  // Pass 1: already a designated shooter within budget?
+!existing:
+    cpy ENEMY_SHOOTER_BUDGET
+    bcs !tryClaim+
+    txa
+    cmp ENEMY_SHOOTER_ID,y
+    beq !yes+
+    iny
+    jmp !existing-
+!tryClaim:
+    ldy #0                                  // Pass 2: a free slot within budget to claim?
+!free:
+    cpy ENEMY_SHOOTER_BUDGET
+    bcs !no+
+    lda ENEMY_SHOOTER_ID,y
+    cmp #$ff
+    beq !claim+
+    iny
+    jmp !free-
+!claim:
+    txa
+    sta ENEMY_SHOOTER_ID,y
+!yes:
+    sec
+    rts
+!no:
+.if (POLICY_DIAG == 1) {
+    lda TURRET_PRESSURE_ACTIVE
+    bne !noTurret+
+    inc ENEMY_FIRE_REJECT_NORMAL
+    bne !noDone+
+    inc ENEMY_FIRE_REJECT_NORMAL + 1
+    jmp !noDone+
+!noTurret:
+    inc ENEMY_FIRE_REJECT_TURRET
+    bne !noDone+
+    inc ENEMY_FIRE_REJECT_TURRET + 1
+!noDone:
+}
+    clc
+    rts
+
+// A = number of active, non-dying TYPE_ENEMY objects in slots 1..MAX_OBJECTS-1.
+// Also stored in ENEMY_ACTIVE_COUNT. Clobbers A, X.
+countActiveEnemies:
+    ldx #MAX_OBJECTS - 1
+    lda #0
+    sta ENEMY_ACTIVE_COUNT
+!loop:
+    lda OBJECT_ACTIVE,x
+    beq !skip+
+    lda OBJECT_TYPE,x
+    cmp #TYPE_ENEMY
+    bne !skip+
+    lda OBJECT_DEATH_TIMER,x
+    bne !skip+
+    inc ENEMY_ACTIVE_COUNT
+!skip:
+    dex
+    bne !loop-                              // stop before player slot 0
+    lda ENEMY_ACTIVE_COUNT
+.if (POLICY_DIAG == 1) {
+    cmp POLICY_MAX_ENEMIES
+    bcc !noPeak+
+    sta POLICY_MAX_ENEMIES
+!noPeak:
+    lda ENEMY_ACTIVE_COUNT
+}
+    rts
+
 BACKGROUND_CONTROL_END:
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"
@@ -5719,3 +5986,9 @@ STAGE_TEST_END:
 
 // Separate CPU allocation; no overlap with VIC-bank data or diagnostic callers.
 #import "background_turrets.asm"
+
+// updateTurretPressure scans turrets with a hardcoded `ldx #2` because the
+// TURRET_COUNT .const is not forward-resolvable at that point.
+.if (TURRET_COUNT != 3) {
+    .error "updateTurretPressure hardcodes TURRET_COUNT-1 = 2; update it if TURRET_COUNT changes"
+}
