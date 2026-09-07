@@ -132,4 +132,33 @@ exactly 19656, no sprite-start or raster-service misses.
 - effective safe maximum for the editor: 844 metatile rows (>= the 400 required).
   400 rows uses $6600-$769f, ~4.3 KB of the ~8.4 KB region.
 
-Nothing left to do. Working tree holds the widening; nothing committed.
+Committed as 3dfe4c4 "Larger levels i,plemented up to 844 rows" (parent fff83be).
+
+## Phase 1 re-validation (independent, at 3dfe4c4)
+
+Re-ran the maintained subset to confirm the committed tree is unchanged from the
+report above. All pass:
+
+- 25-row normal build: clean, stage data $6600-$67f9.
+- tools/check_stage_addressing.py: PASS (all 1600 logical rows + headroom to 6553).
+- decode probe (tools/vice_stage_widen_probe.py) on 25-row and 400-row builds:
+  BG_INCOMING_ROW / BG_METATILE_ROW / BG_ROW_BASE / BG_TILE_ROW_OFS byte-exact
+  vs model + tile expansion, max rows 99 / 1599; wrapBgLogicalRow OK. 400-row
+  build $6600-$769f (4,000-byte map).
+- 400-row full wrap (seed SCROLL_ROW=30, 1100 frames): failure_count 0,
+  frame_cycle_deltas [19656], stage_loops 1, first_transition_ok true,
+  stage_step_errors [], 58,757,315 pixel checks.
+- turret >255-row fixture (turretRows 255/260/1024): PASS.
+- 25-row scroll capture (700 frames, trace): failure_count 0,
+  frame_cycle_deltas [19656], 37.8M pixel checks.
+- check_fixed_hud_capture / check_turret_capture: failure_count 0.
+- check_raster_capture: service_failure_count 0, sprite_start_miss_count 0,
+  frame_cycle_deltas [19656].
+- vice_suppress_fixtures.py: fixtures A-J all PASS.
+
+Note: commit 3dfe4c4 also carried an unrelated SCROLL_FRAME_DIVIDER 3 -> 2
+change (src/main.asm:88). Not part of the widening; left as committed. Widening
+validation is unaffected (cadence stays [19656]).
+
+Shipping config restored: real bas-relief src/stage_test.asm, STAGE_METATILE_ROWS
+= 25, turretRows 13/29/57. No synthetic fixture left in tracked source.
