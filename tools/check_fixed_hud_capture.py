@@ -63,7 +63,9 @@ def main():
     if turrets:
         data = (root/'turret-placements.bin').read_bytes()
         count = len(data)//2
-        placements = list(zip(data[:count],data[count:]))
+        _rhi = (root/'turret-placements-hi.bin').read_bytes() if (root/'turret-placements-hi.bin').exists() else bytes(count)
+        placements = [(data[i], data[count+i] + 256*(_rhi[i] if i < len(_rhi) else 0))
+                      for i in range(count)]
         if not (226 <= tbase and tbase + count*4 <= 238):
             failures.append(['turret private glyphs outside 226..237', tbase, count])
         if set((root/'metatiledefs.bin').read_bytes()) & set(range(tbase,tbase+count*4)):

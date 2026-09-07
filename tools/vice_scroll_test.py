@@ -215,9 +215,16 @@ def main():
     # from here rather than hard-coding them.
     mon.cmd(f'bsave "{out / "vic.bin"}" 0 d000 d02f')
     if 'TURRET_STATE_BEGIN' in sym:
-        for name, low, high in [('turret-placements.bin',sym['turretWorldCol'],sym['turretWorldXLo']-1),
-                                ('turret-art.bin',sym['turretArt'],sym['turretArtEnd']-1),
-                                ('turret-ground.bin',sym['turretGroundGlyphs'],sym['turretGroundGlyphs']+95)]:
+        dumps = [('turret-placements.bin',sym['turretWorldCol'],sym['turretWorldXLo']-1),
+                 ('turret-art.bin',sym['turretArt'],sym['turretArtEnd']-1),
+                 ('turret-ground.bin',sym['turretGroundGlyphs'],sym['turretGroundGlyphs']+95)]
+        # turretWorldRow (the low bytes in turret-placements.bin) is 16-bit LE;
+        # dump the high bytes so oracles can reconstruct world rows above 255.
+        if 'turretWorldRowHi' in sym:
+            n = (sym['turretWorldRow'] - sym['turretWorldCol'])  # TURRET_COUNT bytes
+            dumps.append(('turret-placements-hi.bin',
+                          sym['turretWorldRowHi'], sym['turretWorldRowHi'] + n - 1))
+        for name, low, high in dumps:
             mon.cmd(f'bsave "{out / name}" 0 {low:04x} {high:04x}')
     # Raw ground truth for the checker: the literal metatile definitions and
     # stage metatile-row IDs actually assembled into the program, dumped from

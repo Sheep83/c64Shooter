@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Deterministically (re)generate the 100-metatile-row inspection acceptance level.
 
-This is the first end-to-end level-editor -> generated-assembler -> engine
-integration artefact. It:
+Chain proved end to end:
+  Python level project -> editor exporter -> src/generated/{stage_config,
+  stage_test, stage_turrets}.asm -> KickAssembler -> engine -> VICE.
 
-  1. reads the 16 hand-authored metatile definitions from git HEAD's
-     src/stage_test.asm (the tileset ownership does NOT move in this milestone),
-  2. builds a V2 LevelProject: 100 metatile rows, palette bg=0 / mc1=11 /
-     mc2=14 / character=1, scroll divider 2,
-  3. saves the deterministic V2 project JSON under tools/level_editor/projects/,
-  4. exports src/generated/stage_config.asm + src/generated/stage_test.asm via
-     the real editor exporter.
+The map is the committed 100-row bas-relief inspection stage with:
+  * row 0 and row 99 forced to all-M0 (clean vertical wrap seam),
+  * rows 1..5 forced to all-M13 GRILLE   -> the visually distinct FAR / top band
+    (the END of the stage, reached last),
+  * rows 94..97 forced to all-M1 R_FILL  -> the visually distinct START / bottom
+    band (the BEGINNING of the stage, on screen at boot with bottom-origin init),
+  * three M14 MACH housings under the three authored turrets.
 
-The 100-row map is the committed 25-row bas-relief inspection stage tiled x4
-(rows 0 and 99 are all-M0 so the vertical wrap seam stays clean, and the M14
-MACH turret housings still land under turretCols/turretRows 17/29/13 @ 13/29/57).
+Authored turrets (editor `objects`), one per requirement:
+  * metatile (89, 4) -> world row 357  : near the BEGINNING (activates early)
+  * metatile (70, 7) -> world row 281  : ABOVE logical row 255 (16-bit world row)
+  * metatile (30, 3) -> world row 121  : later in the playthrough
 
 Run from anywhere:  python3 tools/level_editor/build_acceptance_level.py
 """
@@ -26,13 +28,19 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from ka_export import export_project          # noqa: E402
-from project import LevelProject, save_project  # noqa: E402
+from ka_export import export_project              # noqa: E402
+from project import LevelProject, save_project    # noqa: E402
 
 PROJECT_NAME = "inspection-100"
-TARGET_ROWS = 100
 PALETTE = {"background": 0, "multicolour1": 11, "multicolour2": 14, "character": 1}
 SCROLL_FRAME_DIVIDER = 2
+
+M0, M1_RFILL, M13_GRILLE, M14_MACH = 0, 1, 13, 14
+TOP_BAND = range(1, 6)          # rows 1..5   -> GRILLE (FAR / end)
+BOTTOM_BAND = range(94, 98)     # rows 94..97 -> R_FILL (START / beginning)
+
+# Authored turrets: (metatile_row, metatile_col). Distinct rows required.
+TURRETS = [(89, 4), (70, 7), (30, 3)]
 
 
 def _parse_byte_rows(text, start_label, end_label):
@@ -49,8 +57,7 @@ def _parse_byte_rows(text, start_label, end_label):
         payload = stripped.split("//", 1)[0]
         if ".byte" not in payload:
             continue
-        vals = [int(tok) for tok in payload.split(".byte", 1)[1].split(",") if tok.strip()]
-        rows.append(vals)
+        rows.append([int(t) for t in payload.split(".byte", 1)[1].split(",") if t.strip()])
     if not inside:
         raise SystemExit(f"could not find {start_label}: in source")
     return rows
@@ -58,23 +65,32 @@ def _parse_byte_rows(text, start_label, end_label):
 
 def main():
     src = subprocess.check_output(
-        ["git", "-C", str(REPO), "show", "HEAD:src/stage_test.asm"], text=True
+        ["git", "-C", str(REPO), "show", "HEAD:src/generated/stage_test.asm"], text=True
     )
     metatiles = _parse_byte_rows(src, "metatileDefs", "METATILE_DEFS_END")
     if len(metatiles) != 16 or any(len(m) != 16 for m in metatiles):
         raise SystemExit(f"expected 16 x 16-byte metatile defs, got {[len(m) for m in metatiles]}")
 
-    base_rows = _parse_byte_rows(src, "stageMetatileRows", "STAGE_METATILE_ROWS_END")
-    tiled = (base_rows * ((TARGET_ROWS // len(base_rows)) + 1))[:TARGET_ROWS]
-    assert len(tiled) == TARGET_ROWS
-    assert tiled[0] == [0] * 10 and tiled[-1] == [0] * 10, "wrap-seam rows must be all-M0"
+    rows = [row[:] for row in _parse_byte_rows(src, "stageMetatileRows", "STAGE_METATILE_ROWS_END")]
+    if len(rows) != 100 or any(len(r) != 10 for r in rows):
+        raise SystemExit(f"expected a 100 x 10 committed map, got {len(rows)} rows")
+
+    rows[0] = [M0] * 10
+    rows[99] = [M0] * 10
+    for r in TOP_BAND:
+        rows[r] = [M13_GRILLE] * 10
+    for r in BOTTOM_BAND:
+        rows[r] = [M1_RFILL] * 10
+    for mrow, mcol in TURRETS:
+        rows[mrow][mcol] = M14_MACH
 
     project = LevelProject(
         name=PROJECT_NAME,
-        metatile_rows=[row[:] for row in tiled],
+        metatile_rows=rows,
         palette=dict(PALETTE),
         scroll_frame_divider=SCROLL_FRAME_DIVIDER,
-        objects=[],
+        objects=[{"type": "turret", "metatileRow": mr, "metatileCol": mc}
+                 for mr, mc in TURRETS],
         metatile_metadata={},
     )
 
@@ -84,15 +100,16 @@ def main():
     save_project(project, project_path)
 
     generated_dir = REPO / "src" / "generated"
-    config_path, stage_path = export_project(project, metatiles, generated_dir)
+    config_path, stage_path, turrets_path = export_project(project, metatiles, generated_dir)
 
     print(f"project : {project_path.relative_to(REPO)}")
-    print(f"config  : {config_path.relative_to(REPO)}")
-    print(f"stage   : {stage_path.relative_to(REPO)}")
-    print(f"height  : {project.height} metatile rows")
+    for p in (config_path, stage_path, turrets_path):
+        print(f"generated: {p.relative_to(REPO)}")
+    print(f"height  : {project.height} metatile rows  ({project.height * 4} logical rows)")
     print(f"map     : {project.height * 10} bytes")
-    print(f"palette : {project.palette}")
-    print(f"divider : {project.scroll_frame_divider}")
+    print(f"palette : {project.palette}   divider {project.scroll_frame_divider}")
+    for mr, mc in sorted(TURRETS):
+        print(f"turret  : metatile ({mr:3d},{mc}) -> world char row {mr * 4 + 1}, col {mc * 4 + 1}")
 
 
 if __name__ == "__main__":

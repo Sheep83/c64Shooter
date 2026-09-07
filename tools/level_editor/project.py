@@ -17,6 +17,42 @@ MIN_STAGE_ROWS = 1
 MAX_STAGE_ROWS = ENGINE_MAX_STAGE_ROWS
 DEFAULT_STAGE_ROWS = 188
 
+# --- Authored gameplay objects -------------------------------------------------
+# The editor owns authored PLACEMENT only. AI / firing cadence / runtime state /
+# sprite allocation / activation / collision internals stay engine-owned.
+#
+# The first (and, this iteration, only) authored object type is the existing
+# background turret. It is placed on the metatile grid; the engine derives its
+# world CHARACTER coordinates as metatile_index * METATILE_H + 1 (row) and
+# metatile_index * METATILE_W + 1 (col) - i.e. the 2x2 body sits centred in the
+# metatile, which is exactly where the previous hand-authored turrets sat
+# (turretCols 17/29/13 == col*4+1, turretRows 13/29/57 == row*4+1).
+OBJECT_TYPE_TURRET = "turret"
+SUPPORTED_OBJECT_TYPES = (OBJECT_TYPE_TURRET,)
+
+# Engine limit: the private turret glyph namespace is codes 226..239 (4 glyphs
+# per turret), so at most 3 turrets. See src/background_turrets.asm.
+MAX_TURRETS = 3
+TURRET_BODY_CHAR_OFFSET = 1          # 2x2 body offset inside the 4x4 metatile
+
+
+def turret_world_row(metatile_row):
+    """Metatile-grid row -> world CHARACTER / logical row of the turret's top."""
+    return metatile_row * 4 + TURRET_BODY_CHAR_OFFSET
+
+
+def turret_world_col(metatile_col):
+    """Metatile-grid col -> world CHARACTER column of the turret's left cell."""
+    return metatile_col * 4 + TURRET_BODY_CHAR_OFFSET
+
+
+def iter_turrets(project):
+    """Yield the turret objects in deterministic (metatileRow, metatileCol) order."""
+    turrets = [o for o in project.objects
+               if isinstance(o, dict) and o.get("type") == OBJECT_TYPE_TURRET]
+    turrets.sort(key=lambda o: (o.get("metatileRow", 0), o.get("metatileCol", 0)))
+    return turrets
+
 
 class ProjectValidationError(ValueError):
     """Raised when a project does not satisfy the level-editor project contract."""
@@ -56,9 +92,22 @@ class LevelProject:
                 "character": self.palette["character"],
             },
             "metatileRows": self.clone_rows(),
-            "objects": list(self.objects),
+            "objects": self.canonical_objects(),
             "metatileMetadata": dict(self.metatile_metadata),
         }
+
+    def canonical_objects(self):
+        """Deterministic object list: turrets first, sorted by (row, col), with a
+        fixed key order. Any non-turret objects keep their original order after."""
+        turrets = [
+            {"type": OBJECT_TYPE_TURRET,
+             "metatileRow": int(o["metatileRow"]),
+             "metatileCol": int(o["metatileCol"])}
+            for o in iter_turrets(self)
+        ]
+        others = [o for o in self.objects
+                  if not (isinstance(o, dict) and o.get("type") == OBJECT_TYPE_TURRET)]
+        return turrets + others
 
 
 def _validate_palette(palette, errors):
@@ -122,9 +171,64 @@ def validate_project(project):
 
     if not isinstance(project.objects, list):
         errors.append("objects must be a list.")
+    else:
+        _validate_objects(project, errors)
     if not isinstance(project.metatile_metadata, dict):
         errors.append("metatileMetadata must be an object/dictionary.")
 
+    return errors
+
+
+def _validate_objects(project, errors):
+    height = len(project.metatile_rows) if isinstance(project.metatile_rows, list) else 0
+    turret_rows = []
+    turret_count = 0
+    for index, obj in enumerate(project.objects):
+        if not isinstance(obj, dict):
+            errors.append(f"objects[{index}] must be an object/dictionary.")
+            continue
+        obj_type = obj.get("type")
+        if obj_type not in SUPPORTED_OBJECT_TYPES:
+            errors.append(
+                f"objects[{index}].type {obj_type!r} is not supported; "
+                f"expected one of {list(SUPPORTED_OBJECT_TYPES)}."
+            )
+            continue
+        if obj_type == OBJECT_TYPE_TURRET:
+            turret_count += 1
+            mrow = obj.get("metatileRow")
+            mcol = obj.get("metatileCol")
+            if isinstance(mrow, bool) or not isinstance(mrow, int) or not 0 <= mrow < max(height, 1):
+                errors.append(
+                    f"objects[{index}].metatileRow must be an integer 0..{max(height - 1, 0)}; got {mrow!r}."
+                )
+            else:
+                turret_rows.append(mrow)
+            if isinstance(mcol, bool) or not isinstance(mcol, int) or not 0 <= mcol < METATILES_PER_ROW:
+                errors.append(
+                    f"objects[{index}].metatileCol must be an integer 0..{METATILES_PER_ROW - 1}; got {mcol!r}."
+                )
+    if turret_count > MAX_TURRETS:
+        errors.append(
+            f"At most {MAX_TURRETS} turrets are supported (private glyph namespace 226..239); "
+            f"got {turret_count}."
+        )
+    if len(turret_rows) != len(set(turret_rows)):
+        errors.append("Each turret must occupy a distinct metatile row (distinct world character row).")
+
+
+def export_readiness_errors(project):
+    """Extra checks required before generating engine-facing ASM (but not for a
+    plain in-progress editor document). The engine's turret loop / glyph
+    namespace need exactly 1..MAX_TURRETS turrets."""
+    errors = validate_project(project)
+    turrets = [o for o in project.objects
+               if isinstance(o, dict) and o.get("type") == OBJECT_TYPE_TURRET]
+    if not 1 <= len(turrets) <= MAX_TURRETS:
+        errors.append(
+            f"The current engine requires 1..{MAX_TURRETS} placed turrets before export; "
+            f"got {len(turrets)}."
+        )
     return errors
 
 
@@ -168,13 +272,19 @@ def project_from_dict(data):
         palette = dict(_require_key(data, "palette")) if isinstance(data.get("palette"), dict) else data.get("palette")
         scroll_divider = _require_key(data, "scrollFrameDivider")
 
+    # objects / metatileMetadata are optional for backward compatibility with
+    # early V1/V2 files that omitted them or left objects empty.
+    raw_objects = data.get("objects", [])
+    if not isinstance(raw_objects, list):
+        raise ProjectValidationError("objects must be a list.")
+
     project = LevelProject(
         name=_require_key(data, "name"),
         metatile_rows=[row[:] if isinstance(row, list) else row for row in rows],
         palette=palette,
         scroll_frame_divider=scroll_divider,
-        objects=_require_key(data, "objects"),
-        metatile_metadata=_require_key(data, "metatileMetadata"),
+        objects=[dict(o) if isinstance(o, dict) else o for o in raw_objects],
+        metatile_metadata=data.get("metatileMetadata", {}),
     )
     errors = validate_project(project)
     if errors:

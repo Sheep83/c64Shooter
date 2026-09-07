@@ -32,6 +32,10 @@ DEFAULT_SCROLL_FRAME_DIVIDER = 2
 # main.asm no longer defines them.
 GENERATED_CONFIG_REL = "src/generated/stage_config.asm"
 GENERATED_STAGE_REL = "src/generated/stage_test.asm"
+GENERATED_TURRETS_REL = "src/generated/stage_turrets.asm"
+
+# Turret body sits centred in its 4x4 metatile; world char = metatile*4 + 1.
+TURRET_BODY_CHAR_OFFSET = 1
 
 
 @dataclass
@@ -44,6 +48,7 @@ class EngineData:
     source_palette: dict[str, int]
     source_scroll_frame_divider: int
     source_colour_ram: int
+    source_turrets: list[dict]
 
 
 def _strip_comment(line):
@@ -155,11 +160,52 @@ def _parse_generated_config(path):
     return rows, divider, palette, colour_ram
 
 
+def _parse_ka_list(text, name):
+    """Parse `.var <name> = List().add(1, 2, 3)` -> [1, 2, 3]."""
+    match = re.search(
+        rf"\.var\s+{re.escape(name)}\s*=\s*List\(\)\.add\(([^)]*)\)", text
+    )
+    if not match:
+        raise ValueError(f"Could not find .var {name} = List().add(...)")
+    body = match.group(1).strip()
+    if not body:
+        return []
+    return [int(tok.strip()) for tok in body.split(",") if tok.strip()]
+
+
+def _parse_generated_turrets(path):
+    """Parse the generated turret PLACEMENT file into metatile-grid objects."""
+    if not Path(path).exists():
+        return []
+    text = Path(path).read_text(encoding="utf-8")
+    count = _parse_const_int(text, "TURRET_COUNT")
+    cols = _parse_ka_list(text, "turretCols")
+    rows = _parse_ka_list(text, "turretRows")
+    if not (count == len(cols) == len(rows)):
+        raise ValueError(
+            f"{path}: TURRET_COUNT={count} but turretCols has {len(cols)} and turretRows has {len(rows)}"
+        )
+    turrets = []
+    for world_col, world_row in zip(cols, rows):
+        if (world_col - TURRET_BODY_CHAR_OFFSET) % 4 or (world_row - TURRET_BODY_CHAR_OFFSET) % 4:
+            raise ValueError(
+                f"{path}: turret at char ({world_col},{world_row}) is not on a metatile-cell "
+                f"centre (col%4==1, row%4==1); editor placement uses the metatile grid"
+            )
+        turrets.append({
+            "type": "turret",
+            "metatileRow": (world_row - TURRET_BODY_CHAR_OFFSET) // 4,
+            "metatileCol": (world_col - TURRET_BODY_CHAR_OFFSET) // 4,
+        })
+    return turrets
+
+
 def load_engine_data(repo_root):
     repo_root = Path(repo_root)
     main_asm = repo_root / "src" / "main.asm"
     config_asm = repo_root / GENERATED_CONFIG_REL
     stage_asm = repo_root / GENERATED_STAGE_REL
+    turrets_asm = repo_root / GENERATED_TURRETS_REL
     main_text = main_asm.read_text(encoding="utf-8")
 
     # Glyph bitmap data + geometry stay hand-authored / engine-owned for now.
@@ -228,4 +274,5 @@ def load_engine_data(repo_root):
         source_palette=source_palette,
         source_scroll_frame_divider=source_scroll_divider,
         source_colour_ram=source_colour_ram,
+        source_turrets=_parse_generated_turrets(turrets_asm),
     )

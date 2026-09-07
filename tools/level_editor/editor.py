@@ -19,10 +19,16 @@ from project import (
     DEFAULT_STAGE_ROWS,
     LevelProject,
     MAX_STAGE_ROWS,
+    MAX_TURRETS,
     MIN_STAGE_ROWS,
+    OBJECT_TYPE_TURRET,
     ProjectValidationError,
+    export_readiness_errors,
+    iter_turrets,
     load_project,
     save_project,
+    turret_world_col,
+    turret_world_row,
     validate_project,
     wrap_seam_warning,
 )
@@ -54,7 +60,8 @@ class LevelEditor(tk.Tk):
             name="stage_test",
             metatile_rows=[row[:] for row in self.data.stage_rows],
             palette=dict(self.data.source_palette),
-            scroll_frame_divider=DEFAULT_SCROLL_FRAME_DIVIDER,
+            scroll_frame_divider=self.data.source_scroll_frame_divider,
+            objects=[dict(t) for t in self.data.source_turrets],
         )
         self.project_path = None
         self.saved_state = self._project_state()
@@ -65,6 +72,8 @@ class LevelEditor(tk.Tk):
         self.selected_tile = 0
         self.metatile_image_cache = {}
         self.last_painted_cell = None
+        self.edit_mode = tk.StringVar(value="terrain")   # "terrain" | "turret"
+        self.selected_turret = None                      # index into project.objects
         self.show_grid = tk.BooleanVar(value=True)
         self.stage_row_count = tk.IntVar(value=self.project.height)
         self.duration_text = tk.StringVar()
@@ -100,9 +109,22 @@ class LevelEditor(tk.Tk):
             tuple(tuple(row) for row in self.project.metatile_rows),
             tuple(sorted(self.project.palette.items())),
             self.project.scroll_frame_divider,
-            tuple(self.project.objects),
+            tuple(self._object_key(o) for o in self.project.objects),
             tuple(sorted(self.project.metatile_metadata.items())),
         )
+
+    @staticmethod
+    def _object_key(obj):
+        if isinstance(obj, dict):
+            return tuple(sorted((k, v) for k, v in obj.items()
+                                if not isinstance(v, (list, dict))))
+        return ("_opaque", repr(obj))
+
+    @staticmethod
+    def _object_from_key(key):
+        if key and key[0] == "_opaque":
+            return None
+        return {k: v for k, v in key}
 
     def _is_dirty(self):
         return self._project_state() != self.saved_state
@@ -154,6 +176,20 @@ class LevelEditor(tk.Tk):
         ttk.Checkbutton(
             toolbar, text="Metatile grid", variable=self.show_grid, command=self._draw_level
         ).pack(side="right")
+
+        ttk.Label(toolbar, text="   Mode:").pack(side="left", padx=(16, 2))
+        ttk.Radiobutton(
+            toolbar, text="Terrain", value="terrain",
+            variable=self.edit_mode, command=self._on_mode_change,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            toolbar, text="Turrets", value="turret",
+            variable=self.edit_mode, command=self._on_mode_change,
+        ).pack(side="left")
+        self.delete_turret_button = ttk.Button(
+            toolbar, text="Delete turret", command=self._delete_selected_turret, state="disabled",
+        )
+        self.delete_turret_button.pack(side="left", padx=(8, 0))
 
         stage_controls = ttk.Frame(self, padding=(8, 0, 8, 4))
         stage_controls.pack(fill="x")
@@ -237,9 +273,13 @@ class LevelEditor(tk.Tk):
         self.level_canvas.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
 
-        self.level_canvas.bind("<Button-1>", self._paint_start)
-        self.level_canvas.bind("<B1-Motion>", self._paint_event)
-        self.level_canvas.bind("<ButtonRelease-1>", self._paint_end)
+        self.level_canvas.bind("<Button-1>", self._level_click_start)
+        self.level_canvas.bind("<B1-Motion>", self._level_drag)
+        self.level_canvas.bind("<ButtonRelease-1>", self._level_click_end)
+        self.level_canvas.bind("<Button-3>", self._level_right_click)
+        self.level_canvas.bind("<Control-Button-1>", self._level_right_click)
+        self.bind_all("<Delete>", lambda event: self._delete_selected_turret())
+        self.bind_all("<BackSpace>", lambda event: self._delete_selected_turret())
         self._bind_mousewheel(self.level_canvas)
 
         status = ttk.Frame(self, padding=(8, 2, 8, 8))
@@ -344,6 +384,7 @@ class LevelEditor(tk.Tk):
                 self.level_canvas.create_line(x, 0, x, self.level_height, fill=GRID, tags="grid")
             for y in range(0, self.level_height + 1, METATILE_PIXELS):
                 self.level_canvas.create_line(0, y, LEVEL_WIDTH, y, fill=GRID, tags="grid")
+        self._draw_turret_markers()
 
     def _palette_click(self, event):
         y = self.palette_canvas.canvasy(event.y)
@@ -352,6 +393,165 @@ class LevelEditor(tk.Tk):
             self.selected_tile = tile_id
             self._draw_palette()
             self._update_status()
+
+    # ---- level-canvas input dispatch (terrain paint vs turret placement) ----
+    def _cell_from_event(self, event):
+        x = int(self.level_canvas.canvasx(event.x))
+        y = int(self.level_canvas.canvasy(event.y))
+        col = x // METATILE_PIXELS
+        row = y // METATILE_PIXELS
+        if 0 <= row < self.project.height and 0 <= col < METATILES_PER_ROW:
+            return row, col
+        return None
+
+    def _on_mode_change(self):
+        self.selected_turret = None
+        self._draw_level()
+        self._update_turret_ui()
+        self._update_status()
+
+    def _level_click_start(self, event):
+        if self.edit_mode.get() == "turret":
+            self._turret_click(event)
+            return "break"
+        self._paint_start(event)
+
+    def _level_drag(self, event):
+        if self.edit_mode.get() == "turret":
+            return "break"
+        self._paint_event(event)
+
+    def _level_click_end(self, event=None):
+        if self.edit_mode.get() == "turret":
+            return "break"
+        self._paint_end(event)
+
+    def _level_right_click(self, event):
+        if self.edit_mode.get() != "turret":
+            return
+        cell = self._cell_from_event(event)
+        if cell is None:
+            return "break"
+        self._remove_turret_at(*cell)
+        return "break"
+
+    # ---- turret placement -------------------------------------------------
+    def _turret_index_at(self, row, col):
+        for index, obj in enumerate(self.project.objects):
+            if (isinstance(obj, dict) and obj.get("type") == OBJECT_TYPE_TURRET
+                    and obj.get("metatileRow") == row and obj.get("metatileCol") == col):
+                return index
+        return None
+
+    def _turret_index_in_row(self, row):
+        for index, obj in enumerate(self.project.objects):
+            if (isinstance(obj, dict) and obj.get("type") == OBJECT_TYPE_TURRET
+                    and obj.get("metatileRow") == row):
+                return index
+        return None
+
+    def _turret_count(self):
+        return sum(1 for o in self.project.objects
+                   if isinstance(o, dict) and o.get("type") == OBJECT_TYPE_TURRET)
+
+    def _turret_click(self, event):
+        cell = self._cell_from_event(event)
+        if cell is None:
+            return
+        row, col = cell
+        existing = self._turret_index_at(row, col)
+        if existing is not None:
+            self.selected_turret = existing
+            self._draw_level()
+            self._update_turret_ui()
+            return
+        row_conflict = self._turret_index_in_row(row)
+        if row_conflict is not None:
+            self.bell()
+            self.status_text.set(
+                f"Metatile row {row} already has a turret (one turret per world row)."
+            )
+            return
+        if self._turret_count() >= MAX_TURRETS:
+            self.bell()
+            self.status_text.set(
+                f"Maximum {MAX_TURRETS} turrets (engine private glyph namespace)."
+            )
+            return
+        before = self._project_state()
+        self.project.objects.append(
+            {"type": OBJECT_TYPE_TURRET, "metatileRow": row, "metatileCol": col}
+        )
+        self.selected_turret = len(self.project.objects) - 1
+        self._push_undo_state(before)
+        self._draw_level()
+        self._update_turret_ui()
+        self._update_document_ui()
+
+    def _remove_turret_at(self, row, col):
+        index = self._turret_index_at(row, col)
+        if index is None:
+            return
+        before = self._project_state()
+        del self.project.objects[index]
+        self.selected_turret = None
+        self._push_undo_state(before)
+        self._draw_level()
+        self._update_turret_ui()
+        self._update_document_ui()
+
+    def _delete_selected_turret(self):
+        if self.edit_mode.get() != "turret" or self.selected_turret is None:
+            return "break"
+        if not (0 <= self.selected_turret < len(self.project.objects)):
+            self.selected_turret = None
+            return "break"
+        before = self._project_state()
+        del self.project.objects[self.selected_turret]
+        self.selected_turret = None
+        self._push_undo_state(before)
+        self._draw_level()
+        self._update_turret_ui()
+        self._update_document_ui()
+        return "break"
+
+    def _update_turret_ui(self):
+        has_selection = (
+            self.edit_mode.get() == "turret"
+            and self.selected_turret is not None
+            and 0 <= (self.selected_turret or -1) < len(self.project.objects)
+        )
+        self.delete_turret_button.configure(state="normal" if has_selection else "disabled")
+
+    def _draw_turret_markers(self):
+        self.level_canvas.delete("turret_marker")
+        for index, obj in enumerate(self.project.objects):
+            if not (isinstance(obj, dict) and obj.get("type") == OBJECT_TYPE_TURRET):
+                continue
+            row, col = obj.get("metatileRow", 0), obj.get("metatileCol", 0)
+            x0 = col * METATILE_PIXELS
+            y0 = row * METATILE_PIXELS
+            x1 = x0 + METATILE_PIXELS
+            y1 = y0 + METATILE_PIXELS
+            active = self.edit_mode.get() == "turret"
+            outline = SELECTED if (active and index == self.selected_turret) else "#ff5030"
+            width = 3 if (active and index == self.selected_turret) else 2
+            self.level_canvas.create_rectangle(
+                x0 + 2, y0 + 2, x1 - 2, y1 - 2, outline=outline, width=width,
+                tags="turret_marker",
+            )
+            # 2x2 body footprint (chars col*4+1..+2, row*4+1..+2)
+            bx = x0 + CHAR_SIZE
+            by = y0 + CHAR_SIZE
+            self.level_canvas.create_rectangle(
+                bx, by, bx + 2 * CHAR_SIZE, by + 2 * CHAR_SIZE,
+                outline=outline, fill="", width=1, tags="turret_marker",
+            )
+            self.level_canvas.create_text(
+                x0 + METATILE_PIXELS / 2, y0 + METATILE_PIXELS / 2,
+                text="T", fill=outline, font=("TkDefaultFont", 10, "bold"),
+                tags="turret_marker",
+            )
 
     def _paint_start(self, event):
         self.paint_gesture_before = self._project_state()
@@ -393,6 +593,8 @@ class LevelEditor(tk.Tk):
         self._draw_metatile(self.level_canvas, self.stage_rows[row][col], x0, y0, tags=tag)
         if self.show_grid.get():
             self.level_canvas.create_rectangle(x0, y0, x1, y1, outline=GRID, tags=tag)
+        if self._turret_index_at(row, col) is not None:
+            self._draw_turret_markers()
 
     def _apply_stage_row_count(self, event=None):
         try:
@@ -486,6 +688,13 @@ class LevelEditor(tk.Tk):
         self._update_status()
 
     def _update_status(self):
+        if self.edit_mode.get() == "turret":
+            self.status_text.set(
+                f"Turret mode: {self._turret_count()}/{MAX_TURRETS} placed  |  "
+                "click a metatile to place/select, right-click or Delete to remove  |  "
+                f"Level: {METATILES_PER_ROW} x {self.project.height} metatiles"
+            )
+            return
         self.status_text.set(
             f"Selected: {self.selected_tile} {METATILE_NAMES[self.selected_tile]}  |  "
             f"Level: {METATILES_PER_ROW} x {self.project.height} metatiles  |  "
@@ -501,6 +710,7 @@ class LevelEditor(tk.Tk):
         self.level_frame.configure(text=f"Working stage: {self.project.name} ({path_text})")
         self.edit_menu.entryconfigure("Undo", state="normal" if self.undo_stack else "disabled")
         self.edit_menu.entryconfigure("Redo", state="normal" if self.redo_stack else "disabled")
+        self._update_turret_ui()
         self._update_status()
 
     def _push_undo_state(self, state):
@@ -508,13 +718,15 @@ class LevelEditor(tk.Tk):
         self.redo_stack.clear()
 
     def _restore_state(self, state):
-        name, rows, palette_items, scroll_divider, objects, metadata_items = state
+        name, rows, palette_items, scroll_divider, object_keys, metadata_items = state
         self.project.name = name
         self.project.metatile_rows = [list(row) for row in rows]
         self.project.palette = dict(palette_items)
         self.project.scroll_frame_divider = scroll_divider
         self.metatile_image_cache.clear()
-        self.project.objects = list(objects)
+        self.project.objects = [o for o in (self._object_from_key(k) for k in object_keys)
+                                if o is not None]
+        self.selected_turret = None
         self.project.metatile_metadata = dict(metadata_items)
         self.stage_row_count.set(self.project.height)
         self.scroll_divider_var.set(self.project.scroll_frame_divider)
@@ -587,11 +799,15 @@ class LevelEditor(tk.Tk):
             return "break"
 
         self.metatile_image_cache.clear()
+        # Seed one turret near the START (bottom) so a new project is
+        # export-ready; the engine currently needs 1..MAX_TURRETS.
+        seed_row = max(0, rows - 3)
         self.project = LevelProject(
             name=name,
             metatile_rows=[[0] * METATILES_PER_ROW for _ in range(rows)],
             palette=dict(DEFAULT_PALETTE),
             scroll_frame_divider=DEFAULT_SCROLL_FRAME_DIVIDER,
+            objects=[{"type": OBJECT_TYPE_TURRET, "metatileRow": seed_row, "metatileCol": 4}],
         )
         self.project_path = None
         # A newly created project has not been persisted yet, so treat it as dirty.
@@ -703,25 +919,29 @@ class LevelEditor(tk.Tk):
         return True
 
     def _export_kickassembler(self):
+        readiness = export_readiness_errors(self.project)
+        if readiness:
+            messagebox.showerror("Cannot export", "\n".join(readiness), parent=self)
+            return "break"
         if not self._validate_before_write():
             return "break"
         output_dir = filedialog.askdirectory(
             title="Export KickAssembler stage files",
-            initialdir=self.project_dir,
+            initialdir=self.repo_root / "src" / "generated",
             parent=self,
         )
         if not output_dir:
             return "break"
         try:
-            config_path, stage_path = export_project(self.project, self.data.metatiles, output_dir)
+            paths = export_project(self.project, self.data.metatiles, output_dir)
         except (OSError, ProjectValidationError) as exc:
             messagebox.showerror("Export failed", str(exc), parent=self)
             return "break"
         messagebox.showinfo(
             "KickAssembler export complete",
-            f"Generated:\n{config_path.name}\n{stage_path.name}\n\n"
-            "The current engine still needs the one-time stage_config.asm include hook before "
-            "height/palette/scroll settings are engine-owned by generated data.",
+            "Generated:\n" + "\n".join(p.name for p in paths) + "\n\n"
+            "stage_config.asm / stage_turrets.asm are imported early by main.asm; "
+            "stage_test.asm assembles at $6600. Rebuild to play the authored level.",
             parent=self,
         )
         return "break"

@@ -81,7 +81,10 @@ def main():
     if (root / 'turret-placements.bin').exists():
         d = (root / 'turret-placements.bin').read_bytes()
         half = len(d) // 2
-        turret_spans = list(zip(d[:half], d[half:]))
+        cols, rows_lo = d[:half], d[half:]
+        hi = (root / 'turret-placements-hi.bin').read_bytes() if (root / 'turret-placements-hi.bin').exists() else bytes(half)
+        turret_spans = [(cols[i], rows_lo[i] + 256 * (hi[i] if i < len(hi) else 0))
+                        for i in range(half)]
     failures = []
     clocks, fine, rows, active, batches, deferred, scores = [], [], [], [], [], [], []
     frames = []

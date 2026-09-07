@@ -16,7 +16,9 @@ def main():
     records=json.loads((root/'frames.json').read_text())
     placement=(root/'turret-placements.bin').read_bytes()
     count=len(placement)//2
-    rows=placement[count:]
+    _rlo=placement[count:]
+    _rhi=(root/'turret-placements-hi.bin').read_bytes() if (root/'turret-placements-hi.bin').exists() else bytes(count)
+    rows=[_rlo[i]+256*(_rhi[i] if i<len(_rhi) else 0) for i in range(count)]
     stage_rows=len((root/'stagemetatilerows.bin').read_bytes())//10*4
     failures=[]
     previous_hp=[3]*count
