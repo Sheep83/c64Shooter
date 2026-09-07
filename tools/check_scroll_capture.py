@@ -141,7 +141,10 @@ def main():
             codes = row_codes(logical)
             skip_cols = set()
             for col, world in turret_spans:
-                if (logical - world) % total_logical_rows < 2:
+                # +/-1 logical row: a turret changes matrix row on a coarse step
+                # and its pulsed fourth colour can sit on the leaving/entering
+                # row for one frame.
+                if (logical - world + 1) % total_logical_rows < 4:
                     skip_cols |= {col, col + 1}
             # One fixed multicolour colour-RAM value for the whole playfield.
             row_rgb = cfg.row_bytes(codes, gy, glyphs, cfg.terrain_cram)

@@ -82,7 +82,7 @@ def main():
     def private_pixels(styles):
         return b''.join(ground[t] if style==7 else art[style*32:(style+1)*32] for t,style in enumerate(styles))
     @lru_cache(maxsize=1280)
-    def expected_pixels(row, phase, hud, styles):
+    def expected_pixels(row, phase, hud, styles, turret_cram):
         current_glyphs = list(glyphs)
         private = private_pixels(styles)
         for c in range(len(private)//8):current_glyphs[tbase+c] = private[c*8:c*8+8]
@@ -94,10 +94,13 @@ def main():
             elif raster < 71:
                 out.extend(bytes(320*3))
             else:
-                # Terrain / turret cells: multicolour, one fixed colour RAM value.
+                # Terrain: one fixed colour RAM value. Turret private-glyph cells
+                # pulse the fourth multicolour colour (all turrets in phase).
                 terrain_row, gy = divmod(raster-(64+phase),8)
                 codes = visual_rows(row+terrain_row)
-                out.extend(cfg.row_bytes(codes, gy, current_glyphs, cfg.terrain_cram))
+                cram = [turret_cram if tbase <= c < tbase+4*len(placements) else cfg.terrain_cram
+                        for c in codes]
+                out.extend(cfg.row_bytes(codes, gy, current_glyphs, cram))
         return Image.frombytes('RGB',(320,192),bytes(out))
     def nonzero(im):
         # RGB difference -> a binary mask: any nonzero component is a mismatch.
@@ -136,12 +139,31 @@ def main():
                 failures.append([frame,'private glyph publication/charset integrity'])
         colour_ram = load_colour_ram(root, frame, cfg)
         if len(colour_ram) == 1000:
-            # Terrain colour RAM is written once and never scrolled: every cell
-            # below the HUD stays the one fixed multicolour value, every frame.
-            terrain_cells = set(colour_ram[40:1000])
+            # Ordinary terrain colour RAM is written once and never scrolled:
+            # every cell below the HUD stays the one fixed multicolour value.
+            # The exception is the cells currently holding a turret private
+            # glyph (codes tbase..tbase+11): those pulse the fourth multicolour
+            # colour (see pulseTurretColour). They must stay a valid multicolour
+            # selector (bit 3 set, low 3 in 0..7) but their low 3 bits vary.
+            turret_glyph_cells = {c for c in range(40, 1000)
+                                  if tbase <= ram[c] < tbase + 4*len(placements)}
+            # A turret changes matrix row on a coarse step; its pulse colour can
+            # sit on the row it is leaving/entering for one frame. Exclude the
+            # turret columns +/-1 row from the "fixed terrain colour" check.
+            turret_zone = set()
+            for c in turret_glyph_cells:
+                mr, mc = divmod(c, 40)
+                for r in (mr-1, mr, mr+1, mr+2):
+                    if 1 <= r <= 24:
+                        turret_zone.add(r*40 + mc)
+            terrain_cells = set(colour_ram[c] for c in range(40, 1000)
+                                if c not in turret_zone)
             terrain_cram_seen.update(terrain_cells)
             if terrain_cells - {cfg.terrain_cram}:
                 failures.append([frame,'terrain colour RAM not fixed',sorted(terrain_cells)])
+            for c in turret_glyph_cells:
+                if not (colour_ram[c] & 0x08):        # bit 3 must stay set (cell stays multicolour)
+                    failures.append([frame,'turret colour RAM lost the MC selector bit',c,colour_ram[c]])
             if set(colour_ram[:40]) - {cfg.hud_cram}:
                 failures.append([frame,'HUD colour RAM changed',sorted(set(colour_ram[:40]))])
         score = get('SCORE_LO') + 256*get('SCORE_HI')
@@ -188,6 +210,16 @@ def main():
                 x=get(prefix+'_X',live+i)+256*get(prefix+'_X_MSB',live+i)-24
                 y=get(prefix+'_Y',live+i)+1-55
                 draw.rectangle((x,y,x+23,y+20),fill=255)
+        # Turret private-glyph cells pulse the fourth multicolour colour (a
+        # deliberate prototype). Their bitmaps are validated by the charset
+        # integrity check + check_turret_capture, and their colour RAM by the
+        # selector check above; exclude their pixels from the terrain diff,
+        # which models one static terrain colour.
+        for c in range(40,1000):
+            if tbase <= ram[c] < tbase+4*len(placements):
+                mrow,mcol = divmod(c,40)
+                ty0 = 9+phase+(mrow-2)*8            # +/-1 matrix row for the coarse-step transient
+                draw.rectangle((mcol*8, ty0-1, mcol*8+7, ty0+8+16), fill=255)
         # Never excuse HUD/separator contamination as a sprite-covered pixel.
         draw.rectangle((0,0,319,15),fill=0)
         # The five FREE digit cells (cols 33..37) are rewritten late in BUILD
@@ -196,8 +228,14 @@ def main():
         # range) above; exclude them from the exact HUD pixel comparison.
         if free_region[0] == 144:
             draw.rectangle((33*8, 0, 38*8-1, 7), fill=255)
+        # Turret private-glyph cells pulse the fourth multicolour colour; read
+        # this frame's pulse value (all turrets pulse in phase). Fall back to the
+        # fixed terrain value on builds without the pulse.
+        turret_cram = get('TURRET_PULSE_COLOUR') if turrets and 'TURRET_PULSE_COLOUR' in sym else cfg.terrain_cram
+        if not (turret_cram & 0x08):
+            turret_cram = cfg.terrain_cram
         if frame:
-            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud,styles)))
+            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud,styles,turret_cram)))
             difference=ImageChops.subtract(difference,mask)
             bad=difference.getbbox()
             if bad and previous_score is not None and score != previous_score:
@@ -205,7 +243,7 @@ def main():
                 # Allow exactly the complete prior score for that one frame;
                 # still compare every HUD pixel (no score-area exclusion).
                 old_hud=hud_row(previous_score,free_region)
-                old_diff=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,old_hud,styles)))
+                old_diff=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,old_hud,styles,turret_cram)))
                 old_diff=ImageChops.subtract(old_diff,mask)
                 if not old_diff.getbbox():
                     delayed_scores.append(frame)

@@ -15,6 +15,17 @@
 .const TURRET_FIRE_INTERVAL = 100
 .const TURRET_HIT_STYLE = 6
 .const TURRET_DEAD_STYLE = 7
+// Turrets are now STATIC emplacements: no per-frame player-relative aim glyph.
+// One fixed body orientation is shown while alive/visible (style 6 = hit flash,
+// style 7 = destroyed underlay still apply). turretArt style 4 = down-facing,
+// the natural look for a background gun firing down the playfield. The genuine
+// projectile aim is still computed at fire time inside spawnEnemyBulletAt.
+.const TURRET_STATIC_STYLE = 4
+// Static-turret fourth-colour pulse (see pulseTurretColour). Restrained
+// white / red / yellow / red cycle; legal low-3 colours only, bit 3 ORed in at
+// use so the cell stays multicolour. Easy to retune.
+.const TURRET_PULSE_LEN = 4
+.const TURRET_PULSE_INTERVAL = 8            // Gameplay frames between pulse steps.
 
 // Editor-facing placement layer: character column and world character row.
 // A body covers2x2 cells; its second row wraps modulo STAGE_LOGICAL_ROWS.
@@ -59,6 +70,8 @@ initBackgroundTurrets:
     sta TURRET_STATE_BEGIN,x
     dex
     bpl !clear-
+    lda #1
+    sta TURRET_PULSE_TIMER                  // Step the pulse on the first gameplay frame.
     ldx #0
 !turret:
     stx TURRET_INDEX
@@ -285,15 +298,18 @@ updateBackgroundTurrets:
     sta TURRET_FIRE_TIMER,x
     jmp !next+
 !visible:
-    jsr aimBackgroundTurret
-    ldx TURRET_INDEX
+    // Static emplacement: no jsr aimBackgroundTurret here any more. The visible
+    // body is a fixed orientation unless it is flashing from a hit. Removing the
+    // per-frame six-way aim calc is a net CPU saving (aimBackgroundTurret cost
+    // ~59..74 cyc per visible turret per frame). aimBackgroundTurret is kept in
+    // the source, unreferenced, for the functional test and future use.
     lda TURRET_HIT_TIMER,x
-    beq !aimStyle+
+    beq !staticStyle+
     dec TURRET_HIT_TIMER,x
     lda #TURRET_HIT_STYLE
     bne !style+
-!aimStyle:
-    lda TURRET_AIM,x
+!staticStyle:
+    lda #TURRET_STATIC_STYLE
 !style:
     sta TURRET_DESIRED_STYLE,x
     lda TURRET_FIRE_TIMER,x
@@ -350,6 +366,106 @@ updateBackgroundTurrets:
     jmp !turret-
 !done:
     rts
+
+// --- Routine: pulseTurretColour ------------------------------------------
+// A cheap continuous pulse on the fourth multicolour colour (bit-pair 11) of
+// the cells occupied by visible, alive turrets, so a static emplacement stays
+// visually distinct from ordinary terrain. ONLY the four colour-RAM cells per
+// visible turret are written; bit 3 stays set (cell remains multicolour); only
+// legal low-3 colours are used. $D021/$D022/$D023 and all other colour RAM are
+// untouched, so ordinary terrain colour is completely stable. Called once per
+// gameplay frame right after positionBackgroundTurrets (fresh TURRET_Y), at
+// ~raster 20 - well before any terrain colour-RAM badline fetch.
+pulseTurretColour:
+    dec TURRET_PULSE_TIMER
+    bne !phaseReady+
+    lda #TURRET_PULSE_INTERVAL
+    sta TURRET_PULSE_TIMER
+    ldx TURRET_PULSE_INDEX
+    inx
+    cpx #TURRET_PULSE_LEN
+    bcc !storeIdx+
+    ldx #0
+!storeIdx:
+    stx TURRET_PULSE_INDEX
+!phaseReady:
+    ldx TURRET_PULSE_INDEX
+    lda turretPulseTable,x
+    ora #$08                               // Keep the multicolour selector bit set.
+    sta TURRET_PULSE_COLOUR
+
+    ldx #0
+!turret:
+    stx TURRET_INDEX
+    lda TURRET_VISIBLE,x
+    beq !restoreOnly+
+    lda TURRET_HEALTH,x
+    beq !restoreOnly+
+    lda TURRET_Y,x                          // matrix row of the turret's top-left cell:
+    sec
+    sbc RASTER_DISPLAY_FINE                 //   (TURRET_Y - fine - 64) / 8 + 1  == relative row + 1
+    sbc #63                                 // carry still set from the previous sbc.
+    lsr
+    lsr
+    lsr
+    clc
+    adc #1
+    bne !haveRow+                           // (a visible turret is always matrix row >= 2)
+!restoreOnly:
+    lda #0                                  // Nothing to paint this frame: only restore the old cells.
+!haveRow:
+    cmp TURRET_CRAM_ROW,x
+    beq !samePaint+
+    pha                                    // New target matrix row (0 = none).
+    ldy TURRET_CRAM_ROW,x
+    beq !noOldRow+
+    lda #TERRAIN_COLOUR_RAM                // Return the vacated cells to the fixed terrain colour.
+    jsr paintTurretCells
+!noOldRow:
+    pla
+    sta TURRET_CRAM_ROW,x
+!samePaint:
+    ldy TURRET_CRAM_ROW,x
+    beq !next+
+    lda TURRET_PULSE_COLOUR
+    jsr paintTurretCells
+!next:
+    ldx TURRET_INDEX
+    inx
+    cpx #TURRET_COUNT
+    bne !turret-
+    rts
+
+// Y = matrix row (2..24), X = turret index, A = colour byte.
+// Writes the turret's four 2x2 colour-RAM cells. Clobbers A, X, Y, TEXT_SRC/DST.
+paintTurretCells:
+    sta TURRET_PULSE_WRITE
+    lda cramRowLo,y
+    sta TEXT_SRC
+    lda cramRowHi,y
+    sta TEXT_SRC + 1
+    iny
+    lda cramRowLo,y
+    sta TEXT_DST
+    lda cramRowHi,y
+    sta TEXT_DST + 1
+    ldx TURRET_INDEX
+    ldy turretWorldCol,x
+    lda TURRET_PULSE_WRITE
+    sta (TEXT_SRC),y
+    sta (TEXT_DST),y
+    iny
+    sta (TEXT_SRC),y
+    sta (TEXT_DST),y
+    rts
+
+turretPulseTable:
+    .byte 1, 2, 7, 2                        // white, red, yellow, red  (TURRET_PULSE_LEN entries)
+
+// $D800 + row*40 for matrix rows 0..25 (25 is one past the last visible row,
+// referenced only as the "row+1" bottom half of a turret at the aperture edge).
+cramRowLo: .fill 26, <($d800 + i*40)
+cramRowHi: .fill 26, >($d800 + i*40)
 
 // Six discrete directions; compare the horizontal origins with a24-pixel
 // dead band. Subtraction includes the ninth X bit, never an8-bit wrap guess.
@@ -472,6 +588,12 @@ TURRET_GLYPH_PUBLICATIONS: .byte 0
 BULLET_SPAWN_X_LO:     .byte 0
 BULLET_SPAWN_X_HI:     .byte 0
 BULLET_SPAWN_Y:        .byte 0
+TURRET_CRAM_ROW:      .fill TURRET_COUNT,0   // Matrix row whose colour RAM currently holds this turret's
+                                             // pulse colour (0 = none painted -> restore not needed).
+TURRET_PULSE_TIMER:   .byte 0                // Frames until the next pulse-colour step.
+TURRET_PULSE_INDEX:   .byte 0                // Index into turretPulseTable.
+TURRET_PULSE_COLOUR:  .byte 0                // Current pulse colour byte (bit 3 set).
+TURRET_PULSE_WRITE:   .byte 0                // paintTurretCells scratch.
 TURRET_STATE_END:
 .if (TURRET_STATE_END - TURRET_STATE_BEGIN > 128) {
     .error "Turret state clear loop exceeds signed-X range"

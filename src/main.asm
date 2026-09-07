@@ -429,6 +429,7 @@ gameLoop:
 
 !frameLoop:
     jsr positionBackgroundTurrets           // Presented world coordinates for this frame's hitscan.
+    jsr pulseTurretColour                   // Static-turret fourth-colour pulse; turret colour RAM only.
     jsr updateEnemyHitEffects               // Advance enemy death animation and prior-frame hit colour flash.
     jsr updatePlayerCombatEffects           // Decay prior-frame muzzle-flash and fire-cooldown timers.
     jsr updateObjects                       // Update movement and allow the player to fire this frame.
@@ -450,6 +451,9 @@ gameLoop:
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
+    jsr planCoarseBulletSuppression         // Presentation only: may omit ONE hostile projectile from
+                                            // this BUILD plan when its late batch would block a pending
+                                            // coarse transition. Logical projectile unchanged.
     // FREE cycle diagnostic DISABLED for the scroll-hitch timing baseline.
     // updateCycleDebug samples the raster and, every 50th frame, runs a
     // repeated-subtraction decimal conversion (displayCycleMinimum) - all of it
@@ -460,6 +464,8 @@ gameLoop:
     // Re-enable by uncommenting this one call.
     //jsr updateCycleDebug                  // Record the worst-case remaining free-cycle budget this frame.
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
+    jsr noteCoarseSuppressionOutcome        // Diagnostic: record whether a suppression avoided / failed to
+                                            // avoid a deferral, and whether an omitted projectile returned.
     jsr refreshScoreIfDirty                 // Deferred HUD score-digit rebuild: AFTER the coarse-prepare
                                             // admission test (so a kill cannot delay it) and before the
                                             // frame-end wait (so screen RAM is current well before the
@@ -2983,6 +2989,7 @@ buildBatchSpriteSchedule:
 !done:
     rts                                     // Return to the calling routine.
 
+
 // --- Routine: setupLivesDisplay --------------------------------------------
 // Initialise the stock and draw the compact top-row lives HUD.
 setupLivesDisplay:
@@ -4910,6 +4917,14 @@ initBackground:
     sta BG_COARSE_PENDING
     sta BG_COARSE_FINISH
     sta BG_COARSE_DEFERRED
+    ldx #SUPPRESS_STATE_END - SUPPRESS_STATE_BEGIN - 1   // Reset the presentation-suppression diagnostics.
+!clearSuppress:
+    sta SUPPRESS_STATE_BEGIN,x
+    dex
+    bpl !clearSuppress-
+    lda #$ff
+    sta SUPPRESS_LAST_ID
+    sta SUPPRESS_PREV_ID
     lda #0
     sta SCROLL_ROW                           // Initial stage position: logical row 0 begins at screen row 1.
 
@@ -5247,6 +5262,219 @@ bgLowerReady:
 !done:
     rts
 
+// --- Routine: planCoarseBulletSuppression --------------------------------
+// PRESENTATION ONLY. Called after buildBatchSpriteSchedule and before
+// prepareBackgroundCoarse. If a coarse transition is pending AND the just-built
+// BUILD plan holds a sprite batch whose compare raster is at/after the coarse
+// admission cutoff (a batch the IRQ cannot possibly consume before the coarse
+// copy would be admitted) AND a hostile projectile in that batch is binding it,
+// drop exactly that one projectile from THIS BUILD presentation and rebuild the
+// batch schedule. Never the player (slot 0), never an enemy (type 2): only
+// TYPE_ENEMY_BULLET. The logical projectile is not touched at all - it stays
+// OBJECT_ACTIVE, keeps its type/velocity/lifetime, keeps counting toward
+// ENEMY_BULLET_COUNT/MAX_ENEMY_BULLETS, is collision-tested here for the omitted
+// frame, and is rendered normally again on the next presentation. The BUILD
+// plan is main-thread scratch; LIVE and the prepareBackgroundCoarse gate stay
+// untouched.
+.const SUPPRESS_LEFT   = TEMP_OBJECT        // assignment-scan counter (clobbered by the rebuild JSR)
+.const SUPPRESS_BEST_Y = TEMP_SORT_Y        // smallest ASSIGN_Y seen ($ff = none)
+.const SUPPRESS_BEST   = TEMP_SORT_I        // logical id of that projectile
+.const SUPPRESS_TARGET = TEMP_OBJECT_Y      // chosen projectile id, held across the SORTED_OBJECTS edit
+planCoarseBulletSuppression:
+    lda #0
+    sta SUPPRESS_THIS_FRAME
+    lda BG_COARSE_DEFERRED
+    sta SUPPRESS_PRE_DEFER
+
+    lda BG_COARSE_PENDING                   // No coarse pending -> this mechanism is inert.
+    bne !pending+
+    rts
+!pending:
+    ldy BUILD_PLAN
+    lda BATCH_COUNT,y
+    bne !haveBatches+
+    rts
+!haveBatches:
+    sta TEMP_MSB                            // A = BATCH_COUNT[BUILD]; keep it for the scan.
+    ldx #0                                  // Find an obstructing batch.
+!scanBatch:
+    cpx TEMP_MSB
+    bcc !batchInRange+
+    rts                                     // Every batch is early/legal (fixture B: count>8 is fine).
+!batchInRange:
+    txa
+    clc
+    adc BUILD_PLAN
+    tay
+    lda BATCH_RASTER,y
+    cmp #BG_COARSE_LATEST_START
+    bcs !obstructing+
+    inx
+    jmp !scanBatch-
+
+!obstructing:                               // Y = obstructing batch array index.
+    lda BATCH_FIRST_ASSIGN,y
+    clc
+    adc BUILD_PLAN
+    tax                                     // X = first assignment array index.
+    lda BATCH_ASSIGN_COUNT,y
+    sta SUPPRESS_LEFT
+    lda #$ff
+    sta SUPPRESS_BEST_Y
+    sta SUPPRESS_BEST
+!scanAssign:
+    lda SUPPRESS_LEFT
+    beq !assignDone+
+    ldy ASSIGN_OBJECT,x
+    lda OBJECT_TYPE,y
+    cmp #TYPE_ENEMY_BULLET                  // Only hostile projectiles are eligible.
+    bne !nextAssign+
+    lda ASSIGN_Y,x
+    cmp SUPPRESS_BEST_Y                     // Prefer the lowest-Y projectile (it binds BATCH_RASTER).
+    bcs !nextAssign+
+    sta SUPPRESS_BEST_Y
+    sty SUPPRESS_BEST
+!nextAssign:
+    inx
+    dec SUPPRESS_LEFT
+    bne !scanAssign-
+!assignDone:
+    lda SUPPRESS_BEST
+    cmp #$ff
+    bne !haveBullet+
+    inc SUPPRESS_NO_ELIGIBLE                // Obstruction is a player/enemy assignment - not touched.
+    bne !ne1+
+    inc SUPPRESS_NO_ELIGIBLE + 1
+!ne1:
+    rts
+
+!haveBullet:
+    sta SUPPRESS_TARGET
+    tax
+    stx SUPPRESS_LAST_ID
+    lda OBJECT_Y,x
+    sta SUPPRESS_LAST_Y
+    lda OBJECT_Y                            // player OBJECT_Y (slot 0)
+    sta SUPPRESS_LAST_PLAYER_Y
+
+    ldy #0                                  // Remove SUPPRESS_TARGET from SORTED_OBJECTS.
+!findSorted:
+    lda SORTED_OBJECTS,y
+    cmp SUPPRESS_TARGET
+    beq !foundSorted+
+    iny
+    cpy SORTED_COUNT
+    bne !findSorted-
+    rts                                     // Not in the sorted list (should not happen): leave the plan.
+!foundSorted:                               // Y = its index; shift the tail down one.
+!shiftSorted:
+    iny
+    cpy SORTED_COUNT
+    bcs !shiftDone+
+    lda SORTED_OBJECTS,y
+    dey
+    sta SORTED_OBJECTS,y
+    iny
+    jmp !shiftSorted-
+!shiftDone:
+    dec SORTED_COUNT
+
+    jsr buildBatchSpriteSchedule            // Rebuild BUILD batches without the omitted projectile.
+
+    ldy BUILD_PLAN                          // Outcome: does an obstructing batch still exist?
+    lda BATCH_COUNT,y
+    beq !resolved+
+    sta TEMP_MSB
+    ldx #0
+!recheck:
+    cpx TEMP_MSB
+    bcs !resolved+
+    txa
+    clc
+    adc BUILD_PLAN
+    tay
+    lda BATCH_RASTER,y
+    cmp #BG_COARSE_LATEST_START
+    bcs !stillObstructed+
+    inx
+    jmp !recheck-
+!stillObstructed:
+    inc SUPPRESS_UNRESOLVED
+    bne !record+
+    inc SUPPRESS_UNRESOLVED + 1
+    jmp !record+
+!resolved:
+    inc SUPPRESS_RESOLVED
+    bne !record+
+    inc SUPPRESS_RESOLVED + 1
+
+!record:
+    inc SUPPRESS_TOTAL
+    bne !t1+
+    inc SUPPRESS_TOTAL + 1
+!t1:
+    lda #1
+    sta SUPPRESS_THIS_FRAME
+
+    lda SUPPRESS_LAST_ID                    // consecutive-presentation run for one projectile
+    cmp SUPPRESS_PREV_ID
+    bne !newRun+
+    inc SUPPRESS_CONSEC
+    jmp !consecMax+
+!newRun:
+    lda #1
+    sta SUPPRESS_CONSEC
+!consecMax:
+    lda SUPPRESS_CONSEC
+    cmp SUPPRESS_CONSEC_MAX
+    bcc !consecDone+
+    sta SUPPRESS_CONSEC_MAX
+!consecDone:
+    lda SUPPRESS_LAST_ID
+    sta SUPPRESS_PREV_ID
+
+    ldx SUPPRESS_LAST_ID                    // Collision safety for the omitted frame: run the exact
+    lda PLAYER_STATE                        // overlap test the IRQ path would have used.
+    bne !done+
+    jsr checkBulletPlayerOverlap
+    bcc !done+
+.if (DEBUG_PLAYER_INVULNERABLE == 0) {
+    lda #1
+    sta PLAYER_HIT
+}
+!done:
+    rts
+
+// --- Routine: noteCoarseSuppressionOutcome ------------------------------
+// Called right after prepareBackgroundCoarse (which is itself untouched).
+noteCoarseSuppressionOutcome:
+    lda SUPPRESS_THIS_FRAME
+    bne !suppressed+
+    lda SUPPRESS_PREV_ID                    // A frame passed without a suppression: the previously
+    cmp #$ff                                // omitted projectile, if still active, presented normally.
+    beq !clearRun+
+    tax
+    lda OBJECT_ACTIVE,x
+    beq !clearRun+
+    inc SUPPRESS_RETURNED
+    bne !clearRun+
+    inc SUPPRESS_RETURNED + 1
+!clearRun:
+    lda #$ff
+    sta SUPPRESS_PREV_ID
+    lda #0
+    sta SUPPRESS_CONSEC
+    rts
+!suppressed:
+    lda BG_COARSE_DEFERRED                  // Did a coarse deferral still occur this frame?
+    cmp SUPPRESS_PRE_DEFER
+    beq !done+
+    inc SUPPRESS_DEFER_AFTER
+    bne !done+
+    inc SUPPRESS_DEFER_AFTER + 1
+!done:
+    rts
+
 BG_COARSE_PENDING:     .byte 0
 BG_COARSE_FINISH:      .byte 0
 BG_COARSE_DEFERRED:    .byte 0
@@ -5255,6 +5483,26 @@ BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data
                                          // copyIncomingRowToScreen then copies it to a screen row. Never
                                          // touched by the crossing-row save/restore mechanism (that
                                          // buffer, BG_CROSSING_ROW, lives separately near SCROLL_ROW).
+
+// --- Presentation-only hostile-projectile suppression diagnostics ---------
+// Memory counters only (no HUD, no decimal formatting). Reset by initBackground.
+SUPPRESS_STATE_BEGIN:
+SUPPRESS_TOTAL:         .word 0   // Hostile-projectile presentations omitted for one physical frame.
+SUPPRESS_RESOLVED:      .word 0   //  ... where removing that one projectile cleared the obstructing batch.
+SUPPRESS_UNRESOLVED:    .word 0   //  ... where a batch still obstructed; the existing safe deferral stands.
+SUPPRESS_NO_ELIGIBLE:   .word 0   // Coarse conflict + obstructing batch, but no hostile projectile in it.
+SUPPRESS_DEFER_AFTER:   .word 0   // A coarse deferral still occurred on a frame a projectile was suppressed.
+SUPPRESS_RETURNED:      .word 0   // A previously suppressed, still-active projectile presented normally again.
+SUPPRESS_LAST_ID:       .byte $ff // Logical id of the most recently suppressed projectile.
+SUPPRESS_LAST_Y:        .byte 0   // Its OBJECT_Y at suppression.
+SUPPRESS_LAST_PLAYER_Y: .byte 0   // Player OBJECT_Y at that moment.
+SUPPRESS_PREV_ID:       .byte $ff // Projectile suppressed on the previous presentation ($ff = none).
+SUPPRESS_CONSEC:        .byte 0   // Current consecutive-presentation suppression run for one projectile.
+SUPPRESS_CONSEC_MAX:    .byte 0   // Largest observed consecutive suppression run for one projectile.
+SUPPRESS_THIS_FRAME:    .byte 0   // Nonzero if a projectile was suppressed this frame (outcome note).
+SUPPRESS_PRE_DEFER:     .byte 0   // BG_COARSE_DEFERRED snapshot taken just before prepareBackgroundCoarse.
+SUPPRESS_STATE_END:
+
 BACKGROUND_CONTROL_END:
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"

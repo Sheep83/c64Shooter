@@ -192,3 +192,167 @@ the IRQ). Not observed as a sprite-start miss in these 8 candidate captures
 ## Status: sorter progression fix + FREE runtime disable landed. Clean baseline
 ## established. Multi-frame stalls that remain are the proven batch-gate class.
 ## No commits/pushes.
+
+## ================================================================
+## FOLLOW-UP - presentation-only projectile suppression + static turrets + pulse
+## ================================================================
+## Starts from HEAD d186d5901d0ed... (sorter fix + FREE-disable committed as
+## "bg-gfx stall identified, pre-fix commit"). Baseline PRG b2a453aa.
+## New PRG for this pass: 03e4f7a95139ab36028ee5d7be898939be1d94722b92b78deeffa802a5bda7c0
+## No commits/pushes.
+
+### Task A/B - presentation-only hostile-projectile suppression
+
+New routines in src/main.asm, in the $2920 background segment near
+prepareBackgroundCoarse (main pre-$1f00 region was full):
+- `planCoarseBulletSuppression` - called in gameLoop right AFTER
+  buildBatchSpriteSchedule, BEFORE prepareBackgroundCoarse. If BG_COARSE_PENDING
+  and the just-built BUILD plan has a batch with BATCH_RASTER >=
+  BG_COARSE_LATEST_START (184) - a batch the IRQ cannot consume before the
+  coarse copy would be admitted - it scans that batch's assignments for a
+  TYPE_ENEMY_BULLET (never id 0 / player, never type 2 / enemy), picks the
+  lowest-Y one (the constraint that binds BATCH_RASTER = min(ASSIGN_Y-12)),
+  removes it from SORTED_OBJECTS (main-thread scratch), and re-runs
+  buildBatchSpriteSchedule (idempotent; beginRasterPlanMasks fully rebuilds).
+  It re-checks; RESOLVED if no obstructing batch remains, UNRESOLVED otherwise
+  (the projectile stays omitted - strictly fewer sprites - and the existing safe
+  deferral stands; it does NOT cascade into dropping more objects). NO_ELIGIBLE
+  when the obstruction is a player/enemy assignment (nothing is dropped).
+  Collision safety: on the omitted frame it runs the exact `checkBulletPlayerOverlap`
+  test the IRQ path uses (guarded by DEBUG_PLAYER_INVULNERABLE, like the engine's
+  own !hit), so a suppressed projectile can still hit the player.
+- `noteCoarseSuppressionOutcome` - called right AFTER prepareBackgroundCoarse
+  (which is UNTOUCHED). Counts DEFER_AFTER (a coarse deferral still happened on
+  a suppression frame) and RETURNED (a previously omitted, still-active
+  projectile presented normally again), and resets the consecutive-run tracker.
+
+The logical projectile is never modified: still OBJECT_ACTIVE, still its type,
+still moving, still in ENEMY_BULLET_COUNT / the 3-cap, normal lifetime, not
+delayed/frozen/killed, re-rendered next presentation. Only its entry in the
+main-thread SORTED_OBJECTS for one BUILD is removed; LIVE, the IRQ, and the
+coarse-admission gate are untouched. BUILD/LIVE ownership preserved.
+
+Instrumentation (SUPPRESS_* memory words/bytes in the background control block,
+reset by initBackground; no HUD, no formatting): TOTAL, RESOLVED, UNRESOLVED,
+NO_ELIGIBLE, DEFER_AFTER, RETURNED, LAST_ID, LAST_Y, LAST_PLAYER_Y, PREV_ID,
+CONSEC, CONSEC_MAX, THIS_FRAME, PRE_DEFER. ~20 bytes. Per-frame cost on a
+non-suppression frame: `lda BG_COARSE_PENDING / beq` (or the BATCH_COUNT==0
+exit) - a few cycles. Real work only on the rare obstruction frame.
+
+### Task I - deterministic fixtures A-J (tools/vice_suppress_fixtures.py): ALL PASS
+- A (8 sprites): batch_count 0, no suppression.
+- B (9 sprites, 9th a HIGH bullet, BATCH_RASTER 138 < 184): no suppression.
+- C (9th a LOW bullet, BATCH_RASTER 224): 1 suppression, RESOLVED, sorted 9->8,
+  batch gone; bullet still active/type 3; ENEMY_BULLET_COUNT unchanged.
+- D (player id 0 lowest, Y 238, BATCH_RASTER 226): 0 suppressions, NO_ELIGIBLE=1;
+  the deferral would stand.
+- E (enemy lowest, Y 236): 0 suppressions, NO_ELIGIBLE=1.
+- F (two low bullets Y 230 + Y 244): exactly 1 suppression, UNRESOLVED=1
+  (a batch at raster 232 remains); does not drop a second object.
+- G (bullet overlapping the player): 1 suppression; bullet still active/type 3;
+  checkBulletPlayerOverlap returns carry set -> collision still detectable.
+- H (bullet survives, moves up next frame): re-run -> back in SORTED_OBJECTS,
+  no second suppression -> rendered normally.
+- I (bullet despawns): ENEMY_BULLET_COUNT 1 -> 0, object inactive.
+- J (BG_COARSE_PENDING = 0): obstructing batch present, 0 suppressions.
+
+### Task C/D - static turrets, aim-at-fire-time
+src/background_turrets.asm: `updateBackgroundTurrets` `!visible` no longer calls
+`aimBackgroundTurret`; the visible body is `TURRET_STATIC_STYLE = 4` (down-facing
+turretArt) unless flashing from a hit (style 6) or destroyed (style 7).
+`aimBackgroundTurret` kept in source (unreferenced by gameplay; still used by the
+functional test). ALL other turret behaviour retained: HP, hit detection,
+damage/hit-flash, death, underlay restore, stage wrap/reset, score,
+fire-timer/cadence, shared projectile allocation, MAX_ENEMY_BULLETS=3, the
+SORTED_COUNT>=8 turret-fire mitigation.
+Aimed fire unchanged: `spawnEnemyBulletAt` already computes the full
+player-relative X slope (chooseEnemyBulletSlope) from live OBJECT_X at spawn
+time; TURRET_AIM never fed the projectile - it was glyph-only. A static turret
+firing from the same spot at the same player position produces the identical
+projectile vector.
+CPU: `updateBackgroundTurrets` isolated cost 126..529 -> 126..452 (removed the
+per-visible-turret 59..74-cyc aim calc). Net reduction.
+
+### Task E/F - turret fourth-colour pulse
+`pulseTurretColour` (called once/frame after positionBackgroundTurrets, ~raster
+20, before any terrain colour badline): steps a restrained
+white/red/yellow/red table (`turretPulseTable = 1,2,7,2`; bit 3 ORed in so the
+cell stays multicolour; TURRET_PULSE_INTERVAL = 8 frames) and writes the current
+value to exactly the 4 colour-RAM cells of each visible, alive turret (matrix
+row from TURRET_Y - RASTER_DISPLAY_FINE; `cramRowLo/Hi` lookup). When a turret
+changes matrix row (coarse step) the vacated 4 cells are restored to
+TERRAIN_COLOUR_RAM first. $D021/$D022/$D023 and all non-turret colour RAM are
+untouched (oracle confirms terrain colour RAM stays the single value 9).
+All turrets pulse in phase. Colour changes only ~every 8 frames + on a row
+change; ~4-12 colour-RAM writes/turret/step.
+11-pixel coverage: turretArt style 4 is ~50%+ bit-pair-11 pixels (the $ff dome/
+base rows), so the pulse is strongly visible; the $55/$54 barrel-detail rows are
+$D022/$D023 and stay static. No glyph change needed.
+
+### Task H - 8-case hitch results (3500 frames/case, candidate 03e4f7a9)
+
+| case | prior (sort+FREE) | NEW | suppress TOTAL / RESOLVED / NO_ELIGIBLE / DEFER_AFTER | CONSEC_MAX |
+|---|---|---|---|---|
+| movement      | 0            | 0            | 0/0/0/0   | 0 |
+| enemy-nofire  | 0            | 0            | 0/0/0/0   | 0 |
+| fire-no-kills | 17 [17]      | 15 [11,3,1]  | 8/8/9/6   | 3 |
+| hits-kills    | 5 [5]        | 2 [2]        | 2/2/0/2   | 2 |
+| explosions    | 12 [8,3,1]   | 5 [5]        | 0/0/4/0   | 0 |
+| turret-heavy  | 0            | 0            | 0/0/0/0   | 0 |
+| bullet-heavy  | 0            | 0            | 0/0/0/0   | 0 |
+| combined      | 16 [16]      | 0           | 0/0/0/0   | 0 |
+| TOTAL         | 50, worst 17 | 22, worst 11 | - | - |
+
+- All 8: cadence [19656], 0 presentation replays / catchups, 0 check failures
+  (hostile bullet cap <=3, player logical slot 0, BUILD/LIVE {0,8}, trace-clock).
+- combined: 16-frame stall -> 0 (mostly CIA-timing divergence: 0 suppressions;
+  not a matched A/B).
+- hits-kills 5->2, explosions 12->5, fire-no-kills 17 -> [11,3,1]: where a low
+  HOSTILE PROJECTILE binds the obstructing batch, suppression clears it
+  (RESOLVED); multi-frame freezes shrink to short holds.
+- Remaining stalls: the obstructing batch is bound by a NON-projectile - the
+  fire-no-kills 11-frame stall (frames 2327-2337) is bound by
+  `(0, 1, 219)` = the PLAYER sprite low on screen (never suppressible); the
+  explosions 5-frame stall is bound by a low exploding ENEMY (NO_ELIGIBLE=4).
+  These are Codex's proven scheduler impossibility with a non-projectile late
+  object; not addressable by this mechanism.
+- DEFER_AFTER (fire-no-kills 6, hits-kills 2): the suppression + rebuild CPU on
+  the suppression frame can push prepareBackgroundCoarse past 184, turning that
+  one frame's batch-not-consumed defer into a raster-deadline defer. Net still a
+  1-frame hold, then the next frame admits. Acceptable per the task (occasional
+  safe deferral allowed; target is removal of visible multi-frame freezes).
+
+### Task J - full regression (candidate 03e4f7a9, 2700-frame --physical --trace)
+- check_fixed_hud_capture : 0 failures, 157.5M pixel checks, cadence [19656], MC
+  model + matrix + edge-motion pass, ordinary terrain colour RAM = single value
+  9 (turret pulse cells excluded from the fixed-colour check; validated instead
+  as legal MC selectors + by charset integrity + check_turret_capture).
+- check_scroll_capture    : 0 failures, 144.4M pixel checks, stage_loops 2.
+- check_scroll_edges      : 0 failures, 33.6M edge checks.
+- check_raster_capture    : 0 service failures, 0 sprite-start misses, 0 catchups,
+  0 replay frames, cadence [19656].
+- check_turret_capture    : 0 failures (positioning, HP, hit flash, death,
+  underlay restore, wrap re-entry, shared bullet cap, player slot 0, coarse).
+- check_viewport_capture  : 0 failures (viewport_edges, clip_eight, clip_boundary
+  solid captures).
+- vice_turret_cases       : 45 checks, 0 failures (hitscan/aim/fire/damage/
+  destruction/underlay/cap). updateBackgroundTurrets CPU 126..452 (was ..529).
+- vice_raster_lifecycle   : 0 failures, gameplay jiffy drift 0, turret reset ok.
+- vice_raster_cases       : 9 scheduler cases - 0 service failures, 0 sprite-
+  start misses, cadence [19656] each. (Legacy caveat: early24/player37/
+  overlap55/late243 emit 0 batches under the current viewport filter and no
+  longer exercise those numeric compares.)
+- vice_turret_kill_timing : score dirty/deferred rendering intact - fatal-hit
+  critical path flat 75 cyc, 0/40 fatal-only deferrals.
+- sortObjectsByY direct A/B : 0 stable-order failures; worst-case 10673 -> 4373
+  (unchanged - the corrected sort is not touched by this pass).
+
+### Known separate issue (NOT fixed here, as instructed)
+The two raster-deadline (CPU-only) deferrals per run - isolated single frames,
+one still traceable to updateEnemyHealthSprite's 64-byte clone on a non-fatal
+hit. Left for a separate bounded task. applyLiveRasterBatch collision-narrow-
+phase: not observed as a sprite-start miss in these 8 candidate captures.
+
+### Status: presentation-only projectile suppression + static turrets + fourth-
+### colour pulse implemented and validated. All fixtures A-J pass. No STOP
+### condition hit. No commits/pushes.
