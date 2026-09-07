@@ -450,7 +450,15 @@ gameLoop:
     jsr sortObjectsByY                      // Call sortObjectsByY; return here when it executes RTS.
     jsr buildInitialSpriteSnapshot          // Call buildInitialSpriteSnapshot; return here when it executes RTS.
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
-    jsr updateCycleDebug                    // Record the worst-case remaining free-cycle budget this frame.
+    // FREE cycle diagnostic DISABLED for the scroll-hitch timing baseline.
+    // updateCycleDebug samples the raster and, every 50th frame, runs a
+    // repeated-subtraction decimal conversion (displayCycleMinimum) - all of it
+    // BEFORE prepareBackgroundCoarse, where it was measured to push coarse
+    // admission past raster 184 and defer the scroll on its own. The routine,
+    // its DEBUG_MIN_* counters and displayCycleMinimum stay in the source and
+    // are simply not called; the fixed "FREE 00000" HUD label stays static.
+    // Re-enable by uncommenting this one call.
+    //jsr updateCycleDebug                  // Record the worst-case remaining free-cycle budget this frame.
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
     jsr refreshScoreIfDirty                 // Deferred HUD score-digit rebuild: AFTER the coarse-prepare
                                             // admission test (so a kill cannot delay it) and before the
@@ -2491,6 +2499,14 @@ sortObjectsByY:
     ldy #1                                  // Load Y from #1.
 
 !outer:
+    sty TEMP_SORT_I                         // Remember the outer INPUT index. The inner loop below
+                                            // decrements Y through the sorted prefix and leaves it at
+                                            // the insertion point (or $ff for a front insertion); the
+                                            // next pass must resume from this input index + 1, not
+                                            // from wherever the shift stopped. Resuming from the shift
+                                            // position and stepping twice re-scans the already-sorted
+                                            // prefix every pass (a front insertion restarted the whole
+                                            // list), which is pure wasted CPU before prepareBackgroundCoarse.
     lda SORTED_OBJECTS,y                    // Load A from SORTED_OBJECTS,y.
     sta TEMP_OBJECT                         // Store A in TEMP_OBJECT.
     tax                                     // Copy A into X.
@@ -2519,8 +2535,8 @@ sortObjectsByY:
     sta SORTED_OBJECTS + 1,y                // Store A in SORTED_OBJECTS + 1,y.
 
 !next:
-    iny                                     // Increment Y by one.
-    iny                                     // Increment Y by one.
+    ldy TEMP_SORT_I                         // Resume from the outer INPUT index, not the shift position.
+    iny                                     // Advance to the next unsorted item (exactly once).
     cpy SORTED_COUNT                        // Compare Y with SORTED_COUNT; set flags, leaving Y unchanged.
     bcc !outer-                             // Branch to !outer- if carry is clear.
 !done:

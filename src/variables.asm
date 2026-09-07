@@ -31,6 +31,10 @@
 .var JOY_STATE                = $0030
 .var TEMP_OBJECT              = $0031
 .var TEMP_SORT_Y              = $0032
+.var TEMP_SORT_I              = $0033     // sortObjectsByY outer input index, preserved across the
+                                         // inner shift loop (which walks Y down through the sorted
+                                         // prefix). $33 was the one free byte in this scratch block
+                                         // and is referenced nowhere else, including the raster IRQ.
 .var TEMP_OBJECT_Y            = $0034
 .var TEMP_EVENT_INDEX         = $0035
 .var TEMP_FREE_RASTER         = $0036

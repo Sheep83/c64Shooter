@@ -82,11 +82,21 @@ def main():
             if dead_since[t] is None or not dead_reentries[t]:failures.append([t,'missing destroyed wrap reentry'])
             if t not in hit_styles:failures.append([t,'no captured hit flash'])
         if not any(d['turret']==2 and d['y']>=224 for d in deaths):failures.append(['missing destruction before bottom exit'])
+    # The FREE cycle diagnostic is intentionally disabled in this build (its
+    # runtime update contributes zero gameplay-frame CPU), so the FREE digits
+    # are static "00000" and DEBUG_FREE_* stays 0. Report that instead of
+    # crashing on the now-empty sample set; the turret correctness checks above
+    # are unchanged.
+    live_free=[v for v in displayed if v]
+    nonzero_samples={k:[v for v in vs if v] for k,vs in samples.items()}
     summary=dict(frames=len(records),coarse_transitions=coarse,stage_circuits=coarse/stage_rows,
         deaths=deaths,dead_reentries=dead_reentries,hit_flash_turrets=sorted(hit_styles),
         deferrals=deferrals,shots_fired_mod256=previous_shots,
-        hud_free=dict(min=min(v for v in displayed if v),median=statistics.median(displayed),max=max(displayed)),
-        free_samples={k:dict(count=len(v),min=min(v),median=statistics.median(v),max=max(v)) for k,v in samples.items() if v},
+        hud_free=(dict(min=min(live_free),median=statistics.median(live_free),max=max(live_free))
+                  if live_free else 'disabled (static FREE display)'),
+        free_samples=({k:dict(count=len(v),min=min(v),median=statistics.median(v),max=max(v))
+                       for k,v in nonzero_samples.items() if v}
+                      or 'disabled (FREE diagnostic not updated at runtime)'),
         failure_count=len(failures),failures=failures[:24])
     (root/'turret-verification.json').write_text(json.dumps(summary,indent=2))
     print(json.dumps(summary,indent=2))
