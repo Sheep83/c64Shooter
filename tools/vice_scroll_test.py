@@ -58,6 +58,10 @@ def main():
     parser.add_argument('--prg', type=Path, default=Path('build/shooter.prg'))
     parser.add_argument('--frames', type=int, default=600)
     parser.add_argument('--command', action='append', default=[])
+    parser.add_argument('--seed-scroll', type=int, default=None,
+                        help='After the game starts, force SCROLL_ROW (16-bit) '
+                             'to this logical row so a large stage reaches its '
+                             'end->start wrap within the capture window.')
     args = parser.parse_args()
     mon = Monitor(args.port)
     if args.command:
@@ -83,6 +87,23 @@ def main():
     mon.cmd('x')
     mon.cmd('jpdb 1 ff')
     mon.cmd('delete')
+    if args.seed_scroll is not None:
+        # Force the stage position BEFORE initBackground draws the first screen,
+        # so the whole matrix is rendered consistently for the seeded row (no
+        # transient while the scroller replaces stale rows one per coarse step).
+        mon.cmd(f'break {sym["initBackground"]:04x}')
+        mon.cmd('x')
+        mon.cmd(f'> {sym["SCROLL_ROW"]:04x} {args.seed_scroll & 0xff:02x} '
+                f'{(args.seed_scroll >> 8) & 0xff:02x}')
+        # initBackground's own `lda #0 / sta SCROLL_ROW(_HI)` would undo the poke;
+        # step past those two stores (they are the first thing it does after the
+        # coarse-flag clears). Re-poke right after instead, at the row loop.
+        mon.cmd('delete')
+        mon.cmd(f'break {sym["renderStageRowToScreen"]:04x}')
+        mon.cmd('x')
+        mon.cmd(f'> {sym["SCROLL_ROW"]:04x} {args.seed_scroll & 0xff:02x} '
+                f'{(args.seed_scroll >> 8) & 0xff:02x}')
+        mon.cmd('delete')
     mon.cmd(f'break {sym["applyFineScroll"]:04x}')
     mon.cmd('x')
     mon.cmd('jpdb 1 ef')

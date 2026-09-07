@@ -90,14 +90,14 @@ initBackgroundTurrets:
     sta TURRET_CELL_ROW
 !row:
     ldx TURRET_INDEX
-    lda turretWorldRow,x
+    lda turretWorldRow,x                    // BG_LOGICAL_ROW(16) = turretWorldRow(16) + TURRET_CELL_ROW (0/1).
     clc
     adc TURRET_CELL_ROW
-    cmp #STAGE_LOGICAL_ROWS
-    bcc !rowReady+
-    sbc #STAGE_LOGICAL_ROWS
-!rowReady:
     sta BG_LOGICAL_ROW
+    lda turretWorldRowHi,x
+    adc #0
+    sta BG_LOGICAL_ROW_HI
+    jsr wrapBgLogicalRow
     jsr decodeStageCharacterRow             // Raw terrain only; the decoder knows nothing about turrets.
     ldx TURRET_INDEX
     lda turretWorldCol,x
@@ -171,17 +171,52 @@ initBackgroundTurrets:
 // or destroyed - renders with that same fixed multicolour palette; the turret
 // glyph bitmaps (turretArt / the cached underlay) are authored/kept as valid
 // multicolour bitmaps. No turret-specific colour-RAM handling exists.
+// BG_LOGICAL_ROW(16) is the world character row just installed. With TURRET_COUNT
+// small and world rows now 16-bit (a 1,600-row stage cannot use a 256-entry
+// row-indexed LUT), match it directly against each turret's two body rows. At
+// most one turret matches (placement guard forbids shared body rows). O(1) hook,
+// only two CHARACTER cells written, BG_INCOMING_ROW and the decoder untouched.
 installTurretRow:
-    ldx BG_LOGICAL_ROW
-    lda turretRowGlyph,x
-    beq !done+
-    ldy turretRowColumn,x
+    ldx #TURRET_COUNT - 1
+!scan:
+    lda BG_LOGICAL_ROW
+    cmp turretWorldRow,x
+    bne !notTop+
+    lda BG_LOGICAL_ROW_HI
+    cmp turretWorldRowHi,x
+    bne !notTop+
+    txa                                    // Top body row of turret x -> glyph TURRET_GLYPH_BASE + x*4.
+    asl
+    asl
+    clc
+    adc #TURRET_GLYPH_BASE
+    jmp !install+
+!notTop:
+    lda BG_LOGICAL_ROW
+    cmp turretWorldRow2,x
+    bne !nextT+
+    lda BG_LOGICAL_ROW_HI
+    cmp turretWorldRow2Hi,x
+    bne !nextT+
+    txa                                    // Bottom body row -> glyph TURRET_GLYPH_BASE + x*4 + 2.
+    asl
+    asl
+    clc
+    adc #TURRET_GLYPH_BASE + 2
+!install:
+    pha
+    lda turretWorldCol,x
+    tay
+    pla
     sta (TEXT_DST),y
     clc
     adc #1
     iny
     sta (TEXT_DST),y
-!done:
+    rts
+!nextT:
+    dex
+    bpl !scan-
     rts
 
 // One dirty body per presented frame gives a fixed upper cost, independent of
@@ -248,14 +283,34 @@ positionBackgroundTurrets:
 !turret:
     lda #0
     sta TURRET_VISIBLE,x
-    lda turretWorldRow,x
-    sec
+    lda turretWorldRow,x                    // rel(16) = (turretWorldRow(16) - SCROLL_ROW(16))
+    sec                                     //           mod STAGE_LOGICAL_ROWS
     sbc SCROLL_ROW
+    sta TURRET_REL_LO
+    lda turretWorldRowHi,x
+    sbc SCROLL_ROW_HI
+    sta TURRET_REL_HI
     bcs !relative+
-    adc #STAGE_LOGICAL_ROWS                 // Carry clear: add100 to a negative byte difference.
+    lda TURRET_REL_LO
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta TURRET_REL_LO
+    lda TURRET_REL_HI
+    adc #>STAGE_LOGICAL_ROWS
+    sta TURRET_REL_HI
 !relative:
-    cmp #STAGE_LOGICAL_ROWS - 1
-    beq !above+
+    lda TURRET_REL_HI                       // rel == STAGE_LOGICAL_ROWS - 1: body's bottom row is the
+    cmp #>(STAGE_LOGICAL_ROWS - 1)          // incoming row, so its top is one row above the aperture.
+    bne !notAbove+
+    lda TURRET_REL_LO
+    cmp #<(STAGE_LOGICAL_ROWS - 1)
+    bne !notAbove+
+    lda #56
+    jmp !fine+
+!notAbove:
+    lda TURRET_REL_HI
+    bne !next+                              // rel >= 256 -> far below the aperture; not visible.
+    lda TURRET_REL_LO
     cmp #23
     bcs !next+
     asl
@@ -263,9 +318,6 @@ positionBackgroundTurrets:
     asl
     clc
     adc #64
-    jmp !fine+
-!above:
-    lda #56                                 // Top of a body whose bottom world row is the incoming row.
 !fine:
     clc
     adc RASTER_DISPLAY_FINE
@@ -594,33 +646,26 @@ TURRET_PULSE_TIMER:   .byte 0                // Frames until the next pulse-colo
 TURRET_PULSE_INDEX:   .byte 0                // Index into turretPulseTable.
 TURRET_PULSE_COLOUR:  .byte 0                // Current pulse colour byte (bit 3 set).
 TURRET_PULSE_WRITE:   .byte 0                // paintTurretCells scratch.
+TURRET_REL_LO:        .byte 0                // positionBackgroundTurrets: (turretWorldRow - SCROLL_ROW)
+TURRET_REL_HI:        .byte 0                // mod STAGE_LOGICAL_ROWS, 16-bit.
 TURRET_STATE_END:
 .if (TURRET_STATE_END - TURRET_STATE_BEGIN > 128) {
     .error "Turret state clear loop exceeds signed-X range"
 }
-turretWorldCol: .fill TURRET_COUNT,turretCols.get(i)
-turretWorldRow: .fill TURRET_COUNT,turretRows.get(i)
-turretWorldXLo: .fill TURRET_COUNT,<(24+turretCols.get(i)*8)
-turretWorldXHi: .fill TURRET_COUNT,>(24+turretCols.get(i)*8)
+// World-row placement is 16-bit now (a >=400-row stage has 1,600 logical
+// character rows). turretWorldCol / turretWorldRow(low) / turretWorldXLo stay
+// contiguous and one byte each so the existing capture dump
+// (turretWorldCol..turretWorldXLo-1) is unchanged for stages <= 256 rows.
+// turretWorldRow2 is the body's second (bottom) character row = (row+1) mod
+// STAGE_LOGICAL_ROWS, precomputed so installTurretRow needs no runtime wrap.
+turretWorldCol:    .fill TURRET_COUNT,turretCols.get(i)
+turretWorldRow:    .fill TURRET_COUNT,<turretRows.get(i)
+turretWorldXLo:    .fill TURRET_COUNT,<(24+turretCols.get(i)*8)
+turretWorldXHi:    .fill TURRET_COUNT,>(24+turretCols.get(i)*8)
+turretWorldRowHi:  .fill TURRET_COUNT,>turretRows.get(i)
+turretWorldRow2:   .fill TURRET_COUNT,<mod(turretRows.get(i)+1, STAGE_LOGICAL_ROWS)
+turretWorldRow2Hi: .fill TURRET_COUNT,>mod(turretRows.get(i)+1, STAGE_LOGICAL_ROWS)
 
-.align $100
-turretRowGlyph:
-.for (var row = 0; row < STAGE_LOGICAL_ROWS; row++) {
-    .var code = 0
-    .for (var t = 0; t < TURRET_COUNT; t++) {
-        .if (row == turretRows.get(t)) { .eval code = TURRET_GLYPH_BASE+t*4 }
-        .if (row == mod(turretRows.get(t)+1, STAGE_LOGICAL_ROWS)) { .eval code = TURRET_GLYPH_BASE+t*4+2 }
-    }
-    .byte code
-}
-turretRowColumn:
-.for (var row = 0; row < STAGE_LOGICAL_ROWS; row++) {
-    .var col = 0
-    .for (var t = 0; t < TURRET_COUNT; t++) {
-        .if (row == turretRows.get(t) || row == mod(turretRows.get(t)+1, STAGE_LOGICAL_ROWS)) { .eval col = turretCols.get(t) }
-    }
-    .byte col
-}
 .align $100
 turretGroundGlyphs: .fill TURRET_COUNT*32,0
 .align $100

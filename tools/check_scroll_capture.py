@@ -95,7 +95,10 @@ def main():
             addr = sym[name]
             return state[addr - 0x2000] if addr < 0x2400 else bg[addr - 0x2920]
         fine.append(record.get('physical_fine', get('SCROLL_FINE')))
-        rows.append(get('SCROLL_ROW'))
+        # SCROLL_ROW is 16-bit little-endian once the stage exceeds 255 logical
+        # rows (SCROLL_ROW_HI absent in pre-widening captures -> plain byte).
+        rows.append(get('SCROLL_ROW') +
+                    (256 * get('SCROLL_ROW_HI') if 'SCROLL_ROW_HI' in sym else 0))
         deferred.append(get('BG_COARSE_DEFERRED'))
         active.append(sum(state[sym['OBJECT_ACTIVE']-0x2000:sym['OBJECT_ACTIVE']-0x2000+16]))
         batches.append(max(get('BATCH_COUNT'),state[sym['BATCH_COUNT']-0x2000+8]))

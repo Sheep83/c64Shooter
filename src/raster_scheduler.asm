@@ -454,6 +454,6 @@ RASTER_STATE_END:
 .if (RASTER_STATE_END - RASTER_STATE_BEGIN > 128) {
     .error "Raster state clear loop exceeds signed X range"
 }
-.if (* > $8000) {
-    .error "Raster dispatcher exceeds its $6000-$7fff allocation"
+.if (* > $6600) {
+    .error "Raster dispatcher exceeds its $6000-$65ff allocation (the metatile stage data now begins at $6600)"
 }
