@@ -29,7 +29,7 @@ def real_metatile_defs():
     # Take the 16-tile tileset from the live generated stage (its metatileDefs
     # block is the real, engine-consumed tileset). run_stage_fixture.sh backs up
     # and restores the generated files around the fixture run.
-    text = (ROOT / 'src' / 'generated' / 'stage_test.asm').read_text(encoding='utf-8')
+    text = (ROOT / 'src' / 'generated' / 'level1' / 'stage_test.asm').read_text(encoding='utf-8')
     block = text.split('metatileDefs:', 1)[1].split('METATILE_DEFS_END', 1)[0]
     rows = []
     for line in block.splitlines():

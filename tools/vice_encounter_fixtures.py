@@ -141,6 +141,10 @@ def main():
             put('TURRET_VISIBLE', col(0, 0))
             put('TURRET_HEALTH', col(1, 0))
             put('TURRET_Y', col(2, 100))
+            # Streaming turret pool: mark every seeded slot OCCUPIED (auth index 0)
+            # so updateBackgroundTurrets / pulseTurretColour do not skip it as free.
+            if 'TURRET_SLOT_AUTH' in s:
+                put('TURRET_SLOT_AUTH', [0] * TCOUNT)
 
         def enemy_count():
             act = get('OBJECT_ACTIVE', 16)
@@ -218,6 +222,12 @@ def main():
         seed_turrets([(1, 3, 190), (0, 3, 100), (0, 3, 100)])   # Y>=180
         call('updateTurretPressure')
         put('SPAWN_TIMER', 0); put('WAVE_GAP_TIMER', 0); put('WAVE_SPAWN_INTERVAL', 0)
+        # If this build ships authored wave triggers, updateSpawner's !startNext
+        # takes the authored branch and needs a latched trigger; in autonomous
+        # mode this byte is ignored. Either way the encounter-budget contract
+        # (a full wave START is gated by turret pressure) is what is under test.
+        if 'WAVE_TRIGGER_FIRE' in s:
+            put('WAVE_TRIGGER_FIRE', 1)
         call('updateSpawner')
         started = (get('WAVE_SPAWNED')[0] >= 1 and get('WAVE_ENEMY_COUNT')[0] == 5
                    and enemy_count() >= ec0 + 1)
@@ -320,7 +330,6 @@ def main():
             seed_turrets([(1, 3, y), (0, 3, 100), (0, 3, 100)])
             put('TURRET_FIRE_TIMER', [0, 200, 200])
             put('TURRET_HIT_TIMER', [0, 0, 0])
-            put('TURRET_AIM', [4, 4, 4])
             put('SORTED_COUNT', 0)
             put('ENEMY_BULLET_COUNT', 0)
             put('TURRET_SHOTS_FIRED', 0)

@@ -206,3 +206,101 @@ Turret world rows are now 16-bit; `vice_scroll_test.py` additionally dumps
 / `check_turret_capture.py` / `check_fixed_hud_capture.py` reconstruct world
 rows as `lo + 256*hi`. `run_stage_fixture.sh` backs up / writes a minimal
 `stage_turrets.asm` for synthetic fixtures.
+
+---
+
+## Milestone: pre-merge level-authoring pass — viewport overlay, streaming
+## turret pool, authored wave triggers, two level packages
+
+**Status: done, uncommitted.** See `reports/pre-merge-level-authoring-pass.md`
+for the full report. Summary of the permanent contracts introduced here:
+
+### Generated-file layout is now per-level
+
+`src/generated/<level>/` holds **five** includes:
+
+| file | kind | owns |
+|---|---|---|
+| `stage_config.asm` | consts | `STAGE_METATILE_ROWS`, `SCROLL_FRAME_DIVIDER`, `TERRAIN_*` palette, `TERRAIN_COLOUR_RAM`, **`TERRAIN_GLYPH_COUNT`** (moved here from `main.asm`) |
+| `stage_charset.asm` | consts+data | **NEW** — `terrainGlyphs` / `terrainGlyphsEnd` byte block + size guard. The swappable tileset unit. Imported at the old inline-block PC in the `$2920` segment. |
+| `stage_test.asm` | data | `metatileDefs` (from the level's tileset) + `stageMetatileRows` |
+| `stage_turrets.asm` | consts+lists | **`TURRET_TOTAL`** (was `TURRET_COUNT`; 0..255) + `turretCols`/`turretRows` **sorted descending by world row** |
+| `stage_waves.asm` | consts+lists | **NEW** — `WAVE_TRIGGER_COUNT` + resolved `waveTrigger*` lists (rows desc) |
+
+`main.asm` imports the `level1/` set only. `level2/` is generated + committed but
+never `#import`-ed. The flat `src/generated/stage_*.asm` files are removed.
+
+### Char-memory ownership (unchanged addresses, clarified ownership)
+
+| codes | region | owner |
+|---|---|---|
+| 0–127 | ROM copy | permanent |
+| 128–159 | HUD/UI private (128–145 used, 146–159 reserved) | permanent engine/UI |
+| **160–223** | terrain glyph namespace, `$3D00–$3EFF`, 64 slots | **level-owned** — `TERRAIN_GLYPH_COUNT` authored (multiple of 8); bytes come from `stage_charset.asm` |
+| 224–225 | diagnostic rail/diagonal, `$3F00` | permanent |
+| 226–229 | ONE shared turret body glyph set (all live turrets) | engine runtime |
+| 230–239 | free | — |
+| 240–251 | starfield | permanent |
+| 252–255 | free | — |
+
+Future multiload: DMA/copy the next level's `terrainGlyphs` blob (always 64
+slots) into `$3D00` and patch `TERRAIN_GLYPH_COUNT` during the load transition.
+No format change required; not implemented this pass.
+
+### Streaming turret pool + shared body glyphs (`src/background_turrets.asm`)
+
+Authored count `TURRET_TOTAL` is unbounded (0..255, 8-bit stream cursor).
+`updateTurretStream` (frame loop, before `positionBackgroundTurrets`) admits an
+authored turret into a free pool slot once `SCROLL_ROW <= authRow + MARGIN`
+(cursor walks the desc-sorted list, never skipping) and evicts it once its `rel`
+leaves the visible window + margin. `turretDestroyedBits` (one bit per authored
+turret, never cleared) keeps a killed turret dead across evict/re-admit and stage
+loops; `TURRET_STREAM_CURSOR` rewinds to 0 on each stage wrap.
+
+**Concurrent visible capacity is NOT limited by glyph codes.** Every live turret
+shares ONE 4-code body glyph set (codes 226–229, `turretArt` style 4), published
+once. The hit flash is colour-RAM only (`TURRET_HIT_CRAM`); a destroyed turret
+writes the 4 decoded terrain screen codes it covered (`turretGroundCodes`) back
+into its cells - from `publishTurretGlyphs`, at frame start, a safe window - then
+it is plain terrain. The only bound is `TURRET_POOL = 8` per-slot *state* slots
+(15 one-byte arrays × 8 ≤ 128, the signed-X clear loop), which exceeds the ~7
+turrets a 23-row aperture can hold and the 5 that can be combat-visible; a full
+pool just defers the next admit a frame. **No editor viewport-density
+rejection** - `turret_screen_peak` is an informational hint only.
+
+### Authored wave triggers (`src/main.asm`)
+
+A stage with `WAVE_TRIGGER_COUNT > 0` drives encounter timing from world-row
+triggers: a trigger fires the instant its row reaches the **top edge of the
+terrain aperture** (`SCROLL_ROW == worldRow`, checked in `updateWaveTriggers`).
+`worldRow` is a world position, so `SCROLL_FRAME_DIVIDER` cannot move it relative
+to terrain. `startAuthoredWave` reuses `startRandomWave`'s body but takes the
+attack id from the trigger and the wave size / sprite seed / interval from the
+resolved trigger (composition size is authoritative — `NORMAL_WAVE_SIZE` is not
+forced). The CIA-random `startRandomWave` selection is compiled out of
+`updateSpawner`'s `!startNext` and `startGame`'s boot call for such a stage;
+everything else (per-member spawn loop, ingress/manoeuvre/egress, turret-pressure
+gate) is reused unchanged. The cursor rewinds on stage wrap, so authored triggers
+deliberately **re-fire once per stage loop**; a single `WAVE_TRIGGER_FIRE` latch
++ forward-only, never-skip cursor rules out duplicate firing within a loop.
+
+### Editor
+
+`levels/<name>/level.json` is a `formatVersion: 3` self-contained package (map +
+palette + turrets + embedded `tileset` + `waveDefinitions` + `waveTriggers`).
+V1/V2 files still load (tileset migrated from the engine baseline). New modes:
+`Waves` (place/move/assign/delete world-row triggers, edit reusable wave
+definitions against the engine attack catalogue); an editor-only, never-saved
+`Gameplay view` overlay (40×23 logical rows, bottom-origin, clamped, non-wrapping;
+its top edge is the wave activation line). `Open Level…` / `New Level…` switch
+packages and reset **all** editor state.
+
+### Tests
+
+New headless: `test_turret_unlimited.py`, `test_wave_schema.py`,
+`test_viewport_model.py`, `test_level_packages.py`;
+`test_turret_integration.py` updated for `TURRET_TOTAL` + desc sort + tileset.
+New VICE: `vice_wave_trigger_probe.py`, `vice_level1_smoke.py`;
+`vice_bottom_origin_probe.py` rewritten for the pool. `check_fixed_hud_capture.py`
+/ `check_turret_capture.py` / `vice_scroll_test.py` / `run_stage_fixture.sh` /
+`make_stage_fixture.py` updated for the pool + `level1/` layout.

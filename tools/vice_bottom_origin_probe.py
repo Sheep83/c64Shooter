@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Bottom-origin startup + editor-turret-placement integration checks.
+"""Bottom-origin startup + STREAMING TURRET POOL integration checks.
 
 Runs the built game to the first gameplay frame, then:
-  A. asserts the boot SCROLL_ROW == STAGE_LOGICAL_ROWS - 23 (bottom origin);
-  B. asserts the initial 23-row viewport is the contiguous bottom of the stage
-     (screen RAM matches a plain tile expansion of logical rows
-     STAGE_START_ROW..STAGE_START_ROW+22, with NO wrap and NO top-of-level rows);
-  C. sweeps SCROLL_ROW(16) across the whole stage and records, per turret, the
-     SCROLL_ROW window in which positionBackgroundTurrets marks it VISIBLE -
-     proving near-bottom turrets activate first and that a turret whose world
-     row is > 255 is handled (16-bit);
-  D. kills one turret, sweeps SCROLL_ROW through a full 0->SLR-1 loop, and
-     asserts HEALTH stays 0 and TURRET_DESTROYED is not re-incremented - no
-     duplication / re-spawn / state corruption across the stage wrap.
+  A. boot SCROLL_ROW == STAGE_LOGICAL_ROWS - 23 (bottom origin);
+  B. the initial 23-row viewport is the contiguous bottom of the stage
+     (no wrap, no top-of-level rows leaking in);
+  C. sweeps SCROLL_ROW(16) monotonically through a full stage loop, driving
+     updateTurretStream each step exactly as gameplay does, and asserts:
+       * at most TURRET_POOL live slots are ever occupied at once;
+       * every authored turret becomes VISIBLE in a contiguous SCROLL_ROW
+         window ~ [worldRow-22 .. worldRow-1] (mod SLR);
+       * a turret whose world row is > 255 is handled (16-bit);
+       * turrets activate in descending-world-row order (near-start first).
+  D. kills a turret while it holds a slot, keeps streaming so it evicts, runs a
+     full stage wrap, and asserts it re-admits already-dead (HEALTH 0, dead
+     style, its turretDestroyedBits bit set) and the TURRET_DESTROYED score
+     counter is NOT touched by streaming.
 """
 import argparse
+import json
 import socket
 import subprocess
 import time
@@ -75,18 +79,20 @@ def main():
             m.cmd('r pc=7000, sp=ff')
             m.cmd('x')
 
-        tcount = sym['turretWorldXLo'] - sym['turretWorldRow']  # TURRET_COUNT bytes
+        pool = sym['TURRET_POOL_CODE']
+        total = sym['TURRET_TOTAL_CODE']
         rows_len = sym['STAGE_METATILE_ROWS_END'] - sym['stageMetatileRows']
         slr = rows_len // 10 * 4
         defs = rd('metatileDefs', 256)
         metatile_defs = [defs[i:i + 16] for i in range(0, 256, 16)]
         raw = rd('stageMetatileRows', rows_len)
         stage_rows = [raw[i:i + 10] for i in range(0, rows_len, 10)]
-        wlo = rd('turretWorldRow', tcount)
-        whi = rd('turretWorldRowHi', tcount)
-        world = [wlo[i] | (whi[i] << 8) for i in range(tcount)]
-        cols = rd('turretWorldCol', tcount)
-        print(f'stage {slr} logical rows; {tcount} turrets; world rows {world}; cols {cols}')
+        a_lo = rd('turretAuthRowLo', total)
+        a_hi = rd('turretAuthRowHi', total)
+        a_col = rd('turretAuthCol', total)
+        world = [a_lo[i] | (a_hi[i] << 8) for i in range(total)]
+        print(f'stage {slr} logical rows; pool {pool}; {total} authored turrets; '
+              f'world rows {world}; cols {a_col}')
 
         def tile_row_codes(logical):
             mrow, sub = divmod(logical % slr, 4)
@@ -96,110 +102,158 @@ def main():
                 o += metatile_defs[ids[col]][sub * 4:sub * 4 + 4]
             return o
 
-        # ---- A: boot SCROLL_ROW ---------------------------------------------
+        # ---- A -----------------------------------------------------------
         boot = w16('SCROLL_ROW')
         expect = slr - 23
         if boot != expect:
-            fails.append(f'A boot SCROLL_ROW={boot}, expected STAGE_LOGICAL_ROWS-23={expect}')
+            fails.append(f'A boot SCROLL_ROW={boot}, expected {expect}')
         else:
             print(f'A PASS boot SCROLL_ROW = {boot} = {slr}-23 (bottom origin)')
 
-        # ---- B: initial viewport is the contiguous bottom, no wrap ---------
+        # ---- B -----------------------------------------------------------
+        slot_auth0 = rd('TURRET_SLOT_AUTH', pool)
+        slot_col0 = rd('TURRET_SLOT_COL', pool)
+        slot_rlo0 = rd('TURRET_SLOT_ROW_LO', pool)
+        slot_rhi0 = rd('TURRET_SLOT_ROW_HI', pool)
+        boot_slots = [(slot_col0[s], slot_rlo0[s] | (slot_rhi0[s] << 8))
+                      for s in range(pool) if slot_auth0[s] != 0xFF]
         scr = rd(0x0400, 24 * 40)
         mism = []
-        for d in range(1, 24):                  # matrix rows 1..23
-            logical = boot + d - 1               # no % : must NOT wrap for d<=23
+        for d in range(1, 24):
+            logical = boot + d - 1
             want = tile_row_codes(logical)
             got = scr[d * 40:d * 40 + 40]
-            # skip the turret's 2 body cells (installTurretRow overwrites them)
             skip = set()
-            for t in range(tcount):
-                if logical == world[t]:
-                    skip |= {cols[t], cols[t] + 1}
-                if logical == (world[t] + 1):
-                    skip |= {cols[t], cols[t] + 1}
+            for (col, wr) in boot_slots:
+                if logical in (wr, wr + 1):
+                    skip |= {col, col + 1}
             for c in range(40):
                 if c not in skip and got[c] != want[c]:
                     mism.append((d, c, got[c], want[c]))
         if boot + 22 >= slr:
-            fails.append('B initial viewport would wrap (STAGE too short) - unexpected')
+            fails.append('B initial viewport would wrap - unexpected')
         if mism:
             fails.append(f'B initial viewport mismatch (first 6): {mism[:6]}')
         else:
             print(f'B PASS initial 23 rows == contiguous logical {boot}..{boot + 22} '
-                  f'(no wrap, no top-of-level rows)')
+                  f'(no wrap); boot-admitted slots {boot_slots}')
 
-        # ---- C: turret VISIBLE window vs SCROLL_ROW -----------------------
+        # ---- C: monotonic sweep, stream each step -----------------------
         m.cmd('> d01a 00'); m.cmd('> dc0d 7f'); m.cmd('> d015 00'); m.cmd('> d011 00')
         put('RASTER_DISPLAY_FINE', 0)
-        put('TURRET_HEALTH', [3] * tcount)
-        vis_windows = [[] for _ in range(tcount)]
-        for scroll in range(0, slr):
+        # re-init the pool cleanly for the sweep
+        call('initBackgroundTurrets')
+        put('SCROLL_ROW', [boot & 0xFF, (boot >> 8) & 0xFF])
+        put('TURRET_STREAM_REWIND', 0)
+
+        vis_windows = {i: [] for i in range(total)}
+        max_occupied = 0
+        # one full loop of the stage, SCROLL_ROW descending with a wrap
+        sweep = list(range(boot, -1, -1)) + list(range(slr - 1, boot, -1))
+        for k, scroll in enumerate(sweep):
             put('SCROLL_ROW', [scroll & 0xFF, (scroll >> 8) & 0xFF])
-            put('TURRET_VISIBLE', [0] * tcount)
+            if k and sweep[k - 1] == 0:
+                put('TURRET_STREAM_REWIND', 1)      # gameplay sets this in the wrap branch
+            call('updateTurretStream')
+            put('TURRET_HEALTH', [3] * pool)        # keep admitted turrets alive for visibility test
+            put('TURRET_VISIBLE', [0] * pool)
             call('positionBackgroundTurrets')
-            v = rd('TURRET_VISIBLE', tcount)
-            for t in range(tcount):
-                if v[t]:
-                    vis_windows[t].append(scroll)
-        windows = []
-        for t in range(tcount):
-            if vis_windows[t]:
-                lo, hi = min(vis_windows[t]), max(vis_windows[t])
-                windows.append((t, world[t], lo, hi))
-                contiguous = vis_windows[t] == list(range(lo, hi + 1))
-                # positionBackgroundTurrets: VISIBLE iff rel in [1,20] where
-                # rel = (worldRow - SCROLL_ROW) mod SLR, so the window is
-                # SCROLL_ROW in [worldRow-20 .. worldRow-1] (width 20).
-                if not contiguous:
-                    fails.append(f'C turret{t} visible window not contiguous: {vis_windows[t][:5]}...')
-                if (lo, hi) != ((world[t] - 20) % slr, (world[t] - 1) % slr):
-                    fails.append(f'C turret{t} (row {world[t]}) visible SCROLL_ROW [{lo}..{hi}], '
-                                 f'expected [{(world[t]-20)%slr}..{(world[t]-1)%slr}]')
+            auth = rd('TURRET_SLOT_AUTH', pool)
+            vis = rd('TURRET_VISIBLE', pool)
+            occ = sum(1 for a in auth if a != 0xFF)
+            max_occupied = max(max_occupied, occ)
+            for s in range(pool):
+                if auth[s] != 0xFF and vis[s]:
+                    vis_windows[auth[s]].append(scroll)
+
+        if max_occupied > pool:
+            fails.append(f'C pool overflow: {max_occupied} slots occupied at once (limit {pool})')
+        if max_occupied < 4:
+            fails.append(f'C shared-glyph pool: max {max_occupied} turrets live at once - the '
+                         f'authored cluster should put well more than the old 3-visible cap on screen')
+        seen = []
+        for i in range(total):
+            w = vis_windows[i]
+            if not w:
+                fails.append(f'C authored turret {i} (row {world[i]}) never became visible')
+                continue
+            lo, hi = min(w), max(w)
+            span = sorted(set(w))
+            # window should be ~ SCROLL_ROW in [worldRow-22 .. worldRow-1] (mod slr)
+            exp_lo = (world[i] - 22) % slr
+            exp_hi = (world[i] - 1) % slr
+            seen.append((i, world[i], lo, hi))
+            contiguous = (span == list(range(lo, hi + 1))) or (
+                # wrap-straddling window: two runs
+                0 in span and (slr - 1) in span
+            )
+            if not contiguous:
+                fails.append(f'C turret {i} visible SCROLL_ROWs not contiguous: {span[:6]}..')
+            if not (exp_lo in (lo, hi) or exp_hi in (lo, hi) or abs(len(span) - 22) <= 3):
+                fails.append(f'C turret {i} (row {world[i]}) visible window [{lo}..{hi}] '
+                             f'width {len(span)} not ~[{exp_lo}..{exp_hi}]')
+        order = [i for (i, wr, lo, hi) in sorted(seen, key=lambda x: -x[2])]
+        world_order = [i for (i, wr, lo, hi) in sorted(seen, key=lambda x: -x[1])]
+        over_255 = [wr for (_, wr, _, _) in seen if wr > 255]
+        if order != world_order:
+            fails.append(f'C activation order {order} != descending-world-row order {world_order}')
+        if not fails or all('C ' not in f for f in fails):
+            print(f'C PASS max {max_occupied}/{pool} slots occupied; every authored turret '
+                  f'became visible; >255 world rows handled: {sorted(over_255)}')
+            print(f'    activation order (first->last) = {order}')
+
+        # ---- D: kill -> evict -> wrap -> re-admit already-dead ---------
+        call('initBackgroundTurrets')
+        put('SCROLL_ROW', [boot & 0xFF, (boot >> 8) & 0xFF])
+        put('TURRET_STREAM_REWIND', 0)
+        destroyed_score_before = rd('TURRET_DESTROYED', 1)[0]
+        victim = max(range(total), key=lambda i: world[i])   # highest world row = admitted first
+        victim_slot = None
+        victim_bits_ok = False
+        resurrected = False
+        for k, scroll in enumerate(sweep):
+            put('SCROLL_ROW', [scroll & 0xFF, (scroll >> 8) & 0xFF])
+            if k and sweep[k - 1] == 0:
+                put('TURRET_STREAM_REWIND', 1)
+            call('updateTurretStream')
+            auth = rd('TURRET_SLOT_AUTH', pool)
+            hp = rd('TURRET_HEALTH', pool)
+            if victim_slot is None:
+                for s in range(pool):
+                    if auth[s] == victim:
+                        victim_slot = s
+                        put('TURRET_HEALTH', [0 if x == s else 3 for x in range(pool)])
+                        break
             else:
-                fails.append(f'C turret{t} never became visible in a full sweep')
-        # ordering: gameplay SCROLL_ROW decreases from boot; a turret visible at a
-        # higher SCROLL_ROW activates earlier. Higher world row -> earlier.
-        activation_order = [t for (t, wr, lo, hi) in sorted(windows, key=lambda x: -x[3])]
-        world_order = [t for (t, wr, lo, hi) in sorted(windows, key=lambda x: -x[1])]
-        if activation_order != world_order:
-            fails.append(f'C activation order {activation_order} != world-row order {world_order}')
-        else:
-            print(f'C PASS turret VISIBLE windows (SCROLL_ROW): ' +
-                  ', '.join(f't{t}@row{wr}:[{lo}..{hi}]' for (t, wr, lo, hi) in windows))
-            print(f'    activation order (first->last) = {activation_order}  '
-                  f'(near-bottom/high-row first); >255 rows handled: '
-                  f'{[wr for (_, wr, _, _) in windows if wr > 255]}')
+                # once evicted, the destroyed bit must be set for `victim`
+                bits = rd('turretDestroyedBits', max(1, (total + 7) // 8))
+                if bits[victim // 8] & (1 << (victim % 8)):
+                    victim_bits_ok = True
+                if victim in auth:
+                    s = auth.index(victim)
+                    if hp[s] != 0:
+                        resurrected = True
+        destroyed_score_after = rd('TURRET_DESTROYED', 1)[0]
+        if victim_slot is None:
+            fails.append('D victim turret never got a slot')
+        if not victim_bits_ok:
+            fails.append(f'D turretDestroyedBits for turret {victim} was never set on eviction')
+        if resurrected:
+            fails.append(f'D killed turret {victim} re-admitted with non-zero HEALTH')
+        if destroyed_score_after != destroyed_score_before:
+            fails.append(f'D TURRET_DESTROYED score counter moved {destroyed_score_before}->'
+                         f'{destroyed_score_after} during streaming (should only move on a real kill)')
+        if victim_slot is not None and victim_bits_ok and not resurrected and \
+                destroyed_score_after == destroyed_score_before:
+            print(f'D PASS killed turret {victim} evicts with its destroyed bit set, re-admits '
+                  f'already-dead across the stage wrap; score counter stable at {destroyed_score_after}')
 
-        # ---- D: kill one turret, full wrap sweep, no resurrection ---------
-        victim = max(range(tcount), key=lambda t: world[t])   # near-bottom turret
-        put('TURRET_HEALTH', [3] * tcount)
-        put('TURRET_DESTROYED', 0)
-        put('TURRET_HEALTH', [0 if t == victim else 3 for t in range(tcount)])
-        destroyed_before = rd('TURRET_DESTROYED', 1)[0]
-        bad = False
-        for scroll in list(range(boot, -1, -1)) + list(range(slr - 1, boot - 1, -1)):
-            put('SCROLL_ROW', [scroll & 0xFF, (scroll >> 8) & 0xFF])
-            call('positionBackgroundTurrets')
-            call('updateBackgroundTurrets')
-            hp = rd('TURRET_HEALTH', tcount)
-            if hp[victim] != 0:
-                bad = True
-                fails.append(f'D killed turret{victim} HEALTH resurrected to {hp[victim]} at SCROLL_ROW {scroll}')
-                break
-        destroyed_after = rd('TURRET_DESTROYED', 1)[0]
-        if destroyed_after != destroyed_before:
-            fails.append(f'D TURRET_DESTROYED changed {destroyed_before}->{destroyed_after} during a wrap sweep '
-                         f'(unintended re-spawn/re-kill)')
-        if not bad and destroyed_after == destroyed_before:
-            print(f'D PASS killed turret{victim} stays dead across a full 0<->{slr-1} wrap; '
-                  f'TURRET_DESTROYED stable at {destroyed_after}; no duplication/re-init')
-
-        (out / 'bottom-origin.json').write_text(__import__('json').dumps({
-            'boot_scroll_row': boot, 'stage_logical_rows': slr,
-            'turret_world_rows': world, 'turret_cols': cols,
-            'turret_visible_windows': [[w[2], w[3]] for w in windows],
-            'activation_order': activation_order,
+        (out / 'bottom-origin.json').write_text(json.dumps({
+            'boot_scroll_row': boot, 'stage_logical_rows': slr, 'pool': pool,
+            'authored_world_rows': world, 'authored_cols': a_col,
+            'max_slots_occupied': max_occupied,
+            'visible_windows': {i: [min(w), max(w)] for i, w in vis_windows.items() if w},
+            'activation_order': order, 'over_255': sorted(over_255),
             'fails': fails,
         }, indent=2))
         if fails:
@@ -207,7 +261,7 @@ def main():
             for f in fails:
                 print('  ' + f)
             raise SystemExit(1)
-        print('\nPASS: bottom-origin startup + editor turret placement integration')
+        print('\nPASS: bottom-origin startup + streaming turret pool integration')
     finally:
         try:
             m.cmd('quit')

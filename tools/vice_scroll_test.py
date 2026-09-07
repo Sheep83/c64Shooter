@@ -160,7 +160,7 @@ def main():
         mon.cmd(f'bsave "{out / f"{frame:05d}.bg"}" 0 2920 2fff')
         mon.cmd(f'bsave "{out / f"{frame:05d}.colour"}" 0 d800 dbff')
         if 'TURRET_STATE_BEGIN' in sym:
-            mon.cmd(f'bsave "{out / f"{frame:05d}.turret"}" 0 {sym["TURRET_STATE_BEGIN"]:04x} {sym["TURRET_STATE_END"]-1:04x}')
+            mon.cmd(f'bsave "{out / f"{frame:05d}.turret"}" 0 {sym["TURRET_STATE_BEGIN"]:04x} {sym.get("TURRET_SCRATCH_END", sym["TURRET_STATE_END"])-1:04x}')
             mon.cmd(f'bsave "{out / f"{frame:05d}.charset"}" 0 3800 3fff')
         if 'RASTER_STATE_BEGIN' in sym:
             mon.cmd(f'bsave "{out / f"{frame:05d}.raster"}" 0 {sym["RASTER_STATE_BEGIN"]:04x} {sym["RASTER_STATE_END"]-1:04x}')
@@ -215,15 +215,23 @@ def main():
     # from here rather than hard-coding them.
     mon.cmd(f'bsave "{out / "vic.bin"}" 0 d000 d02f')
     if 'TURRET_STATE_BEGIN' in sym:
-        dumps = [('turret-placements.bin',sym['turretWorldCol'],sym['turretWorldXLo']-1),
-                 ('turret-art.bin',sym['turretArt'],sym['turretArtEnd']-1),
-                 ('turret-ground.bin',sym['turretGroundGlyphs'],sym['turretGroundGlyphs']+95)]
-        # turretWorldRow (the low bytes in turret-placements.bin) is 16-bit LE;
-        # dump the high bytes so oracles can reconstruct world rows above 255.
-        if 'turretWorldRowHi' in sym:
-            n = (sym['turretWorldRow'] - sym['turretWorldCol'])  # TURRET_COUNT bytes
+        # Streaming turret pool: turretAuth* are the AUTHORED placement LUTs
+        # (turretAuthCol / turretAuthRowLo / turretAuthRowHi kept contiguous so
+        # the dump is [cols(N), rowsLo(N)] + [rowsHi(N)], N = TURRET_TOTAL).
+        col_lbl = 'turretAuthCol' if 'turretAuthCol' in sym else 'turretWorldCol'
+        row_lbl = 'turretAuthRowLo' if 'turretAuthRowLo' in sym else 'turretWorldRow'
+        rowhi_lbl = 'turretAuthRowHi' if 'turretAuthRowHi' in sym else 'turretWorldRowHi'
+        n = sym[row_lbl] - sym[col_lbl]  # TURRET_TOTAL bytes
+        dumps = [('turret-placements.bin', sym[col_lbl], sym[row_lbl] + n - 1),
+                 ('turret-art.bin', sym['turretArt'], sym['turretArtEnd'] - 1)]
+        if 'turretGroundCodes' in sym:          # shared-glyph pool: cached terrain codes, POOL*4 bytes
+            gc = sym['turretGroundCodes']
+            dumps.append(('turret-ground.bin', gc, gc + sym.get('TURRET_POOL_CODE', 8) * 4 - 1))
+        elif 'turretGroundGlyphs' in sym:
+            dumps.append(('turret-ground.bin', sym['turretGroundGlyphs'], sym['turretGroundGlyphs'] + 95))
+        if rowhi_lbl in sym:
             dumps.append(('turret-placements-hi.bin',
-                          sym['turretWorldRowHi'], sym['turretWorldRowHi'] + n - 1))
+                          sym[rowhi_lbl], sym[rowhi_lbl] + n - 1))
         for name, low, high in dumps:
             mon.cmd(f'bsave "{out / name}" 0 {low:04x} {high:04x}')
     # Raw ground truth for the checker: the literal metatile definitions and

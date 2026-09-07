@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Headless regression tests for editor turret placement + bottom-origin data.
 
-Plain assert script (no pytest dependency), matching the repo's tools/check_*.py
-style. Run:  python3 tools/level_editor/test_turret_integration.py
+Plain assert script (no pytest), matching the repo's tools/check_*.py style.
+Run:  python3 tools/level_editor/test_turret_integration.py
 """
 import json
 import sys
@@ -13,9 +13,9 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from engine_data import load_engine_data                       # noqa: E402
-from ka_export import render_stage_turrets, export_project      # noqa: E402
-from project import (                                           # noqa: E402
+from engine_data import TURRET_POOL, load_engine_data                    # noqa: E402
+from ka_export import render_stage_turrets, export_project               # noqa: E402
+from project import (                                                    # noqa: E402
     MAX_TURRETS, LevelProject, export_readiness_errors, iter_turrets,
     load_project, project_from_dict, save_project,
     turret_world_col, turret_world_row, validate_project,
@@ -34,6 +34,13 @@ def fail(msg):
     sys.exit(1)
 
 
+def _baseline_tileset():
+    d = load_engine_data(REPO)
+    return {"glyphCount": d.glyph_count,
+            "glyphs": [list(d.glyphs[160 + i]) for i in range(d.glyph_count)],
+            "metatileDefs": [list(m) for m in d.metatiles]}
+
+
 def _project(rows=100, turrets=((30, 3), (70, 7), (89, 4)), **kw):
     return LevelProject(
         name=kw.get("name", "t"),
@@ -41,6 +48,7 @@ def _project(rows=100, turrets=((30, 3), (70, 7), (89, 4)), **kw):
         palette={"background": 0, "multicolour1": 11, "multicolour2": 14, "character": 1},
         scroll_frame_divider=2,
         objects=[{"type": "turret", "metatileRow": r, "metatileCol": c} for r, c in turrets],
+        tileset=_baseline_tileset(),
     )
 
 
@@ -49,14 +57,15 @@ assert turret_world_row(0) == 1 and turret_world_row(89) == 357
 assert turret_world_col(0) == 1 and turret_world_col(7) == 29
 ok("coordinate model: world = metatile_index * 4 + 1")
 
-# 2. widened vertical coordinate - no 8-bit limit
+# 2. widened vertical coordinate - no 8-bit limit; export sorts DESCENDING by row
 big = _project(rows=844, turrets=((0, 0), (200, 5), (700, 9)))
 assert validate_project(big) == [], validate_project(big)
-rows = [turret_world_row(t["metatileRow"]) for t in iter_turrets(big)]
-assert rows == [1, 801, 2801] and max(rows) > 255
+rows = sorted((turret_world_row(t["metatileRow"]) for t in iter_turrets(big)), reverse=True)
+assert rows == [2801, 801, 1] and max(rows) > 255
 asm = render_stage_turrets(big)
-assert "turretRows = List().add(1, 801, 2801)" in asm, asm
-ok("widened turret vertical coordinate: world rows up to 2801 (>255), 16-bit clean")
+assert "turretRows = List().add(2801, 801, 1)" in asm, asm
+assert ".const TURRET_TOTAL = 3" in asm
+ok("widened turret vertical coordinate: world rows up to 2801 (>255), 16-bit, desc-sorted")
 
 # 3. JSON persistence: save -> reload -> identical, and deterministic bytes
 p = _project()
@@ -79,46 +88,45 @@ ok("turret JSON persistence: save/reload exact + byte-deterministic")
 p_shuffled = _project(turrets=((89, 4), (30, 3), (70, 7)))
 assert render_stage_turrets(p) == render_stage_turrets(p_shuffled), "export depends on order"
 assert render_stage_turrets(p).splitlines()[-3:] == [
-    ".const TURRET_COUNT = 3",
-    ".var turretCols = List().add(13, 29, 17)",
-    ".var turretRows = List().add(121, 281, 357)",
+    ".const TURRET_TOTAL = 3",
+    ".var turretCols = List().add(17, 29, 13)",   # world cols in desc-row order
+    ".var turretRows = List().add(357, 281, 121)",
 ]
-ok("turret ASM export: deterministic + authoring-order-independent")
+ok("turret ASM export: deterministic + authoring-order-independent (desc by world row)")
 
-# 5. backward compat: V2 file with no/empty 'objects' still loads
+# 5. backward compat: V2 file with no/empty 'objects' still loads (tileset migrated)
 legacy = {
     "formatVersion": 2, "name": "legacy", "width": 10, "height": 30,
     "scrollFrameDivider": 2,
     "palette": {"background": 0, "multicolour1": 11, "multicolour2": 14, "character": 1},
     "metatileRows": [[0] * 10 for _ in range(30)],
 }
-lp = project_from_dict(legacy)
+lp = project_from_dict(legacy, default_tileset=_baseline_tileset())
 assert lp.objects == []
+assert lp.tileset is not None
 assert validate_project(lp) == []                     # structurally fine
-assert export_readiness_errors(lp)                    # ... but not export-ready (needs >=1 turret)
+assert export_readiness_errors(lp) == []              # 0 turrets is now export-ready
 legacy_v1 = dict(legacy, formatVersion=1)
 legacy_v1.pop("palette"); legacy_v1.pop("scrollFrameDivider")
-assert project_from_dict(legacy_v1).objects == []
-ok("backward compat: V1/V2 levels with absent/empty 'objects' load")
+assert project_from_dict(legacy_v1, default_tileset=_baseline_tileset()).objects == []
+ok("backward compat: V1/V2 levels with absent/empty 'objects' load (tileset migrated)")
 
 # 6. impossible placements rejected
 dup = _project(turrets=((5, 3), (5, 7)))
 assert any("distinct metatile row" in e for e in validate_project(dup))
-too_many = _project(turrets=tuple((i, 0) for i in range(MAX_TURRETS + 1)))
-assert any("At most" in e for e in validate_project(too_many))
 bad_type = _project()
 bad_type.objects.append({"type": "boss", "metatileRow": 1, "metatileCol": 1})
 assert any("not supported" in e for e in validate_project(bad_type))
 oob = _project(turrets=((30, 3), (70, 7), (500, 4)))   # row 500 > height 100
 assert any("metatileRow" in e for e in validate_project(oob))
-ok("impossible placements rejected (dup row / >MAX / bad type / out of range)")
+ok("impossible placements rejected (dup row / bad type / out of range)")
 
 # 7. round-trip through the real generated file the engine consumes
 d = load_engine_data(REPO)
 gen_project = LevelProject(
     name="from-generated", metatile_rows=[r[:] for r in d.stage_rows],
     palette=dict(d.source_palette), scroll_frame_divider=d.source_scroll_frame_divider,
-    objects=[dict(t) for t in d.source_turrets],
+    objects=[dict(t) for t in d.source_turrets], tileset=_baseline_tileset(),
 )
 assert validate_project(gen_project) == [], validate_project(gen_project)
 assert export_readiness_errors(gen_project) == []
@@ -127,11 +135,11 @@ assert any(r > 255 for r in turret_rows), turret_rows
 ok(f"engine_data reads generated placement: {len(d.source_turrets)} turrets, "
    f"world rows {sorted(turret_rows)} (has >255)")
 
-# 8. export_project writes exactly the 3 engine files
+# 8. export_project (legacy 3-file) still writes exactly the config/stage/turret files
 with tempfile.TemporaryDirectory() as td:
     paths = export_project(_project(), d.metatiles, td)
     names = sorted(p.name for p in paths)
     assert names == ["stage_config.asm", "stage_test.asm", "stage_turrets.asm"], names
 ok("export_project writes stage_config.asm + stage_test.asm + stage_turrets.asm")
 
-print(f"\nAll {len(PASS)} turret-integration checks passed.")
+print(f"\nAll {len(PASS)} turret-integration checks passed. (TURRET_POOL={TURRET_POOL}, MAX_TURRETS={MAX_TURRETS})")

@@ -15,12 +15,15 @@ def main():
     sym=json.loads((root/'symbols.json').read_text())
     records=json.loads((root/'frames.json').read_text())
     placement=(root/'turret-placements.bin').read_bytes()
-    count=len(placement)//2
+    count=len(placement)//2                                # authored turret count (TURRET_TOTAL)
     _rlo=placement[count:]
     _rhi=(root/'turret-placements-hi.bin').read_bytes() if (root/'turret-placements-hi.bin').exists() else bytes(count)
     rows=[_rlo[i]+256*(_rhi[i] if i<len(_rhi) else 0) for i in range(count)]
     stage_rows=len((root/'stagemetatilerows.bin').read_bytes())//10*4
+    pool=sym.get('TURRET_POOL_CODE',3)                     # concurrent live slots
     failures=[]
+    # Lifetime state is tracked per AUTHORED turret; the engine streams each
+    # through a pool slot as SCROLL_ROW crosses it.
     previous_hp=[3]*count
     previous_visible=[0]*count
     dead_since=[None]*count
@@ -44,7 +47,7 @@ def main():
             addr=sym[name]+i
             if 0x2000<=addr<0x2400:return state[addr-0x2000]
             if 0x2920<=addr<0x3000:return bg[addr-0x2920]
-            return turret[addr-sym['TURRET_STATE_BEGIN']]
+            return turret[addr-sym['TURRET_STATE_BEGIN']]  # blob spans STATE + SCRATCH
         phase=record['physical_fine']
         # SCROLL_ROW is 16-bit LE for stages above 255 logical rows.
         scroll_row=get('SCROLL_ROW')+(256*get('SCROLL_ROW_HI') if 'SCROLL_ROW_HI' in sym else 0)
@@ -54,29 +57,46 @@ def main():
         deferred=get('BG_COARSE_DEFERRED')
         deferrals+=(deferred-previous_deferred)%256
         previous_deferred=deferred
+        # Map each pool slot -> the authored turret it currently holds.
+        slot_auth=[get('TURRET_SLOT_AUTH',s) for s in range(pool)]
+        auth_slot={slot_auth[s]:s for s in range(pool) if slot_auth[s]!=0xff}
+        frame_hp={}
         for t,world in enumerate(rows):
-            hp,visible,y,style=(get(name,t) for name in ('TURRET_HEALTH','TURRET_VISIBLE','TURRET_Y','TURRET_SHOWN_STYLE'))
+            s=auth_slot.get(t)
+            live=s is not None
+            hp,visible,y,hit=(0,0,0,0)
+            if live:
+                hp,visible,y,hit=(get(name,s) for name in
+                                  ('TURRET_HEALTH','TURRET_VISIBLE','TURRET_Y','TURRET_HIT_TIMER'))
+            frame_hp[t]=hp
             delta=(world-origin)%stage_rows
             if delta==stage_rows-1:delta=-1
             expected_y=64+phase+8*delta
-            expected_visible=int(-1<=delta<23 and 72<=expected_y<=231)
-            if n and visible!=expected_visible:failures.append([n,t,'visibility',visible,expected_visible])
-            if n and -1<=delta<23 and y!=expected_y:failures.append([n,t,'screen Y',y,expected_y])
-            if hp>previous_hp[t]:failures.append([n,t,'health resurrected',previous_hp[t],hp])
-            if previous_hp[t] and not hp:
+            on_screen=(-1<=delta<23)
+            expected_visible=int(on_screen and 72<=expected_y<=231)
+            # Only assert render geometry while the turret actually holds a slot;
+            # streaming admits with a few rows of lead and evicts a few rows past.
+            if n and live and visible!=expected_visible:
+                failures.append([n,t,'visibility',visible,expected_visible])
+            if n and live and on_screen and y!=expected_y:
+                failures.append([n,t,'screen Y',y,expected_y])
+            if live and previous_visible[t] and hp>previous_hp[t]:
+                failures.append([n,t,'health resurrected',previous_hp[t],hp])
+            if live and previous_hp[t] and not hp:
                 dead_since[t]=n
                 deaths.append(dict(frame=n,turret=t,y=y,phase=phase,coarse_count=coarse))
-            if style==6:hit_styles.add(t)
-            if dead_since[t] is not None:
-                if n>dead_since[t]+3 and style!=7:failures.append([n,t,'death glyph not published',style])
+            if live and hit:hit_styles.add(t)                  # hit flash is colour-RAM now
+            if live and dead_since[t] is not None:
                 if visible and not previous_visible[t] and n>dead_since[t]:dead_reentries[t]+=1
-            previous_hp[t],previous_visible[t]=hp,visible
+            previous_hp[t]=hp if live else previous_hp[t]
+            previous_visible[t]=visible
+        if len(auth_slot)>pool:failures.append([n,'more live turrets than the pool',len(auth_slot)])
         if get('OBJECT_TYPE')!=1:failures.append([n,'logical player slot0 changed'])
         bullets=sum(get('OBJECT_ACTIVE',i)!=0 and get('OBJECT_TYPE',i)==3 for i in range(1,16))
         if bullets!=get('ENEMY_BULLET_COUNT') or bullets>3:failures.append([n,'shared bullet cap/count',bullets,get('ENEMY_BULLET_COUNT')])
         shots=get('TURRET_SHOTS_FIRED')
         free=get('DEBUG_FREE_LO')+256*get('DEBUG_FREE_HI')
-        group='firing' if shots!=previous_shots else 'visible' if any(get('TURRET_VISIBLE',t) and get('TURRET_HEALTH',t) for t in range(count)) else 'offscreen'
+        group='firing' if shots!=previous_shots else 'visible' if any(get('TURRET_VISIBLE',s) and get('TURRET_HEALTH',s) for s in range(pool)) else 'offscreen'
         samples[group].append(free)
         previous_shots=shots
         if all(134<=d<=143 for d in ram[33:38]):displayed.append(int(''.join(str(d-134) for d in ram[33:38])))

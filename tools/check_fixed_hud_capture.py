@@ -59,35 +59,51 @@ def main():
     # Turret private glyph code base (relocated out of the 160..223 terrain
     # namespace); exported as a label so this oracle carries no literal.
     tbase = sym.get('TURRET_GLYPH_BASE_CODE', 200)
-    placements, ground, art = [], [], b''
+    # STREAMING TURRET POOL - SHARED body glyphs. Every live turret's 2x2 cells
+    # point at the ONE shared body set (codes tbase..tbase+3, from turretArt
+    # style TURRET_STATIC_STYLE); a dead turret's cells are just terrain again.
+    # There are no per-slot glyph blocks and no per-slot glyph styles. All turret
+    # geometry here comes from the per-frame slot state (TURRET_SLOT_*).
+    pool = sym.get('TURRET_POOL_CODE', 3)
+    STATIC_STYLE = 4
+    art = b''
     if turrets:
-        data = (root/'turret-placements.bin').read_bytes()
-        count = len(data)//2
-        _rhi = (root/'turret-placements-hi.bin').read_bytes() if (root/'turret-placements-hi.bin').exists() else bytes(count)
-        placements = [(data[i], data[count+i] + 256*(_rhi[i] if i < len(_rhi) else 0))
-                      for i in range(count)]
-        if not (226 <= tbase and tbase + count*4 <= 238):
-            failures.append(['turret private glyphs outside 226..237', tbase, count])
-        if set((root/'metatiledefs.bin').read_bytes()) & set(range(tbase,tbase+count*4)):
-            failures.append(['raw terrain uses turret private glyphs'])
+        if not (226 <= tbase and tbase + 4 <= 240):
+            failures.append(['shared turret body glyphs outside 226..239', tbase])
+        if set((root/'metatiledefs.bin').read_bytes()) & set(range(tbase, tbase+4)):
+            failures.append(['raw terrain uses the shared turret body glyphs'])
         art = (root/'turret-art.bin').read_bytes()
-        for col,world in placements:
-            ground.append(b''.join(glyphs[rows(world+dy)[col+dx]] for dy in range(2) for dx in range(2)))
-        if (root/'turret-ground.bin').read_bytes() != b''.join(ground):
-            failures.append(['turret underlay cache differs from stage/charset'])
-    def visual_rows(world):
+
+    def visual_rows(world, slots):
+        # slots: (auth, col, world_row, render_body, hit) per pool slot; 255 => free.
+        # render_body is True while the shared body glyph is on screen - alive, or
+        # dead-this-frame (publishTurretGlyphs reverts the cells only next frame).
         codes = list(rows(world))
-        for t,(col,top) in enumerate(placements):
-            dy = (world-top)%stage[2]
-            if dy < 2:codes[col:col+2] = [tbase+t*4+dy*2,tbase+1+t*4+dy*2]
+        for (auth, col, srow, render_body, hit) in slots:
+            if auth == 255 or not render_body:
+                continue                                  # free or reverted-to-terrain
+            dy = (world - srow) % stage[2]
+            if dy < 2:
+                codes[col:col+2] = [tbase + dy*2, tbase + 1 + dy*2]   # ONE shared body code set
         return codes
-    def private_pixels(styles):
-        return b''.join(ground[t] if style==7 else art[style*32:(style+1)*32] for t,style in enumerate(styles))
+
+    def hit_body_cols(world, slots):
+        # column indices whose shared-body cell belongs to a HIT-flashing turret
+        cols = set()
+        for (auth, col, srow, render_body, hit) in slots:
+            if auth != 255 and render_body and hit and (world - srow) % stage[2] < 2:
+                cols.update((col, col+1))
+        return cols
+
+    # Colour-RAM value a hit-flashing turret uses (TURRET_HIT_CRAM in
+    # src/background_turrets.asm: 10 | 8 == 10, light red, not in the pulse).
+    HIT_CRAM = 10
+
     @lru_cache(maxsize=1280)
-    def expected_pixels(row, phase, hud, styles, turret_cram):
+    def expected_pixels(row, phase, hud, slots, turret_cram):
         current_glyphs = list(glyphs)
-        private = private_pixels(styles)
-        for c in range(len(private)//8):current_glyphs[tbase+c] = private[c*8:c*8+8]
+        for c in range(4):
+            current_glyphs[tbase + c] = art[STATIC_STYLE*32 + c*8: STATIC_STYLE*32 + c*8 + 8]
         out = bytearray()
         for raster in range(55,247):
             if raster < 63:
@@ -96,12 +112,14 @@ def main():
             elif raster < 71:
                 out.extend(bytes(320*3))
             else:
-                # Terrain: one fixed colour RAM value. Turret private-glyph cells
-                # pulse the fourth multicolour colour (all turrets in phase).
+                # Terrain: one fixed colour RAM value. Shared turret body cells
+                # pulse; a HIT-flashing turret's cells use HIT_CRAM instead.
                 terrain_row, gy = divmod(raster-(64+phase),8)
-                codes = visual_rows(row+terrain_row)
-                cram = [turret_cram if tbase <= c < tbase+4*len(placements) else cfg.terrain_cram
-                        for c in codes]
+                codes = visual_rows(row+terrain_row, slots)
+                hitc = hit_body_cols(row+terrain_row, slots)
+                cram = [(HIT_CRAM if i in hitc else turret_cram) if tbase <= c < tbase+4
+                        else cfg.terrain_cram
+                        for i, c in enumerate(codes)]
                 out.extend(cfg.row_bytes(codes, gy, current_glyphs, cram))
         return Image.frombytes('RGB',(320,192),bytes(out))
     def nonzero(im):
@@ -111,7 +129,8 @@ def main():
     clocks, phases, positions = [], [], []
     checks = hud_checks = edge_checks = wraps = max_active = max_batches = max_deferred = 0
     previous = previous_mask = None
-    previous_styles, previous_origin = (), None
+    previous_slots, previous_origin = (), None
+    prev_alive = []
     previous_score = None
     delayed_scores = []
     for record in records:
@@ -125,7 +144,7 @@ def main():
             addr = sym[name]+index
             if 0x2000 <= addr < 0x2400:return state[addr-0x2000]
             if 0x2920 <= addr < 0x3000:return bg[addr-0x2920]
-            if turrets and sym['TURRET_STATE_BEGIN'] <= addr < sym['TURRET_STATE_END']:
+            if turrets and sym['TURRET_STATE_BEGIN'] <= addr < sym.get('TURRET_SCRATCH_END', sym['TURRET_STATE_END']):
                 return turret_state[addr-sym['TURRET_STATE_BEGIN']]
             return raster_state[addr-sym['RASTER_STATE_BEGIN']]
         phase = record['physical_fine']
@@ -133,15 +152,26 @@ def main():
         # rows (SCROLL_ROW_HI absent in pre-widening captures -> plain byte).
         row = get('SCROLL_ROW') + (256 * get('SCROLL_ROW_HI') if 'SCROLL_ROW_HI' in sym else 0)
         finish, live = get('BG_COARSE_FINISH'), get('LIVE_PLAN')
-        styles = tuple(get('TURRET_SHOWN_STYLE',t) for t in range(len(placements)))
-        if any(style>7 for style in styles):
-            failures.append([frame,'uninitialized turret glyph style',styles])
-            styles = tuple(min(style,7) for style in styles)
+        if turrets:
+            alive_now = [get('TURRET_HEALTH', s) != 0 for s in range(pool)]
+            occ_now = [get('TURRET_SLOT_AUTH', s) != 255 for s in range(pool)]
+            slots = tuple(
+                (get('TURRET_SLOT_AUTH', s),
+                 get('TURRET_SLOT_COL', s),
+                 get('TURRET_SLOT_ROW_LO', s) + 256*get('TURRET_SLOT_ROW_HI', s),
+                 # render the body while alive, or for the ONE frame after death
+                 # (publishTurretGlyphs reverts the cells only at the next frame start)
+                 alive_now[s] or (occ_now[s] and s < len(prev_alive) and prev_alive[s]),
+                 get('TURRET_HIT_TIMER', s) != 0)              # hit-flashing?
+                for s in range(pool))
+            prev_alive = alive_now
+        else:
+            slots = ()
         if turrets:
             actual_charset = (root/f'{frame:05d}.charset').read_bytes()
-            expected_charset = charset[:tbase*8]+private_pixels(styles)+charset[tbase*8+32*len(placements):]
-            if actual_charset != expected_charset:
-                failures.append([frame,'private glyph publication/charset integrity'])
+            # The ONE shared body glyph set is published once and never changes.
+            if actual_charset[tbase*8:tbase*8 + 32] != art[STATIC_STYLE*32:STATIC_STYLE*32 + 32]:
+                failures.append([frame,'shared turret body glyph set corrupted'])
         colour_ram = load_colour_ram(root, frame, cfg)
         if len(colour_ram) == 1000:
             # Ordinary terrain colour RAM is written once and never scrolled:
@@ -151,7 +181,7 @@ def main():
             # colour (see pulseTurretColour). They must stay a valid multicolour
             # selector (bit 3 set, low 3 in 0..7) but their low 3 bits vary.
             turret_glyph_cells = {c for c in range(40, 1000)
-                                  if tbase <= ram[c] < tbase + 4*len(placements)}
+                                  if tbase <= ram[c] < tbase + 4}
             # A turret changes matrix row on a coarse step; its pulse colour can
             # sit on the row it is leaving/entering for one frame. Exclude the
             # turret columns +/-1 row from the "fixed terrain colour" check.
@@ -182,14 +212,14 @@ def main():
         elif set(free_region) != {128}:
             failures.append([frame,'FREE area not blank',list(free_region)])
         terrain = bytearray(hud)
-        for r in range(1,24):terrain.extend(visual_rows(row+r-1+(1 if finish and r>=13 else 0)))
+        for r in range(1,24):terrain.extend(visual_rows(row+r-1+(1 if finish and r>=13 else 0), slots))
         terrain.extend([32]*40)
         if ram[:1000] != terrain:
             failures.append([frame,'matrix',[i for i in range(1000) if ram[i] != terrain[i]][:12]])
         if finish:
             if bytes(get('BG_INCOMING_ROW',i) for i in range(40)) != bytes(rows(row)):
                 failures.append([frame,'incoming buffer'])
-            if bytes(get('BG_CROSSING_ROW',i) for i in range(40)) != bytes(visual_rows(row+12)):
+            if bytes(get('BG_CROSSING_ROW',i) for i in range(40)) != bytes(visual_rows(row+12, slots)):
                 failures.append([frame,'crossing buffer'])
         if get('RASTER_DISPLAY_LATE'):
             failures.append([frame,'late display event',get('RASTER_DISPLAY_LATE')])
@@ -215,13 +245,31 @@ def main():
                 x=get(prefix+'_X',live+i)+256*get(prefix+'_X_MSB',live+i)-24
                 y=get(prefix+'_Y',live+i)+1-55
                 draw.rectangle((x,y,x+23,y+20),fill=255)
+        # A slot that DIED this frame (or last frame) reverts its 2x2 body cells
+        # from the shared glyph (masked) to plain terrain (compared) in the same
+        # frame the killing projectile / impact sprite is consumed and the score
+        # digits lag. Exclude that slot's cells + a 1-cell halo for the death
+        # transition; the reverted terrain codes + colour RAM are still verified
+        # by the matrix / colour checks.
+        for s in range(pool):
+            cur = slots[s] if s < len(slots) else (255,0,0,0,0)
+            prv = previous_slots[s] if s < len(previous_slots) else (255,0,0,0,0)
+            dead_now = cur[0] != 255 and not cur[3]
+            died_here = (prv[0] != 255 and prv[3] and dead_now) or (prv[0] != 255 and not prv[3] and dead_now)
+            if turrets and died_here:
+                col, wr = cur[1], cur[2]
+                dy = (row - wr) % stage[2]
+                mrow = (dy + 1) if dy < 23 else 0
+                if 1 <= mrow <= 23:
+                    y0 = 9 + phase + (mrow - 1) * 8
+                    draw.rectangle(((col-1)*8, y0 - 2, (col+3)*8 - 1, y0 + 17), fill=255)
         # Turret private-glyph cells pulse the fourth multicolour colour (a
         # deliberate prototype). Their bitmaps are validated by the charset
         # integrity check + check_turret_capture, and their colour RAM by the
         # selector check above; exclude their pixels from the terrain diff,
         # which models one static terrain colour.
         for c in range(40,1000):
-            if tbase <= ram[c] < tbase+4*len(placements):
+            if tbase <= ram[c] < tbase+4:
                 mrow,mcol = divmod(c,40)
                 ty0 = 9+phase+(mrow-2)*8            # +/-1 matrix row for the coarse-step transient
                 draw.rectangle((mcol*8, ty0-1, mcol*8+7, ty0+8+16), fill=255)
@@ -240,7 +288,7 @@ def main():
         if not (turret_cram & 0x08):
             turret_cram = cfg.terrain_cram
         if frame:
-            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud,styles,turret_cram)))
+            difference=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,hud,slots,turret_cram)))
             difference=ImageChops.subtract(difference,mask)
             bad=difference.getbbox()
             if bad and previous_score is not None and score != previous_score:
@@ -248,7 +296,7 @@ def main():
                 # Allow exactly the complete prior score for that one frame;
                 # still compare every HUD pixel (no score-area exclusion).
                 old_hud=hud_row(previous_score,free_region)
-                old_diff=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,old_hud,styles,turret_cram)))
+                old_diff=nonzero(ImageChops.difference(im,expected_pixels((row+finish)%stage[2],phase,old_hud,slots,turret_cram)))
                 old_diff=ImageChops.subtract(old_diff,mask)
                 if not old_diff.getbbox():
                     delayed_scores.append(frame)
@@ -261,17 +309,24 @@ def main():
             # rows72..78 and240..246, one fine step must move prior pixels down1.
             if previous is not None and phase==(phases[-1]+1)%8:
                 current_edge_mask,old_edge_mask = mask.copy(),previous_mask.copy()
-                for t,(col,world) in enumerate(placements):
-                    if styles[t] == previous_styles[t]:continue
-                    # A deliberate aim/hit/death change is still checked by the
-                    # absolute pixel oracle; only its motion comparison differs.
-                    for target,origin,fine in [(current_edge_mask,(row+finish)%stage[2],phase),
-                                               (old_edge_mask,previous_origin,phases[-1])]:
-                        offset=(world-origin)%stage[2]
+                for s in range(pool):
+                    cur = slots[s] if s < len(slots) else (255,0,0,0,0)
+                    prv = previous_slots[s] if s < len(previous_slots) else (255,0,0,0,0)
+                    a,col,world = cur[0],cur[1],cur[2]
+                    pcol,pworld = prv[1],prv[2]
+                    # A slot whose occupancy / position / alive / hit state
+                    # changed between frames is still checked by the absolute
+                    # pixel oracle; only exclude its cells from the motion diff.
+                    if cur == prv:
+                        continue
+                    for target,(scol,swld),origin,fine in [
+                            (current_edge_mask,(col,world),(row+finish)%stage[2],phase),
+                            (old_edge_mask,(pcol,pworld),previous_origin,phases[-1])]:
+                        offset=(swld-origin)%stage[2]
                         if offset==stage[2]-1:offset=-1
                         if -1<=offset<23:
                             top=64+fine+8*offset-55
-                            ImageDraw.Draw(target).rectangle((col*8,max(16,top),col*8+15,top+15),fill=255)
+                            ImageDraw.Draw(target).rectangle((scol*8,max(16,top),scol*8+15,top+15),fill=255)
                 for lo,hi in [(72,79),(240,247)]:
                     box=(0,lo-55,320,hi-55)
                     prevbox=(0,lo-56,320,hi-56)
@@ -281,7 +336,7 @@ def main():
                     edge_checks+=320*(hi-lo)-excluded.histogram()[255]
                     if diff.getbbox():failures.append([frame,'edge motion',lo,diff.getbbox()])
         previous,previous_mask=im,mask
-        previous_styles,previous_origin=styles,(row+finish)%stage[2]
+        previous_slots,previous_origin=slots,(row+finish)%stage[2]
         previous_score=score
         phases.append(phase)
     deltas=sorted(set(b-a for a,b in zip(clocks,clocks[1:])))

@@ -1,5 +1,5 @@
-"""Read current 19656 terrain glyph, metatile, palette, and stage data from assembly."""
-from dataclasses import dataclass
+"""Read current 19656 terrain glyph, metatile, palette, stage, and encounter data from assembly."""
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 
@@ -16,6 +16,28 @@ TERRAIN_GLYPH_BASE = 160
 TERRAIN_GLYPH_NAMESPACE = 64
 ENGINE_MAX_STAGE_ROWS = 844
 
+# The terrain aperture the player actually sees: 40 chars wide, 23 logical rows
+# tall (matrix row 0 is the fixed hires HUD, matrix rows 1..23 are terrain, row
+# 24 never reaches the RSEL=0 aperture). Bottom-origin: gameplay boots with
+# SCROLL_ROW = STAGE_LOGICAL_ROWS - VIEWPORT_ROWS.
+VIEWPORT_COLS = METATILES_PER_ROW * METATILE_W        # 40
+VIEWPORT_ROWS = 23
+
+# Turret runtime pool. Every live turret shares ONE 4-code body glyph set
+# (codes 226..229), so concurrent capacity is NOT bounded by glyph codes - only
+# by the per-slot state array (TURRET_POOL = 8, well above the ~7 turrets a
+# 23-row aperture can hold and the 5 that can be combat-visible). The authored
+# count is unbounded up to MAX_AUTHORED_TURRETS (8-bit streaming cursor); the
+# engine streams authored turrets in/out of the pool as they cross the
+# activation window. See src/background_turrets.asm.
+TURRET_POOL = 8
+MAX_AUTHORED_TURRETS = 255
+
+# Curated enemy attacks. The editor references these by catalogue name/ID; it
+# never re-implements formation/pattern/ingress/egress logic.
+ATTACK_COUNT = 12
+ENEMY_TYPE_COUNT = 4        # attackSpriteStart picks one of four sprite/colour sets
+
 # Project defaults are design choices, not immutable engine truths.
 DEFAULT_PALETTE = {
     "background": 0,
@@ -27,12 +49,15 @@ DEFAULT_SCROLL_FRAME_DIVIDER = 2
 
 
 # Generated build inputs owned by the level editor (see tools/level_editor/
-# ka_export.py). After the engine integration these are the single source of
-# truth for stage height / terrain palette / scroll speed and the stage map;
-# main.asm no longer defines them.
-GENERATED_CONFIG_REL = "src/generated/stage_config.asm"
-GENERATED_STAGE_REL = "src/generated/stage_test.asm"
-GENERATED_TURRETS_REL = "src/generated/stage_turrets.asm"
+# ka_export.py). Each level owns a directory under src/generated/<level>/.
+# Gameplay imports the LEVEL1_DIR set only; other levels coexist unreferenced.
+GENERATED_DIR_REL = "src/generated"
+LEVEL1_DIR_NAME = "level1"
+GENERATED_CONFIG_NAME = "stage_config.asm"
+GENERATED_CHARSET_NAME = "stage_charset.asm"
+GENERATED_STAGE_NAME = "stage_test.asm"
+GENERATED_TURRETS_NAME = "stage_turrets.asm"
+GENERATED_WAVES_NAME = "stage_waves.asm"
 
 # Turret body sits centred in its 4x4 metatile; world char = metatile*4 + 1.
 TURRET_BODY_CHAR_OFFSET = 1
@@ -49,6 +74,9 @@ class EngineData:
     source_scroll_frame_divider: int
     source_colour_ram: int
     source_turrets: list[dict]
+    attack_catalogue: list[tuple] = field(default_factory=list)   # [(name, id), ...]
+    attack_intervals: list[int] = field(default_factory=list)     # attackInterval table
+    attack_sprite_start: list[int] = field(default_factory=list)  # attackSpriteStart table
 
 
 def _strip_comment(line):
@@ -161,13 +189,13 @@ def _parse_generated_config(path):
 
 
 def _parse_ka_list(text, name):
-    """Parse `.var <name> = List().add(1, 2, 3)` -> [1, 2, 3]."""
+    """Parse `.var <name> = List().add(1, 2, 3)` or `.var <name> = List()` -> [ints]."""
     match = re.search(
-        rf"\.var\s+{re.escape(name)}\s*=\s*List\(\)\.add\(([^)]*)\)", text
+        rf"\.var\s+{re.escape(name)}\s*=\s*List\(\)(?:\.add\(([^)]*)\))?", text
     )
     if not match:
-        raise ValueError(f"Could not find .var {name} = List().add(...)")
-    body = match.group(1).strip()
+        raise ValueError(f"Could not find .var {name} = List()...")
+    body = (match.group(1) or "").strip()
     if not body:
         return []
     return [int(tok.strip()) for tok in body.split(",") if tok.strip()]
@@ -178,12 +206,15 @@ def _parse_generated_turrets(path):
     if not Path(path).exists():
         return []
     text = Path(path).read_text(encoding="utf-8")
-    count = _parse_const_int(text, "TURRET_COUNT")
+    try:
+        count = _parse_const_int(text, "TURRET_TOTAL")
+    except ValueError:
+        count = _parse_const_int(text, "TURRET_COUNT")   # pre-streaming-pool files
     cols = _parse_ka_list(text, "turretCols")
     rows = _parse_ka_list(text, "turretRows")
     if not (count == len(cols) == len(rows)):
         raise ValueError(
-            f"{path}: TURRET_COUNT={count} but turretCols has {len(cols)} and turretRows has {len(rows)}"
+            f"{path}: TURRET_TOTAL={count} but turretCols has {len(cols)} and turretRows has {len(rows)}"
         )
     turrets = []
     for world_col, world_row in zip(cols, rows):
@@ -200,19 +231,73 @@ def _parse_generated_turrets(path):
     return turrets
 
 
+def _parse_attack_catalogue(main_text):
+    """Extract the curated-attack catalogue (name -> id) and the attackInterval /
+    attackSpriteStart tables from main.asm.
+
+    Names come from the `.const ATTACK_* = <id>` block; the two data tables are
+    read so the wave exporter can supply per-attack defaults without duplicating
+    them in Python."""
+    catalogue = []
+    for match in re.finditer(
+        r"^\s*\.const\s+(ATTACK_[A-Z0-9_]+)\s*=\s*(\d+)", main_text, flags=re.MULTILINE
+    ):
+        name, value = match.group(1), int(match.group(2))
+        if name in ("ATTACK_COUNT",):
+            continue
+        catalogue.append((name, value))
+    catalogue.sort(key=lambda pair: pair[1])
+
+    def _list_after_label(label):
+        match = re.search(
+            rf"\.var\s+{label}\s*=\s*List\(\)\.add\(([^)]*)\)", main_text
+        )
+        if match:
+            return [int(t.strip()) for t in match.group(1).split(",") if t.strip()]
+        return None
+
+    intervals = _list_after_label("attackIntervalData") or []
+    sprite_start = _list_after_label("attackSpriteStartData") or []
+    return catalogue, intervals, sprite_start
+
+
+def _read_byte_table_from_text(text, label):
+    """Read a `label:` .byte table terminated by a blank line / next label."""
+    values = []
+    inside = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped == f"{label}:":
+            inside = True
+            continue
+        if inside:
+            if stripped.endswith(":") and ".byte" not in stripped:
+                break
+            got = _parse_byte_values(raw)
+            if not got and stripped and ".byte" not in stripped and not stripped.startswith("//"):
+                break
+            values.extend(got)
+    return values
+
+
 def load_engine_data(repo_root):
     repo_root = Path(repo_root)
     main_asm = repo_root / "src" / "main.asm"
-    config_asm = repo_root / GENERATED_CONFIG_REL
-    stage_asm = repo_root / GENERATED_STAGE_REL
-    turrets_asm = repo_root / GENERATED_TURRETS_REL
+    generated = repo_root / GENERATED_DIR_REL
+    level1 = generated / LEVEL1_DIR_NAME
+
+    # Prefer the per-level layout; fall back to the flat layout during migration.
+    def _pick(name):
+        new = level1 / name
+        old = generated / name
+        return new if new.exists() else old
+
+    config_asm = _pick(GENERATED_CONFIG_NAME)
+    charset_asm = _pick(GENERATED_CHARSET_NAME)
+    stage_asm = _pick(GENERATED_STAGE_NAME)
+    turrets_asm = _pick(GENERATED_TURRETS_NAME)
     main_text = main_asm.read_text(encoding="utf-8")
 
-    # Glyph bitmap data + geometry stay hand-authored / engine-owned for now.
-    glyph_count = _parse_const_int(main_text, "TERRAIN_GLYPH_COUNT")
-
-    # Stage height / terrain palette / scroll speed are owned by the generated
-    # level config. There is deliberately no fallback to stale main.asm values.
     if not config_asm.exists():
         raise ValueError(
             f"Generated level config not found: {config_asm}. "
@@ -221,12 +306,30 @@ def load_engine_data(repo_root):
     (source_stage_rows, source_scroll_divider,
      source_palette, source_colour_ram) = _parse_generated_config(config_asm)
 
+    # Terrain glyph count is level-owned and declared in stage_config.asm; the
+    # bitmaps live in the per-level stage_charset.asm. Fall back to the
+    # (soon-to-be-removed) hand-authored block in main.asm during migration, and
+    # ultimately just count the bytes.
+    config_text = config_asm.read_text(encoding="utf-8")
+    if charset_asm.exists():
+        glyph_bytes = _read_table(charset_asm, "terrainGlyphs", "terrainGlyphsEnd")
+    else:
+        glyph_bytes = _read_table(main_asm, "terrainGlyphs", "terrainGlyphsEnd")
+    glyph_count = None
+    for text in (config_text, charset_asm.read_text(encoding="utf-8") if charset_asm.exists() else "", main_text):
+        try:
+            glyph_count = _parse_const_int(text, "TERRAIN_GLYPH_COUNT")
+            break
+        except ValueError:
+            continue
+    if glyph_count is None:
+        glyph_count = len(glyph_bytes) // 8
+
     if not 1 <= glyph_count <= TERRAIN_GLYPH_NAMESPACE or glyph_count % 8:
         raise ValueError(
             f"TERRAIN_GLYPH_COUNT must be 1..{TERRAIN_GLYPH_NAMESPACE} and a multiple of 8; got {glyph_count}"
         )
 
-    glyph_bytes = _read_table(main_asm, "terrainGlyphs", "terrainGlyphsEnd")
     expected_glyph_bytes = glyph_count * 8
     if len(glyph_bytes) != expected_glyph_bytes:
         raise ValueError(f"Expected {expected_glyph_bytes} terrain glyph bytes, got {len(glyph_bytes)}")
@@ -265,6 +368,13 @@ def load_engine_data(repo_root):
         for i in range(parsed_stage_rows)
     ]
 
+    catalogue, intervals, sprite_start = _parse_attack_catalogue(main_text)
+    if not intervals:
+        intervals = _read_byte_table_from_text(main_text, "attackInterval")
+    if not sprite_start:
+        # attackSpriteStart is materialised from a List(); read the .fill target.
+        sprite_start = _read_byte_table_from_text(main_text, "attackSpriteStart")
+
     return EngineData(
         glyphs=glyphs,
         metatiles=metatiles,
@@ -275,4 +385,7 @@ def load_engine_data(repo_root):
         source_scroll_frame_divider=source_scroll_divider,
         source_colour_ram=source_colour_ram,
         source_turrets=_parse_generated_turrets(turrets_asm),
+        attack_catalogue=catalogue,
+        attack_intervals=intervals,
+        attack_sprite_start=sprite_start,
     )
