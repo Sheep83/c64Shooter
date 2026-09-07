@@ -1,5 +1,22 @@
+# macOS
 .DS_Store
+
+# Build / emulator output
 build/
 *.prg
 *.sym
+*.vs
+*.vicesymbols
+
+# Python
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/editor scratch
+*.log
+*.tmp
+*.bak
+*~
