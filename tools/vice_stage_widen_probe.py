@@ -23,6 +23,15 @@ from check_stage_addressing import decode_row_math, wrap_bg_logical_row
 import re as _re
 _RREG = _re.compile(r'\.;.*? (\d+)\s+(\d+)\s+(\d+)\n')
 
+# Call trampoline. It must sit outside the stage map: with up to 64 metatile
+# defs (1024 bytes) the map runs $6A00.. and a 768-row fixture fills to $8800,
+# so $7000 (the old spot) is now inside a large fixture's stageMetatileRows.
+# $6350..$65FF is dead space between two engine segments and no map reaches it.
+TRAMP = 0x6400
+TRAMP_HALT = TRAMP + 0x0a
+TRAMP_HALT_T = TRAMP + 0x07
+TRAMP_FLAGS = 0x6480
+
 
 def launch(port):
     with socket.socket() as c:
@@ -66,14 +75,15 @@ def main():
             return list(p.read_bytes())
 
         m.cmd('delete')
-        m.cmd('break 700a')                  # halt address for the call trampoline
+        m.cmd(f'break {TRAMP_HALT:04x}')     # halt address for the call trampoline
 
         def call(name):
             a = sym[name]
             code = [0x78, 0xd8, 0x20, a & 255, a >> 8, 0x08, 0x68,
-                    0x8d, 0x00, 0x7e, 0x4c, 0x0a, 0x70]
-            put(0x7000, code)
-            m.cmd('r pc=7000, sp=ff')
+                    0x8d, TRAMP_FLAGS & 0xFF, TRAMP_FLAGS >> 8,
+                    0x4c, TRAMP_HALT & 0xFF, TRAMP_HALT >> 8]
+            put(TRAMP, code)
+            m.cmd(f'r pc={TRAMP:04x}, sp=ff')
             m.cmd('x')
 
         def clk():
@@ -83,16 +93,16 @@ def main():
             """Cycle cost of one `jsr name` (sei/cld, IRQs/DMA off), minus stub."""
             a = sym[name]
             code = [0x78, 0xd8, 0xa2, x & 255, 0x20, a & 255, a >> 8,
-                    0x4c, 0x07, 0x70]
-            put(0x7000, code)
-            m.cmd('r pc=7000, sp=ff')
+                    0x4c, TRAMP_HALT_T & 0xFF, TRAMP_HALT_T >> 8]
+            put(TRAMP, code)
+            m.cmd(f'r pc={TRAMP:04x}, sp=ff')
             t0 = clk()
             m.cmd('x')
             return clk() - t0 - 11           # 11 = sei+cld+ldx#+jmp overhead
 
         if args.timing:
             m.cmd('delete')
-            m.cmd('break 7007')
+            m.cmd(f'break {TRAMP_HALT_T:04x}')
             m.cmd('> d01a 00'); m.cmd('> dc0d 7f')
             m.cmd('> d015 00'); m.cmd('> d011 00')
             put('SCROLL_ROW', [40, 0])
@@ -115,9 +125,13 @@ def main():
             print(__import__('json').dumps(samples, indent=2))
             return
 
-        # Stage tables straight from the running image.
-        defs = rd('metatileDefs', 256)
-        metatile_defs = [defs[i:i + 16] for i in range(0, 256, 16)]
+        # Stage tables straight from the running image. The metatile-def table is
+        # variable length now (STAGE_METATILE_COUNT entries, 1..64) - read its
+        # real byte span, not a fixed 256.
+        defs_len = sym['METATILE_DEFS_END'] - sym['metatileDefs']
+        defs = rd('metatileDefs', defs_len)
+        metatile_defs = [defs[i:i + 16] for i in range(0, defs_len, 16)]
+        print(f'metatile defs: {len(metatile_defs)} ({defs_len} bytes)')
         rows_len = sym['STAGE_METATILE_ROWS_END'] - sym['stageMetatileRows']
         raw = rd('stageMetatileRows', rows_len)
         stage_rows = [raw[i:i + 10] for i in range(0, rows_len, 10)]

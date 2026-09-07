@@ -5,6 +5,7 @@
 set -e
 cd "${0:A:h}/.."
 N=$1
+D=${2:-16}                       # metatile-def count (1..64); default keeps the real 16
 KA=/Users/brianmorrice/dev/tools/kickassembler/KickAss.jar
 PORT=$((6600 + N % 60))
 
@@ -28,10 +29,11 @@ restore() {
 }
 trap restore EXIT
 
-python3 tools/make_stage_fixture.py "$N" > /tmp/stage_fixture_$N.asm
+python3 tools/make_stage_fixture.py "$N" "$D" > /tmp/stage_fixture_$N.asm
 test -s /tmp/stage_fixture_$N.asm || { echo "fixture generation failed"; exit 1; }
 cp /tmp/stage_fixture_$N.asm "$STG"
 sed -i '' "s/^\.const STAGE_METATILE_ROWS *= *[0-9]*/.const STAGE_METATILE_ROWS = $N/" "$CFG"
+sed -i '' "s/^\.const STAGE_METATILE_COUNT *= *[0-9]*/.const STAGE_METATILE_COUNT   = $D/" "$CFG"
 # Minimal in-range single-turret placement + no wave triggers for the synthetic
 # fixture (the widen probe does not care about either; this just satisfies the
 # placement guards for any N).

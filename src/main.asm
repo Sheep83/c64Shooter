@@ -159,7 +159,12 @@
 .const METATILE_W = 4
 .const METATILE_H = 4
 .const METATILES_PER_ROW = 10                       // 40 / METATILE_W: metatiles spanning one screen width.
-.const METATILE_DEF_COUNT = 16                       // Distinct 4x4 metatile definitions (bas-relief tileset).
+// Distinct 4x4 metatile definitions for this level. LEVEL-owned: STAGE_METATILE_COUNT
+// is declared in generated/level1/stage_config.asm (imported above). 1..64. The
+// def table is variable length (STAGE_METATILE_COUNT * 16 bytes) - no padding -
+// and the metatile-ID -> def lookup in decodeStageCharacterRow is a 16-bit
+// address calc, so an ID may be 0..63 (id*16 up to 1008, past an 8-bit offset).
+.const METATILE_DEF_COUNT = STAGE_METATILE_COUNT
 // STAGE_METATILE_ROWS is level-owned (generated/stage_config.asm) and MUST match
 // the generated stageMetatileRows byte count (hard guard after the #import).
 // decodeStageCharacterRow uses 16-bit logical-row / metatile-row / stage-map
@@ -169,8 +174,8 @@
 .if (METATILES_PER_ROW * METATILE_W != 40) {
     .error "METATILES_PER_ROW * METATILE_W must tile the 40-column screen exactly"
 }
-.if (METATILE_DEF_COUNT > 16) {
-    .error "METATILE_DEF_COUNT > 16: id*16 no longer fits an 8-bit metatileDefs offset"
+.if (METATILE_DEF_COUNT < 1 || METATILE_DEF_COUNT > 64) {
+    .error "METATILE_DEF_COUNT (STAGE_METATILE_COUNT) must be within 1..64"
 }
 .if (STAGE_METATILE_ROWS < 1) {
     .error "STAGE_METATILE_ROWS must be at least 1"
@@ -4180,7 +4185,8 @@ BG_METATILE_ROW_HI:    .byte 0          // ...(0..STAGE_METATILE_ROWS-1).
 BG_ROW_BASE:           .byte 0          // Scratch: BG_METATILE_ROW * METATILES_PER_ROW, 16-bit LE
 BG_ROW_BASE_HI:        .byte 0          // (stageMetatileRows byte offset of this row's column 0).
 BG_COL:                .byte 0          // Scratch: metatile column counter (0..METATILES_PER_ROW-1).
-BG_DEF_BASE:           .byte 0          // Scratch: metatileDefs offset of the current column's 4-byte slice.
+BG_DEF_BASE:           .byte 0          // Scratch: current column's metatile ID (0..63) while the
+                                         // 16-bit metatileDefs pointer is being built.
 BG_OUT_BASE:           .byte 0          // Scratch: BG_INCOMING_ROW offset of the current column.
 BATCH_FIRST_ASSIGN:    .fill 16, $ff
 BATCH_ASSIGN_COUNT:    .fill 16, 0
@@ -5226,9 +5232,10 @@ wrapBgLogicalRow:
 // The logical row, metatile row and stageMetatileRows byte offset are all
 // 16-bit now (a >=400-row stage has a 4,000-byte map, well past an 8-bit
 // index). subrow = logicalRow & 3 stays 8-bit (always 0..3). The stage row's
-// 10 IDs are reached through a 16-bit pointer (stageMetatileRows + rowBase);
-// only the 0..9 column is an index. The metatile ID stays a single byte and
-// id*16 stays an 8-bit metatileDefs offset (METATILE_DEF_COUNT <= 16).
+// 10 IDs are read once into BG_ROW_IDS through a 16-bit pointer
+// (stageMetatileRows + rowBase); only the 0..9 column is an index. The metatile
+// ID stays a single byte (0..63) but id*16 (up to 1008) is a 16-bit
+// metatileDefs offset - built per column into TEXT_SRC after the IDs are read.
 decodeStageCharacterRow:
     lda BG_LOGICAL_ROW
     and #METATILE_H - 1
@@ -5279,28 +5286,59 @@ decodeStageCharacterRow:
     adc BG_ROW_BASE_HI
     sta TEXT_SRC + 1
 
+    // Read this row's METATILES_PER_ROW metatile IDs into BG_ROW_IDS up front,
+    // so the per-column loop can reuse TEXT_SRC as a 16-bit metatileDefs pointer.
+    // (An ID is 0..63 now; id*16 is up to 1008, so the def offset must be 16-bit.)
+    ldy #METATILES_PER_ROW - 1
+!readIds:
+    lda (TEXT_SRC),y
+    sta BG_ROW_IDS,y
+    dey
+    bpl !readIds-
+
     lda #0
     sta BG_COL
 !colLoop:
     ldy BG_COL
-    lda (TEXT_SRC),y                         // This column's metatile ID (0..METATILE_DEF_COUNT-1).
-    asl
-    asl
-    asl
-    asl                                      // id * (METATILE_W * METATILE_H) = id * 16.
+    lda BG_ROW_IDS,y                         // This column's metatile ID (0..METATILE_DEF_COUNT-1, <=63).
+    sta BG_DEF_BASE                          // Keep the raw ID; both halves of id*16 are derived from it.
+
+    // TEXT_SRC(16) = metatileDefs + id*16 + BG_TILE_ROW_OFS.
+    //   high(id*16) = id >> 4          (0..3)
+    //   low (id*16) = (id << 4) & $FF  (a multiple of 16, <= $F0)
+    // BG_TILE_ROW_OFS is 0..12, so low + ofs <= $FC and cannot carry; only the
+    // base-low add can carry, and that carry is folded into the high byte.
+    lsr
+    lsr
+    lsr
+    lsr                                     // A = id >> 4
     clc
-    adc BG_TILE_ROW_OFS
-    sta BG_DEF_BASE                          // metatileDefs offset of this tile's internal-row slice.
+    adc #>metatileDefs
+    sta TEXT_SRC + 1                        // provisional high byte
+
+    lda BG_DEF_BASE
+    asl
+    asl
+    asl
+    asl                                    // A = (id << 4) & $FF
+    clc
+    adc BG_TILE_ROW_OFS                    // + internal-row offset (no carry)
+    clc
+    adc #<metatileDefs                     // + base low (may carry)
+    sta TEXT_SRC
+    bcc !defPtrDone+
+    inc TEXT_SRC + 1
+!defPtrDone:
 
     lda BG_COL
     asl
     asl
     sta BG_OUT_BASE                          // BG_INCOMING_ROW offset for this column (col * METATILE_W).
 
-    ldy BG_DEF_BASE
     ldx BG_OUT_BASE
+    ldy #0
     .for (var s = 0; s < METATILE_W; s++) {
-        lda metatileDefs,y
+        lda (TEXT_SRC),y
         sta BG_INCOMING_ROW,x
         .if (s < METATILE_W - 1) {
             iny
@@ -5671,6 +5709,12 @@ BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data
                                          // copyIncomingRowToScreen then copies it to a screen row. Never
                                          // touched by the crossing-row save/restore mechanism (that
                                          // buffer, BG_CROSSING_ROW, lives separately near SCROLL_ROW).
+BG_ROW_IDS:            .fill METATILES_PER_ROW, 0  // decodeStageCharacterRow scratch: this stage row's
+                                         // 10 metatile IDs, read once up front so TEXT_SRC can then be
+                                         // reused per column as a 16-bit metatileDefs pointer (an ID may
+                                         // be 0..63 -> id*16 up to 1008, past an 8-bit offset). Lives in
+                                         // the $2920 segment next to BG_INCOMING_ROW; the $2000 engine-
+                                         // state block is full.
 
 // --- Presentation-only hostile-projectile suppression diagnostics ---------
 // Memory counters only (no HUD, no decimal formatting). Reset by initBackground.

@@ -58,7 +58,7 @@ assert turret_world_col(0) == 1 and turret_world_col(7) == 29
 ok("coordinate model: world = metatile_index * 4 + 1")
 
 # 2. widened vertical coordinate - no 8-bit limit; export sorts DESCENDING by row
-big = _project(rows=844, turrets=((0, 0), (200, 5), (700, 9)))
+big = _project(rows=768, turrets=((0, 0), (200, 5), (700, 9)))
 assert validate_project(big) == [], validate_project(big)
 rows = sorted((turret_world_row(t["metatileRow"]) for t in iter_turrets(big)), reverse=True)
 assert rows == [2801, 801, 1] and max(rows) > 255

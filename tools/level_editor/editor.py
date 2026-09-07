@@ -14,9 +14,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from engine_data import (
+    C64_PALETTE_HEX,
     DEFAULT_PALETTE,
     DEFAULT_SCROLL_FRAME_DIVIDER,
     ENEMY_TYPE_COUNT,
+    METATILE_CAPACITY,
     METATILE_H,
     METATILE_NAMES,
     METATILE_W,
@@ -25,6 +27,9 @@ from engine_data import (
     load_engine_data,
 )
 from ka_export import export_level
+from native_metatile import GlyphBudgetExceeded, blank_pixels
+from terrain_repository import TerrainRepository, default_repo_path
+from workshop_ui import ImportDialog, WorkshopDialog
 from project import (
     DEFAULT_STAGE_ROWS,
     LevelProject,
@@ -38,10 +43,14 @@ from project import (
     clamp_viewport_top,
     composition_size,
     default_viewport_top,
+    ensure_level_metatile_set,
     export_readiness_errors,
     iter_turrets,
     load_project,
     max_viewport_top,
+    metatile_set_entry_from_native,
+    metatile_set_glyph_cost,
+    repack_tileset_from_metatile_set,
     save_project,
     stage_logical_rows,
     turret_world_col,
@@ -55,13 +64,9 @@ CHAR_SIZE = 8
 METATILE_PIXELS = METATILE_W * CHAR_SIZE
 LEVEL_WIDTH = METATILES_PER_ROW * METATILE_PIXELS
 PAL_FRAMES_PER_SECOND = 50
-# Approximate C64 palette for editor preview. Project data stores indices, not RGB.
-C64_COLOURS = (
-    "#000000", "#ffffff", "#813338", "#75cec8",
-    "#8e3c97", "#56ac4d", "#2e2c9b", "#edf171",
-    "#8e5029", "#553800", "#c46c71", "#4a4a4a",
-    "#7b7b7b", "#a9ff9f", "#706deb", "#b2b2b2",
-)
+# Approximate C64 palette for editor preview. Project data stores indices, not
+# RGB. The table itself lives in engine_data so non-GUI modules share it.
+C64_COLOURS = C64_PALETTE_HEX
 GRID = "#555555"
 SELECTED = "#ffffff"
 VIEWPORT_EDGE = "#38d0ff"
@@ -95,6 +100,12 @@ class LevelEditor(tk.Tk):
                                           dict(self.data.source_palette),
                                           self.data.source_scroll_frame_divider,
                                           objects=[dict(t) for t in self.data.source_turrets])
+        ensure_level_metatile_set(self.project)
+        self.repo_path = default_repo_path(self.repo_root / "tools" / "level_editor")
+        try:
+            self.repository = TerrainRepository.load(self.repo_path)
+        except Exception:                                 # noqa: BLE001 - start empty on a bad file
+            self.repository = TerrainRepository(path=self.repo_path)
         self.project_path = None
         self.viewport_top = default_viewport_top(self.project)
 
@@ -175,6 +186,7 @@ class LevelEditor(tk.Tk):
             json.dumps(self.project.canonical_wave_definitions(), sort_keys=True),
             json.dumps(self.project.canonical_wave_triggers(), sort_keys=True),
             json.dumps(self.project.tileset, sort_keys=True) if self.project.tileset else None,
+            json.dumps(self.project.canonical_metatile_set(), sort_keys=True),
         )
 
     @staticmethod
@@ -280,17 +292,32 @@ class LevelEditor(tk.Tk):
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        palette_frame = ttk.LabelFrame(body, text="Metatiles", padding=6)
+        palette_frame = ttk.LabelFrame(body, text="Level metatile set (up to 64)", padding=6)
         palette_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8))
-        palette_frame.rowconfigure(0, weight=1)
+        palette_frame.rowconfigure(1, weight=1)
+        self.glyph_budget_text = tk.StringVar(value="")
+        ttk.Label(palette_frame, textvariable=self.glyph_budget_text,
+                  font=("TkDefaultFont", 9)).grid(row=0, column=0, columnspan=2, sticky="w")
         self.palette_canvas = tk.Canvas(palette_frame, width=210, highlightthickness=0,
                                         background=self.cget("background"))
         pscroll = ttk.Scrollbar(palette_frame, orient="vertical", command=self.palette_canvas.yview)
         self.palette_canvas.configure(yscrollcommand=pscroll.set)
-        self.palette_canvas.grid(row=0, column=0, sticky="nsew")
-        pscroll.grid(row=0, column=1, sticky="ns")
+        self.palette_canvas.grid(row=1, column=0, sticky="nsew")
+        pscroll.grid(row=1, column=0, sticky="nse")
         self.palette_canvas.bind("<Button-1>", self._palette_click)
         self._bind_mousewheel(self.palette_canvas)
+        mt_btns = ttk.Frame(palette_frame)
+        mt_btns.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        for txt, cmd in (("Workshop…", self._metatile_edit_workshop),
+                         ("New", self._metatile_new_blank),
+                         ("Import PNG…", self._metatile_import_png)):
+            ttk.Button(mt_btns, text=txt, width=11, command=cmd).pack(side="left", padx=1)
+        mt_btns2 = ttk.Frame(palette_frame)
+        mt_btns2.grid(row=3, column=0, columnspan=2, sticky="ew")
+        for txt, cmd in (("From repo…", self._metatile_from_repo),
+                         ("Rename…", self._metatile_rename),
+                         ("Trim unused", self._metatile_remove_unused)):
+            ttk.Button(mt_btns2, text=txt, width=11, command=cmd).pack(side="left", padx=1)
 
         self.level_frame = ttk.LabelFrame(body, text="Working stage", padding=6)
         self.level_frame.grid(row=0, column=1, sticky="nsew")
@@ -486,10 +513,31 @@ class LevelEditor(tk.Tk):
     def _draw_metatile(self, canvas, tile_id, x, y, tags=()):
         canvas.create_image(x, y, anchor="nw", image=self._get_metatile_image(tile_id), tags=tags)
 
+    # ---- level metatile set (up to 64) ----------------------------------
+    def _metatile_count(self):
+        s = self.project.level_metatile_set
+        if s:
+            return len(s)
+        if self.project.tileset:
+            return len(self.project.tileset["metatileDefs"])
+        return len(METATILE_NAMES)
+
+    def _metatile_name(self, tile_id):
+        s = self.project.level_metatile_set
+        if s and 0 <= tile_id < len(s):
+            return s[tile_id].get("name") or f"M{tile_id}"
+        return METATILE_NAMES[tile_id] if tile_id < len(METATILE_NAMES) else f"M{tile_id}"
+
+    def _metatile_row_usage(self):
+        """set of metatile IDs referenced by the current map."""
+        return {c for r in self.project.metatile_rows for c in r}
+
     def _draw_palette(self):
         self.palette_canvas.delete("all")
         item_height = 46
-        for tile_id, name in enumerate(METATILE_NAMES):
+        count = self._metatile_count()
+        for tile_id in range(count):
+            name = self._metatile_name(tile_id)
             y = tile_id * item_height + 4
             tags = (f"tile_{tile_id}",)
             self.palette_canvas.create_rectangle(4, y, 39, y + 35,
@@ -499,7 +547,11 @@ class LevelEditor(tk.Tk):
             self.palette_canvas.create_text(48, y + 17, anchor="w", text=f"{tile_id:2d}  {name}", tags=tags)
             if tile_id == self.selected_tile:
                 self.palette_canvas.create_rectangle(1, y - 2, 205, y + 38, outline=SELECTED, width=2, tags=tags)
-        self.palette_canvas.configure(scrollregion=(0, 0, 210, len(METATILE_NAMES) * item_height + 4))
+        self.palette_canvas.configure(scrollregion=(0, 0, 210, count * item_height + 4))
+        if hasattr(self, "glyph_budget_text"):
+            info = metatile_set_glyph_cost(self.project)
+            self.glyph_budget_text.set(
+                f"Metatiles: {count} / 64      Terrain glyphs: {info['used']} / {info['capacity']}")
 
     def _draw_level(self):
         self.level_canvas.delete("all")
@@ -558,10 +610,187 @@ class LevelEditor(tk.Tk):
 
     def _palette_click(self, event):
         tile_id = int((self.palette_canvas.canvasy(event.y) - 4) // 46)
-        if 0 <= tile_id < len(METATILE_NAMES):
+        if 0 <= tile_id < self._metatile_count():
             self.selected_tile = tile_id
             self._draw_palette()
             self._update_status()
+
+    # ---- metatile-set operations -------------------------------------------
+    def _repack_after_metatile_edit(self):
+        try:
+            repack_tileset_from_metatile_set(self.project)
+        except GlyphBudgetExceeded as exc:
+            messagebox.showerror("Terrain glyph budget", str(exc), parent=self)
+            return False
+        self.metatile_image_cache.clear()
+        return True
+
+    def _metatile_new_blank(self):
+        if self._metatile_count() >= 64:
+            self.bell()
+            self.status_text.set("This level already has 64 metatiles (the live maximum).")
+            return
+        before = self._project_state()
+        ensure_level_metatile_set(self.project)
+        idx = len(self.project.level_metatile_set)
+        self.project.level_metatile_set.append(
+            metatile_set_entry_from_native(blank_pixels(0), name=f"M{idx}"))
+        if not self._repack_after_metatile_edit():
+            self.project.level_metatile_set.pop()
+            return
+        self.selected_tile = idx
+        self._push_undo(before)
+        self._refresh_all()
+
+    def _metatile_edit_workshop(self):
+        idx = self.selected_tile
+        ensure_level_metatile_set(self.project)
+        if not 0 <= idx < len(self.project.level_metatile_set):
+            return
+        entry = self.project.level_metatile_set[idx]
+        before = self._project_state()
+
+        def on_save(name, pixels):
+            self.project.level_metatile_set[idx] = metatile_set_entry_from_native(
+                pixels, name=name, source=entry.get("source"))
+            if not self._repack_after_metatile_edit():
+                return "This metatile would push the level past 64 unique terrain glyphs."
+            self._push_undo(before)
+            self._refresh_all()
+            return None
+
+        WorkshopDialog(
+            self, self.project.palette, title=f"Workshop — metatile {idx} ({entry['name']})",
+            name=entry["name"], pixels=entry["native"]["pixels"],
+            cost_fn=lambda px: metatile_set_glyph_cost(self.project, candidate_pixels=px),
+            on_save=on_save)
+
+    def _metatile_import_png(self):
+        def on_pick(rgb_rows, provenance):
+            native = None
+            from terrain_convert import source_tile_to_native
+            native = source_tile_to_native(rgb_rows, self.project.palette)
+            before = self._project_state()
+
+            def on_save(name, pixels):
+                if self._metatile_count() >= 64:
+                    return "This level already has 64 metatiles."
+                ensure_level_metatile_set(self.project)
+                self.project.level_metatile_set.append(metatile_set_entry_from_native(
+                    pixels, name=name, source={"provenance": provenance}))
+                if not self._repack_after_metatile_edit():
+                    self.project.level_metatile_set.pop()
+                    return "Adding this metatile would exceed the 64-glyph terrain budget."
+                self.selected_tile = self._metatile_count() - 1
+                self._push_undo(before)
+                self._refresh_all()
+                return None
+
+            def repo_save(name, pixels):
+                try:
+                    self.repository.add_asset(name, pixels, provenance=provenance)
+                    self.repository.save()
+                except Exception as exc:                  # noqa: BLE001
+                    return str(exc)
+                return None
+
+            WorkshopDialog(self, self.project.palette, title="Workshop — imported source tile",
+                           name="imported", pixels=native, source_rgb=rgb_rows,
+                           cost_fn=lambda px: metatile_set_glyph_cost(self.project, candidate_pixels=px),
+                           on_save=on_save, allow_repo_save=repo_save)
+
+        ImportDialog(self, on_pick=on_pick, initial_dir=str(self.repo_root))
+
+    def _metatile_from_repo(self):
+        if not len(self.repository):
+            messagebox.showinfo("Terrain repository",
+                                "The terrain repository is empty. Import a source tile first.",
+                                parent=self)
+            return
+        picker = tk.Toplevel(self)
+        picker.title("Add metatile from repository")
+        picker.transient(self)
+        lb = tk.Listbox(picker, width=44, height=14)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        assets = self.repository.list()
+        for a in assets:
+            lb.insert("end", f"{a['id']}  {a['name']}")
+
+        def add():
+            sel = lb.curselection()
+            if not sel:
+                return
+            if self._metatile_count() >= 64:
+                messagebox.showerror("Full", "This level already has 64 metatiles.", parent=picker)
+                return
+            asset = assets[sel[0]]
+            snap = self.repository.snapshot(asset["id"])
+            before = self._project_state()
+            ensure_level_metatile_set(self.project)
+            self.project.level_metatile_set.append(metatile_set_entry_from_native(
+                snap["pixels"], name=snap["name"],
+                source={"repositoryAssetId": snap["repositoryAssetId"],
+                        "provenance": snap["provenance"]}))
+            if not self._repack_after_metatile_edit():
+                self.project.level_metatile_set.pop()
+                return
+            self.selected_tile = self._metatile_count() - 1
+            self._push_undo(before)
+            self._refresh_all()
+            picker.destroy()
+
+        ttk.Button(picker, text="Add snapshot to level", command=add).pack(pady=(0, 8))
+
+    def _metatile_rename(self):
+        idx = self.selected_tile
+        ensure_level_metatile_set(self.project)
+        if not 0 <= idx < len(self.project.level_metatile_set):
+            return
+        cur = self.project.level_metatile_set[idx]["name"]
+        new = simpledialog.askstring("Rename metatile", f"New name for metatile {idx}:",
+                                     initialvalue=cur, parent=self)
+        if not new or new.strip() == cur:
+            return
+        before = self._project_state()
+        self.project.level_metatile_set[idx]["name"] = new.strip()
+        self._push_undo(before)
+        self._draw_palette()
+        self._update_status()
+
+    def _metatile_remove_unused(self):
+        ensure_level_metatile_set(self.project)
+        count = len(self.project.level_metatile_set)
+        if count <= 16:
+            messagebox.showinfo("Remove unused",
+                                "Keeping at least the first 16 metatiles (historical IDs).",
+                                parent=self)
+            return
+        used = self._metatile_row_usage()
+        # Only trailing unused metatiles can be dropped without renumbering the
+        # painted map. Never silently renumber IDs.
+        removable = []
+        for i in range(count - 1, 15, -1):
+            if i in used:
+                break
+            removable.append(i)
+        if not removable:
+            messagebox.showinfo(
+                "Remove unused",
+                "The highest metatile ID is still used by the map. Removing a "
+                "metatile below it would renumber painted cells, which is not done "
+                "automatically. Repaint those cells first.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Remove unused",
+                f"Remove {len(removable)} trailing unused metatile(s) "
+                f"(IDs {min(removable)}..{max(removable)})?", parent=self):
+            return
+        before = self._project_state()
+        del self.project.level_metatile_set[min(removable):]
+        self._repack_after_metatile_edit()
+        self.selected_tile = min(self.selected_tile, self._metatile_count() - 1)
+        self._push_undo(before)
+        self._refresh_all()
 
     # ---- canvas input dispatch -----------------------------------------
     def _cell_from_event(self, event):
@@ -1024,9 +1253,11 @@ class LevelEditor(tk.Tk):
                 f"{len(self.project.wave_definitions)} definition(s)  |  "
                 f"click the stage to place a trigger; drag to move; Delete to remove")
             return
+        info = metatile_set_glyph_cost(self.project)
         self.status_text.set(
-            f"Selected: {self.selected_tile} {METATILE_NAMES[self.selected_tile]}  |  "
-            f"Level: {self.project.name}  {METATILES_PER_ROW} x {self.project.height} metatiles  |  "
+            f"Selected: {self.selected_tile} {self._metatile_name(self.selected_tile)}  |  "
+            f"Level: {self.project.name}  {METATILES_PER_ROW} x {self.project.height}  |  "
+            f"Metatiles {self._metatile_count()}/64  ·  Terrain glyphs {info['used']}/{info['capacity']}  |  "
             f"Palette {self.project.palette['background']}/{self.project.palette['multicolour1']}/"
             f"{self.project.palette['multicolour2']}/{self.project.palette['character']}  |  "
             f"Divider {self.project.scroll_frame_divider}")
@@ -1060,7 +1291,8 @@ class LevelEditor(tk.Tk):
         self.redo_stack.clear()
 
     def _restore_state(self, state):
-        (name, rows, palette_items, divider, obj_keys, meta_items, defs_json, trig_json, tileset_json) = state
+        (name, rows, palette_items, divider, obj_keys, meta_items, defs_json, trig_json,
+         tileset_json, metatile_set_json) = state
         self.project.name = name
         self.project.metatile_rows = [list(r) for r in rows]
         self.project.palette = dict(palette_items)
@@ -1070,7 +1302,10 @@ class LevelEditor(tk.Tk):
         self.project.wave_definitions = json.loads(defs_json)
         self.project.wave_triggers = json.loads(trig_json)
         self.project.tileset = json.loads(tileset_json) if tileset_json else None
+        self.project.level_metatile_set = json.loads(metatile_set_json) if metatile_set_json else None
         self.selected_turret = self.selected_trigger = None
+        self.selected_tile = min(self.selected_tile, self._metatile_count() - 1)
+        self.metatile_image_cache.clear()
         self._refresh_all()
 
     def _undo(self):
@@ -1100,11 +1335,13 @@ class LevelEditor(tk.Tk):
     def _adopt_project(self, project, path):
         """Switch to a level package, resetting ALL editor state (no stale data)."""
         self.project = project
+        ensure_level_metatile_set(self.project)
         self.project_path = Path(path) if path else None
         self.metatile_image_cache.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.selected_turret = self.selected_trigger = self.selected_wave_def = None
+        self.selected_tile = min(self.selected_tile, self._metatile_count() - 1)
         self.paint_gesture_before = None
         self._dragging_trigger = False
         self.edit_mode.set("terrain")

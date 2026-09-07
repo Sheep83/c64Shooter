@@ -304,3 +304,166 @@ New VICE: `vice_wave_trigger_probe.py`, `vice_level1_smoke.py`;
 `vice_bottom_origin_probe.py` rewritten for the pool. `check_fixed_hud_capture.py`
 / `check_turret_capture.py` / `vice_scroll_test.py` / `run_stage_fixture.sh` /
 `make_stage_fixture.py` updated for the pool + `level1/` layout.
+
+---
+
+## Milestone: Terrain Asset Workshop + 64-metatile per-level capacity
+
+**Status: done, uncommitted.** Full report:
+`reports/terrain-asset-workshop-report.md`. See also
+`docs/terrain-asset-workshop-worklog.md`.
+
+### Live per-level metatile capacity: 16 -> 64
+
+`STAGE_METATILE_COUNT` is a new level-owned `.const` in the generated
+`stage_config.asm` (1..64, the level's real metatile count - no padding, no
+magic 16). The engine derives `.const METATILE_DEF_COUNT = STAGE_METATILE_COUNT`
+(`src/main.asm`); the old `.if (METATILE_DEF_COUNT > 16)` guard is replaced with
+a `1..64` range check. The metatile-definition table is variable length
+(`STAGE_METATILE_COUNT * 16` bytes).
+
+### Engine metatile-definition lookup is 16-bit
+
+`decodeStageCharacterRow` previously formed the `metatileDefs` offset as an
+8-bit `id*16 + subrowOffset` (correct only for id 0..15). It now reads the
+row's 10 IDs into a `BG_ROW_IDS` scratch buffer once, then per column builds a
+16-bit pointer `TEXT_SRC = metatileDefs + (id<<4) + BG_TILE_ROW_OFS` and copies
+4 bytes via `lda (TEXT_SRC),y`. Legal NMOS 6502 only; the row/scroll/wrap logic
+is unchanged. `BG_ROW_IDS` lives in the `$2920` segment next to
+`BG_INCOMING_ROW` (the `$2000` engine-state block is full). Cost:
+`decodeStageCharacterRow` ~1050 -> 1697 cycles; PAL frame cadence, raster
+servicing and sprite starts are unaffected (measured).
+
+### Stage-row maximum recalculated: 844 -> 768
+
+From the real assembled layout: `metatileDefs + stageMetatileRows` occupy
+`$6600..$8800` (`$2200` = 8704 bytes); a full 64-entry def table is 1024 bytes,
+leaving `(8704 - 1024) / 10 = 768` whole rows. `ENGINE_MAX_STAGE_ROWS = 768`
+(`tools/level_editor/engine_data.py`), used by `project.MAX_STAGE_ROWS` and the
+editor spinboxes. The engine's own `.if (STAGE_TEST_END > $8800) .error` is
+label-based and stays exact (a 16-metatile level could still reach 844; the
+editor deliberately uses the uniform 64-metatile worst case). One row beyond
+768 with a 64-def table fails assembly with
+`"Metatile stage data collides with the background turret segment ($8800)"`.
+
+### Terrain Asset Repository (editor-side, reusable across projects)
+
+`tools/level_editor/terrain_repository/repository.json` - one deterministic,
+schema-versioned (v1) JSON document (`sort_keys`, sorted assets, **no
+timestamps** so re-saving an unchanged repo is a no-op diff). Each asset:
+stable `asset_NNNN` id, display name, native 16x32 logical-multicolour grid
+(values 0..3), provenance (`sourcePack`, `sourceTileIndex`, `sourceCoords`,
+`sourceTileSize`, `licenceNote`, optional `localSourcePath`), free-form notes
+and tags. Assets store **logical pixels only** - never a live char code.
+`TerrainRepository.snapshot(id)` returns a standalone deep copy for embedding
+into a level, so a later repository edit or delete can never make a level fail
+to build. Module: `tools/level_editor/terrain_repository.py`.
+
+### Native 16x32 multicolour representation + glyph packing / dedup
+
+`tools/level_editor/native_metatile.py`. A metatile is 16 logical multicolour
+pixels across x 32 rows; char cell (cr,cc) covers native rows `cr*8..cr*8+7`,
+cols `cc*4..cc*4+3`, and its 8 bytes pack each row's 4 pixels as
+`(p0<<6)|(p1<<4)|(p2<<2)|p3` - exactly what the engine/VIC consume.
+`pixels_to_glyphs` / `glyphs_to_pixels` round-trip losslessly.
+`pack_metatiles` deduplicates: identical 8-byte glyphs share one code, repeats
+within and across metatiles reuse IDs, glyph order is first-seen and
+deterministic, and the glyph list is padded to a multiple of 8 (engine copy
+constraint). `GlyphBudgetExceeded` is raised - never a silent alias or drop -
+when a level's metatiles need more than the 64-slot terrain glyph namespace.
+The editor shows `Metatiles: N / 64   Terrain glyphs: U / 64` and, in the
+Workshop, `this metatile: 16 cells, R existing reused, X new unique required`.
+
+### Spritesheet import + colour conversion
+
+`tools/level_editor/spritesheet.py` - `slice_sheet(path, tile_w=32, tile_h=32)`;
+configurable tile size; incomplete edge cells are **warned, never cropped**
+into short tiles; Pillow for PNG decode only.
+`tools/level_editor/terrain_convert.py` - deterministic nearest-colour
+conversion of a source tile to the native 16x32 grid, against the FOUR colours
+the current project palette uses (the one editor C64 table, moved to
+`engine_data.C64_PALETTE_RGB` / `_HEX`). Horizontal pair-reduction policy: a
+32-wide source row's columns `2x, 2x+1` are RGB-averaged into native pixel `x`;
+a non-32 source is nearest-resampled to 32x32 first. The conversion is a
+starting point only - manual editing in the Workshop is authoritative.
+
+### Terrain Asset Workshop (editor UI)
+
+`tools/level_editor/workshop_ui.py` (Tkinter, no new framework).
+`NativeMetatileEditor` is a zoomed 16x32 paint canvas with 4 project-palette
+swatches (rendered in the current palette but storing logical 0..3), click and
+drag paint, visible 4x4-char boundary guides, undo/redo and a live glyph-cost
+readout. `WorkshopDialog` shows an optional source-image preview beside the
+native editor and can Save to the level metatile set and/or Save to the
+repository (with provenance). `ImportDialog` picks a PNG, sets the tile size,
+browses cached thumbnails and opens one tile in the Workshop. In `editor.py`
+the metatile palette now iterates the level metatile set (up to 64, scrollable)
+with per-entry names; buttons: Workshop / New / Import PNG / From repo / Rename
+/ Trim unused. "Trim unused" only drops **trailing** unused metatiles - IDs are
+never silently renumbered (that would corrupt painted maps); a metatile below a
+still-used higher ID must be repainted first.
+
+### Project format: V4
+
+`formatVersion 4` adds `levelMetatileSet` - up to 64 entries, each
+`{name, native:{width:16,height:32,pixels:[[0..3]*16]*32], source: null | {repositoryAssetId, provenance}}`.
+It is the authored source of truth; `tileset` (packed glyphs + defs) is a
+derived cache, regenerated by `repack_tileset_from_metatile_set` whenever a
+native metatile is edited or a repository asset is added. V1/V2/V3 files load
+unchanged: the packed `tileset` is kept byte-for-byte and a native
+`levelMetatileSet` is *derived* from it (names default to the historical
+`METATILE_NAMES`), so a migrated level renders and exports exactly as before
+until a metatile is edited. `SUPPORTED_FORMAT_VERSIONS = (1, 2, 3, 4)`;
+`project_from_dict` migration is deterministic (save -> reload -> save is
+byte-identical). `MACH` stays a terrain metatile, not a gameplay object.
+
+### Generated engine ownership (unchanged boundary)
+
+Char codes 160..223 remain the permanent 64-slot terrain glyph namespace,
+already level-owned via generated `stage_charset.asm` (from the prior pass).
+This task adds editor-authored terrain but does **not** move any ownership:
+`stage_charset.asm` still carries only `terrainGlyphs` (codes 160..), and the
+HUD (128..159), diagnostic (224/225), shared turret body (226..229) and
+starfield (240..251) glyphs are untouched. Export path enforces the 64-glyph
+budget before generating any bytes.
+
+### Deterministic export
+
+`ka_export.render_stage_config` emits `.const STAGE_METATILE_COUNT`;
+`render_stage_asm` emits up to 64 metatile defs. `build_levels.py` re-emits
+both `level1/` and `level2/` (level.json migrated to V4); the two generated
+dirs stay independent and gameplay imports only `level1/`. The editor never
+patches `main.asm`.
+
+### Tests
+
+New headless (`tools/level_editor/`): `test_native_metatile.py`,
+`test_terrain_repository.py`, `test_colour_conversion.py`,
+`test_spritesheet.py`, `test_metatile_capacity.py`,
+`test_editor_workshop_gui.py`; end-to-end `acceptance_terrain_workshop.py`
+(import -> convert -> edit -> save to repo -> snapshot into one level -> prove
+the other level's tileset is independent -> export both). New host arithmetic
+`tools/check_metatile_def_lookup.py`. New VICE `tools/vice_metatile64_smoke.py`
+(64-def stage boots/scrolls/wraps, live decode of a map row containing id 63).
+`make_stage_fixture.py` / `run_stage_fixture.sh` gained a `[D]` def-count arg;
+`vice_stage_widen_probe.py` reads the def table by its real byte span and its
+call trampoline moved to `$6400` (a 768-row fixture map now fills to `$8800`).
+Committed fixture: `tools/level_editor/testdata/synthetic_tileset.png`.
+
+### Current limitations
+
+- The editor deliberately caps stage height at 768 rows for every level (the
+  64-metatile worst case), even though a small-metatile level could assemble
+  taller.
+- Repacking on a native edit may re-order / shrink a hand-authored glyph set
+  (identical bitmaps collapse). The render is visually identical; the exported
+  `terrainGlyphs` bytes may differ from a pre-edit export.
+- `check_scroll_capture --stress` shows 4 transient pixel hiccups at one raster
+  line during one coarse transition (matches the pre-existing artefact in
+  `docs/encounter-budget-worklog.md`); the plain capture is clean.
+
+### Future object-layer boundary (unchanged)
+
+Terrain metatiles stay terrain. Gameplay objects (turrets today) remain a
+separate authored layer. No object-placement, boss-editor, wave-authoring-beyond-
+triggers, runtime charset streaming or bank-switching work is in scope here.

@@ -8,13 +8,41 @@ METATILE_NAMES = (
     "R_BL", "R_BR", "CHAN_V", "CHAN_H", "RECESS", "GRILLE", "MACH", "STEP",
 )
 
+# The ONE editor C64 colour table (index 0..15 -> approximate RGB). The stage
+# editor renders previews with it and the Terrain Asset Workshop converts source
+# artwork against the 4 project-palette entries picked out of it. Project data
+# always stores colour *indices*, never RGB. Kept here so non-GUI modules
+# (colour conversion, tests) can use it without importing the Tkinter editor.
+C64_PALETTE_RGB = (
+    (0x00, 0x00, 0x00), (0xff, 0xff, 0xff), (0x81, 0x33, 0x38), (0x75, 0xce, 0xc8),
+    (0x8e, 0x3c, 0x97), (0x56, 0xac, 0x4d), (0x2e, 0x2c, 0x9b), (0xed, 0xf1, 0x71),
+    (0x8e, 0x50, 0x29), (0x55, 0x38, 0x00), (0xc4, 0x6c, 0x71), (0x4a, 0x4a, 0x4a),
+    (0x7b, 0x7b, 0x7b), (0xa9, 0xff, 0x9f), (0x70, 0x6d, 0xeb), (0xb2, 0xb2, 0xb2),
+)
+C64_PALETTE_HEX = tuple("#%02x%02x%02x" % rgb for rgb in C64_PALETTE_RGB)
+
 METATILE_W = 4
 METATILE_H = 4
 METATILES_PER_ROW = 10
+# Per-level metatile-definition table. It is variable length now (1..64 entries,
+# no padding); the engine derives METATILE_DEF_COUNT = STAGE_METATILE_COUNT from
+# the generated stage_config.asm. METATILE_CAPACITY is the hard ceiling a level
+# package may hold; the editor's live metatile-set selector is bounded by it.
+METATILE_CAPACITY = 64
+# Back-compat alias: some call sites still say METATILE_DEF_COUNT meaning "the
+# built-in / baseline count". It equals len(METATILE_NAMES) and is only the
+# *default* set size for a fresh project, never a hard limit.
 METATILE_DEF_COUNT = 16
 TERRAIN_GLYPH_BASE = 160
 TERRAIN_GLYPH_NAMESPACE = 64
-ENGINE_MAX_STAGE_ROWS = 844
+# Safe maximum stage height. Recalculated from the real assembled layout for the
+# 64-metatile worst case: metatileDefs+stageMetatileRows occupy $6600..$8800
+# ($2200 = 8704 bytes); a full 64-entry def table is 1024 bytes, leaving
+# (8704 - 1024) / 10 = 768 whole 10-byte rows. The engine's own label-based
+# `.if (STAGE_TEST_END > $8800) .error` remains exact for smaller def tables
+# (a 16-metatile level could reach 844); the editor deliberately uses the
+# uniform worst case so the bound never depends on the tileset size.
+ENGINE_MAX_STAGE_ROWS = 768
 
 # The terrain aperture the player actually sees: 40 chars wide, 23 logical rows
 # tall (matrix row 0 is the fixed hires HUD, matrix rows 1..23 are terrain, row
@@ -339,12 +367,21 @@ def load_engine_data(repo_root):
     }
 
     metatile_bytes = _read_table(stage_asm, "metatileDefs", "METATILE_DEFS_END")
-    expected_metatile_bytes = METATILE_DEF_COUNT * METATILE_W * METATILE_H
+    bytes_per_def = METATILE_W * METATILE_H
+    # The def table is variable length now. Prefer the level-owned
+    # STAGE_METATILE_COUNT; fall back to the byte count for pre-const files.
+    try:
+        metatile_count = _parse_const_int(config_text, "STAGE_METATILE_COUNT")
+    except ValueError:
+        metatile_count = len(metatile_bytes) // bytes_per_def
+    if not 1 <= metatile_count <= METATILE_CAPACITY:
+        raise ValueError(f"STAGE_METATILE_COUNT must be 1..{METATILE_CAPACITY}; got {metatile_count}")
+    expected_metatile_bytes = metatile_count * bytes_per_def
     if len(metatile_bytes) != expected_metatile_bytes:
         raise ValueError(f"Expected {expected_metatile_bytes} metatile bytes, got {len(metatile_bytes)}")
     metatiles = [
-        metatile_bytes[i * 16:(i + 1) * 16]
-        for i in range(METATILE_DEF_COUNT)
+        metatile_bytes[i * bytes_per_def:(i + 1) * bytes_per_def]
+        for i in range(metatile_count)
     ]
     valid_codes = set(glyphs)
     invalid_codes = sorted({code for code in metatile_bytes if code not in valid_codes})
@@ -361,8 +398,8 @@ def load_engine_data(repo_root):
         raise ValueError(
             f"STAGE_METATILE_ROWS says {source_stage_rows}, but stage table contains {parsed_stage_rows} rows"
         )
-    if any(tile_id >= METATILE_DEF_COUNT for tile_id in stage_bytes):
-        raise ValueError(f"Stage contains a metatile ID outside 0..{METATILE_DEF_COUNT - 1}")
+    if any(tile_id >= metatile_count for tile_id in stage_bytes):
+        raise ValueError(f"Stage contains a metatile ID outside 0..{metatile_count - 1}")
     stage_rows = [
         stage_bytes[i * METATILES_PER_ROW:(i + 1) * METATILES_PER_ROW]
         for i in range(parsed_stage_rows)

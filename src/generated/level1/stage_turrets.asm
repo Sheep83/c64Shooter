@@ -9,6 +9,6 @@
 //   world row = metatileRow * 4 + 1     world col = metatileCol * 4 + 1
 //   values above 255 are supported (16-bit world rows).
 // ============================================================================
-.const TURRET_TOTAL = 2
-.var turretCols = List().add(17, 21)
-.var turretRows = List().add(357, 353)
+.const TURRET_TOTAL = 9
+.var turretCols = List().add(25, 13, 33, 5, 21, 17, 9, 33, 5)
+.var turretRows = List().add(369, 365, 361, 357, 353, 241, 161, 81, 33)

@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """Emit a deterministic stage_test.asm fixture with N metatile rows.
 
-Keeps the real 16 metatileDefs (parsed out of the current src/stage_test.asm so
-the tileset never drifts) and replaces only stageMetatileRows with N rows of 10
-IDs. The IDs vary by BOTH row and column and by the flat byte offset in a way
+Keeps the real metatile defs (parsed out of the current
+src/generated/level1/stage_test.asm so the tileset never drifts) as ids 0..15,
+and - when a larger def count is asked for - synthesises extra defs 16..D-1 from
+the same pool of glyph codes. It then replaces stageMetatileRows with N rows of
+10 IDs. The IDs vary by BOTH row and column and by the flat byte offset in a way
 that any 8-bit truncation of the stage-map offset would corrupt:
 
-    id(offset) = (offset * 7 + offset // 256 + row) % 16      offset = row*10 + col
+    id(offset) = (offset * 7 + offset // 256 + row) % D      offset = row*10 + col
 
 so offset 0 and offset 256, or offset 250 and 256, choose different metatiles.
-Rows 0 and N-1 are still all-M0 so the wrap seam stays visually continuous.
+Rows 0 and N-1 are still all-M0 so the wrap seam stays visually continuous. When
+D > 16 a handful of interior cells are pinned to the boundary ids 15, 16, 31, 32
+and D-1 so a probe can assert the widened (>8-bit) metatileDefs offset directly.
 
-Usage:  python3 tools/make_stage_fixture.py N > src/generated/stage_test.asm
-        (caller is responsible for setting .const STAGE_METATILE_ROWS = N and
-         for restoring the originals afterwards, e.g. via git checkout)
+Usage:  python3 tools/make_stage_fixture.py N [D] > stage_test.asm
+        (caller sets .const STAGE_METATILE_ROWS = N and
+         .const STAGE_METATILE_COUNT = D, and restores the originals afterwards)
 """
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 MPR = 10
-DEF_COUNT = 16
+BASE_DEF_COUNT = 16
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def real_metatile_defs():
-    # Take the 16-tile tileset from the live generated stage (its metatileDefs
-    # block is the real, engine-consumed tileset). run_stage_fixture.sh backs up
-    # and restores the generated files around the fixture run.
+    # The 16-tile tileset from the live generated stage (its metatileDefs block
+    # is the real, engine-consumed tileset). run_stage_fixture.sh backs up and
+    # restores the generated files around the fixture run.
     text = (ROOT / 'src' / 'generated' / 'level1' / 'stage_test.asm').read_text(encoding='utf-8')
     block = text.split('metatileDefs:', 1)[1].split('METATILE_DEFS_END', 1)[0]
     rows = []
@@ -37,34 +40,63 @@ def real_metatile_defs():
         nums = re.findall(r'\d+', line)
         if nums:
             rows.append([int(n) for n in nums])
-    assert len(rows) == DEF_COUNT, f'expected {DEF_COUNT} metatile defs, got {len(rows)}'
+    assert len(rows) == BASE_DEF_COUNT, f'expected {BASE_DEF_COUNT} metatile defs, got {len(rows)}'
     for r in rows:
         assert len(r) == 16, f'metatile def is not 16 bytes: {r}'
     return rows
 
 
-def stage_row_ids(n_rows):
+def metatile_defs(def_count):
+    defs = real_metatile_defs()
+    if def_count <= BASE_DEF_COUNT:
+        return defs[:def_count]
+    # Synthesise defs 16..def_count-1 from the glyph codes the real defs use, so
+    # every byte stays a valid terrain glyph code. Each synthetic def is a
+    # distinct rotation/permutation so a wrong (truncated) id decodes visibly
+    # wrong bytes.
+    pool = sorted({b for d in defs for b in d})
+    for i in range(BASE_DEF_COUNT, def_count):
+        d = [pool[(i * 7 + k * 13 + (k // 4) * 3) % len(pool)] for k in range(16)]
+        defs.append(d)
+    return defs
+
+
+def stage_row_ids(n_rows, def_count):
+    # Interior cells pinned to boundary ids, so a probe can target them.
+    pins = {}
+    if def_count > BASE_DEF_COUNT:
+        targets = [t for t in (15, 16, 31, 32, def_count - 1) if t < def_count]
+        for k, tid in enumerate(targets):
+            r = 2 + k * 2               # rows 2,4,6,8,10 - all interior
+            if r < n_rows - 1:
+                pins[(r, 1 + k)] = tid
     for row in range(n_rows):
         ids = []
         for col in range(MPR):
+            if (row, col) in pins:
+                ids.append(pins[(row, col)])
+                continue
             offset = row * MPR + col
             if row == 0 or row == n_rows - 1:
                 ids.append(0)
             else:
-                ids.append((offset * 7 + offset // 256 + row) % DEF_COUNT)
+                ids.append((offset * 7 + offset // 256 + row) % def_count)
         yield row, ids
 
 
 def main():
     n = int(sys.argv[1])
-    defs = real_metatile_defs()
+    def_count = int(sys.argv[2]) if len(sys.argv) > 2 else BASE_DEF_COUNT
+    assert 1 <= def_count <= 64, f'def count must be 1..64; got {def_count}'
+    defs = metatile_defs(def_count)
     out = []
     out.append('// ============================================================================')
     out.append(f'// DETERMINISTIC TEST FIXTURE - {n} metatile rows ({n*4} logical char rows,'
-               f' {n*MPR}-byte map).')
-    out.append('// Generated by tools/make_stage_fixture.py. Real 16 metatileDefs; synthetic')
-    out.append('// stageMetatileRows: id = (offset*7 + offset//256 + row) % 16, seam rows all M0.')
-    out.append('// Not for commit - restore src/generated/stage_test.asm afterwards.')
+               f' {n*MPR}-byte map), {def_count} metatile defs.')
+    out.append('// Generated by tools/make_stage_fixture.py. Real 16 metatileDefs (+ synthetic')
+    out.append(f'// 16..{def_count-1}); id = (offset*7 + offset//256 + row) % {def_count}, seam rows all M0,')
+    out.append('// a few interior cells pinned to boundary ids 15/16/31/32/D-1.')
+    out.append('// Not for commit - restore src/generated/level1/stage_test.asm afterwards.')
     out.append('// ============================================================================')
     out.append('')
     out.append('metatileDefs:')
@@ -74,7 +106,7 @@ def main():
     out.append('')
     out.append(f'// {n} rows x {MPR} metatile IDs.')
     out.append('stageMetatileRows:')
-    for row, ids in stage_row_ids(n):
+    for row, ids in stage_row_ids(n, def_count):
         body = ','.join(f'{v:2d}' for v in ids)
         out.append(f'    .byte {body}   // row {row}')
     out.append('STAGE_METATILE_ROWS_END:')

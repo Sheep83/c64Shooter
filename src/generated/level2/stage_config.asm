@@ -7,7 +7,9 @@
 // constant exists before the engine constants/code that consume them.
 //
 // Ownership: these values belong to the level package, NOT to the engine.
-// The engine derives STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H.
+// The engine derives STAGE_LOGICAL_ROWS = STAGE_METATILE_ROWS * METATILE_H
+// and METATILE_DEF_COUNT = STAGE_METATILE_COUNT (the level's metatile-def
+// table is variable length: STAGE_METATILE_COUNT * 16 bytes, 1..64).
 //   TERRAIN_BACKGROUND_COLOUR -> $D021
 //   TERRAIN_MC_COLOUR_1       -> $D022   (multicolour bit-pair 01)
 //   TERRAIN_MC_COLOUR_2       -> $D023   (multicolour bit-pair 10)
@@ -18,6 +20,7 @@
 // ============================================================================
 .const STAGE_METATILE_ROWS     = 64
 .const SCROLL_FRAME_DIVIDER    = 2
+.const STAGE_METATILE_COUNT   = 16
 .const TERRAIN_BACKGROUND_COLOUR = 0
 .const TERRAIN_MC_COLOUR_1     = 9
 .const TERRAIN_MC_COLOUR_2     = 8
