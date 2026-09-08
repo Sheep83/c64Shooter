@@ -68,7 +68,7 @@ publishRasterPlan:
     lda #>multiplexIRQ
     sta IRQ_VECTOR + 1
     lda RASTER_DISPLAY_FINE                 // publishRasterPlan runs every frame (armFirstBatch) at ~line 17,
-    ora #$18                                // before the first badline: install the SAME whole-frame display
+    ora #GAMEPLAY_D011_BASE                 // before the first badline: install the SAME whole-frame display
     sta VIC_CONTROL_1                        // state as rasterFrameReset (RSEL=1, DEN=1, YSCROL=presented fine;
                                             // compare high always 0) so it never clobbers the fine phase.
     lda #1
@@ -142,7 +142,7 @@ rasterFrameReset:
     // $D011 split. This is also the RSEL 0->1 restore after borderOpenHook's late
     // RSEL 1->0 lower-border dodge. DEN=1, RSEL=1, raster-compare MSB stays 0.
     lda RASTER_DISPLAY_FINE
-    ora #$18
+    ora #GAMEPLAY_D011_BASE
     sta VIC_CONTROL_1                        // Every physical frame, including replay with main still building.
     lda RASTER_EXPECTED_ASSIGNMENTS
     sta RASTER_LAST_EXPECTED
@@ -370,15 +370,35 @@ borderOpenHook:
     sta SPRITE_ENABLE
 !skipMarker:
 
+#if GAMEPLAY_BOTTOM_EXTEND
+    // Part-D asymmetric bottom-extend candidate (GAMEPLAY_RSEL = 0 only).
+!wait242:
+    ldx RASTER
+    cpx #242
+    bcc !wait242-
+    lda VIC_CONTROL_1
+    ora #%00001000                          // RSEL 0 -> 1 before the raster-247 RSEL=0 close compare.
+    sta VIC_CONTROL_1
+!wait252:
+    ldx RASTER
+    cpx #252
+    bcc !wait252-
+    lda VIC_CONTROL_1
+    and #%11110111                          // RSEL 1 -> 0 AFTER the raster-251 RSEL=1 close compare (FF set at 251).
+    sta VIC_CONTROL_1                        // => aperture 55..250; next-frame top compare is still RSEL=0's line 55.
+borderOpenRestored:
+    rts
+#else
 !wait250:
     ldx RASTER
     cpx #250
     bcc !wait250-
     lda VIC_CONTROL_1
-    and #%11110111                          // RSEL 1 -> 0 before the raster-251 close compare -> border stays open.
-    sta VIC_CONTROL_1
+    and #%11110111                          // GAMEPLAY_RSEL=1: RSEL 1 -> 0 before the raster-251 close -> border open.
+    sta VIC_CONTROL_1                        // GAMEPLAY_RSEL=0: no-op (bit already clear); border closes normally at 247.
 borderOpenRestored:
     rts
+#endif
 #endif
 
 // The assignment payload/order is unchanged. Final batch masks are prepared

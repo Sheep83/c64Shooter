@@ -90,10 +90,13 @@ def put(m, sym, name, values):
     m.cmd(f'> {sym[name]:04x} ' + ' '.join(f'{v:02x}' for v in values))
 
 
-def seed_dense(m, sym, low_y=False):
+def seed_dense(m, sym, low_y=False, high_y=False):
     put(m, sym, "OBJECT_ACTIVE", [1] * 16)
     put(m, sym, "OBJECT_TYPE", [1] + [2] * 15)
-    if low_y:
+    if high_y:
+        # 15 enemies packed into the newly-legal top band (Y 56..84) + player
+        put(m, sym, "OBJECT_Y", [200] + list(range(56, 85, 2)))
+    elif low_y:
         put(m, sym, "OBJECT_Y", [150] + [245] * 7 + [244, 243, 242, 241, 240, 238, 236, 234])
     else:
         put(m, sym, "OBJECT_Y", list(range(96, 125, 4)) + list(range(160, 189, 4)))
@@ -110,7 +113,7 @@ def seed_dense(m, sym, low_y=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--case", default="ordinary",
-                    choices=["ordinary", "wave5", "wave6", "dense", "lowy", "contrast", "div1"])
+                    choices=["ordinary", "wave5", "wave6", "dense", "lowy", "highy", "contrast", "div1"])
     ap.add_argument("--port", type=int, default=6540)
     ap.add_argument("--frames", type=int, default=220)
     ap.add_argument("--out", type=Path, default=None)
@@ -131,9 +134,9 @@ def main():
             meta["wave_counts_before"], meta["wave_counts_after"] = clamp_waves(m, sym, 5)
         if args.case == "wave6":
             meta["wave_counts_before"] = rd(m, sym["waveTrigCount"], 16)
-        if args.case in ("dense", "lowy"):
+        if args.case in ("dense", "lowy", "highy"):
             m.cmd(f'break {sym["applyFineScroll"]:04x}'); m.cmd("x"); m.cmd("delete")
-            seed_dense(m, sym, low_y=(args.case == "lowy"))
+            seed_dense(m, sym, low_y=(args.case == "lowy"), high_y=(args.case == "highy"))
         if args.case == "contrast":
             wr(m, 0xD021, args.d021)
 
@@ -154,7 +157,10 @@ def main():
             if args.case == "contrast":
                 wr(m, 0xD021, args.d021)
             if args.case == "div1":
-                wr(m, sym["SCROLL_FRAME_COUNT"], 0)
+                # divider-1-like: hold SCROLL_FRAME_COUNT one below the authored
+                # SCROLL_FRAME_DIVIDER (2) every frame so updateBackgroundScroll
+                # advances the fine phase every frame -> coarse work every 8 frames.
+                wr(m, sym["SCROLL_FRAME_COUNT"], 1)
             regs = m.cmd("r")
             m.cmd(f'bsave "{out / f"{frame:05d}.ram"}" 0 0400 07ff')
             m.cmd(f'bsave "{out / f"{frame:05d}.state"}" 0 2000 23ff')

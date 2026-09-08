@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_scroll_edges import sprite_mask  # reuse the LIVE-plan sprite rectangle mask
 
-APERTURE_TOP, APERTURE_BOTTOM = 51, 250          # RSEL=1, border opened below 250
+APERTURE_TOP, APERTURE_BOTTOM = 51, 250          # RSEL=1 default; --aperture overrides (RSEL=0 -> 55 246)
 GREY_D021 = None                                 # filled from the first frame's own backdrop
 
 
@@ -64,12 +64,28 @@ def main():
                     help="first raster of the 'terrain body' band judged for cleanliness")
     ap.add_argument("--last-row-top", type=int, default=232,
                     help="first raster of the 'last terrain row' band reported separately")
+    ap.add_argument("--aperture", type=int, nargs=2, metavar=("TOP", "BOTTOM"),
+                    help="override the visible aperture (RSEL=0 -> 55 246)")
     args = ap.parse_args()
+    global APERTURE_TOP, APERTURE_BOTTOM
+    if args.aperture:
+        APERTURE_TOP, APERTURE_BOTTOM = args.aperture
     root = args.capture
     records = json.loads((root / "frames.json").read_text())
     sym = json.loads((root / "symbols.json").read_text())
 
     cols = list(range(40, 344, 8))
+    # Turret 2x2 glyph cells are republished on stream-in / aim / hit / death / stage
+    # wrap -- a deliberate content change covered by check_turret_capture.py, not by
+    # this motion test. Exclude a margin around every authored turret column (screen
+    # x = 32 + col*8, body 16 px wide) for all frames.
+    turret_skip_x = set()
+    tp = root / "turret-placements.bin"
+    if tp.exists():
+        d = tp.read_bytes()
+        for col in d[: len(d) // 2]:
+            for x in range(32 + col * 8 - 8, 32 + col * 8 + 24):
+                turret_skip_x.add(x)
     stats = defaultdict(lambda: dict(pairs=0, checks=0, diffs=0, rows=defaultdict(int)))
     body_failures = []
     coarse_steps = []
@@ -107,6 +123,8 @@ def main():
                         continue
                     y = raster - 16
                     for x in range(32, 352):
+                        if x in turret_skip_x:
+                            continue
                         if m[x, y] or om[x, y - dy]:
                             continue
                         st["checks"] += 1
