@@ -58,6 +58,13 @@
 .const HUD_SPRITE_COUNT    = 4
 .const HUD_Y               = 22         // sprite Y (body raster 22..42); clear of clean terrain @55.
 .const HUD_HANDOFF_RASTER  = 46         // DISPLAY event line: re-arm slots 4..7 for gameplay here.
+// hudBorderHandoff ENTERS at raster ~46-49 but its per-slot reclaim writes finish
+// as late as raster ~55 (measured, capF timing.log: last hudSlotReclaimed p50 53,
+// max 55; rasterDisplayRestored max 56). buildBatchSpriteSchedule must not mark an
+// UNUSED HUD slot free before reclamation physically completes, or a batch could
+// program that slot while the handoff is still writing it. Floor at the measured
+// completion raster + 1 line, not the nominal entry raster.
+.const HUD_HANDOFF_COMPLETE_RASTER = 56
 .const HUD_SPRITE_BASE     = $2f00      // 4 x 64B hires bitmaps, VIC bank 0 gap $2e6a..$2fff.
 .const HUD_SPRITE_BASE_PTR = HUD_SPRITE_BASE / 64        // $bc; slot ptrs $bc..$bf.
 .const HUD_D010_KEEP       = $80        // HUD sprite index 3 (hw slot 7) sits at X=280 -> keep its $D010 bit.
@@ -1658,6 +1665,13 @@ setupSprites:
     sta SPRITE_COLOUR_1
     lda #$0f
     sta SPRITE_COLOUR_2
+    // No sprite Y/X expansion, default sprite/background priority. These never
+    // change during gameplay -- set once here instead of every frame in
+    // hudBorderSetup (the line-1 IRQ), which keeps that IRQ's cost flat.
+    lda #0
+    sta $D017
+    sta $D01D
+    sta $D01B
 
     lda #146                                // Load A from #146.
     sta OBJECT_X                            // Player X
@@ -3041,9 +3055,9 @@ buildBatchSpriteSchedule:
     ldy #HUD_SLOT_FIRST
 !hudFloor:
     lda SLOT_FREE_RASTER,y
-    cmp #HUD_HANDOFF_RASTER
+    cmp #HUD_HANDOFF_COMPLETE_RASTER        // measured last-reclaim raster + 1 (was the nominal entry raster)
     bcs !hudFloorNext+
-    lda #HUD_HANDOFF_RASTER
+    lda #HUD_HANDOFF_COMPLETE_RASTER
     sta SLOT_FREE_RASTER,y
 !hudFloorNext:
     iny
@@ -6364,6 +6378,20 @@ hudBorderSetup:
     sta SPR_Y + HUD_SLOT_FIRST * 2,y
     dex
     bpl !slot-
+    // --- HUD ENABLE, DETERMINISTIC (intermittent top-HUD sprite-7 flicker fix) --
+    // The HUD slots' $D015 enable bits were previously set ONLY by renderSprites
+    // (ora #$F0), which runs in the MAIN thread at a load-dependent raster (~8..30).
+    // On a frame whose predecessor left $D015 bit 7 clear (RENDER_COUNT <= 7 =>
+    // hudBorderHandoff disabled slot 7) AND whose renderSprites $D015 write lands
+    // after VIC's sprite-7 Y/DMA-enable check (~raster 21-22), sprite 7's DMA never
+    // turns on -> HUD sprite 7 is invisible for that frame (the reported flicker,
+    // ~0.5% of frames, worst at 6-8 enemies). hudBorderSetup runs at ~raster 2 from
+    // rasterFrameReset (before ANY sprite DMA, and before the replay-path
+    // renderSprites), so enable the HUD slots HERE, deterministically. renderSprites'
+    // ora #$F0 and hudBorderHandoff's final $D015 write are both unchanged.
+    lda SPRITE_ENABLE
+    ora #(($ff << HUD_SLOT_FIRST) & $ff)   // $F0: HUD slots 4..7 enabled from raster ~2 every frame
+    sta SPRITE_ENABLE
     lda SPRITE_MODE                        // $D01C: HUD slots -> hires
     and #(($01 << HUD_SLOT_FIRST) - 1)     // keep low HUD_SLOT_FIRST bits, clear the HUD slots
     sta SPRITE_MODE
@@ -6371,10 +6399,7 @@ hudBorderSetup:
     and #(($01 << HUD_SLOT_FIRST) - 1)
     ora #HUD_D010_KEEP
     sta SPRITE_OVERFLOW_REGISTER
-    lda #0
-    sta $D017                              // no Y expansion
-    sta $D01D                              // no X expansion
-    sta $D01B                              // default sprite/background priority
+    // $D017 / $D01D / $D01B are set once in setupSprites (they never change).
     rts
 
 // --- Routine: hudBorderHandoff -----------------------------------------------

@@ -332,8 +332,31 @@ dispatchRasterEvents:
     jmp !select-
 #if BORDER_PROOF_ENABLE
 !borderHook:
+    // Scheduler-level hardening (residual whole-border flicker). borderOpenHook's
+    // RSEL dodge can only land when the beam is still in raster ~237..245. A BORDER
+    // event reaches this !due/!service path only when a heavy replay/catchup frame
+    // has pushed dispatchRasterEvents to the BORDER arm at or past its target (240).
+    // If the beam is already >= 246 (or wrapped past 255) the dodge is physically
+    // impossible this frame: do NOT enter the hook (no reliance on its internal
+    // bail, no in-IRQ busy-wait). Mark BORDER finished, count it, and fall through
+    // to the epoch -- the lower border closes for that one frame only and the
+    // scheduler stays perfectly in sync. In-window (240..245) is still serviced
+    // normally: the dodge lands and the border opens.
+    lda VIC_CONTROL_1
+    bmi !borderSkip+                        // $d011 bit7 = raster bit8 => beam >= 256
+    lda RASTER
+    cmp #246
+    bcs !borderSkip+                        // beam >= 246 => cannot dodge this frame
     jsr borderOpenHook
     jmp !select-
+!borderSkip:
+    lda #0
+    sta RASTER_BORDER_PENDING               // BORDER is complete for this frame.
+    inc RASTER_BORDER_SKIPS
+    bne !borderSkipDone+
+    inc RASTER_BORDER_SKIPS + 1
+!borderSkipDone:
+    jmp !select-                            // !noBatch: DISPLAY & BORDER done -> epoch
 #endif
 !hook:
     jsr rasterDisplayHook
@@ -389,38 +412,43 @@ rasterBadlineRestored:
 //      cycle is not visible-pixel critical.
 // ============================================================================
 borderOpenHook:
-    lda #0
-    sta RASTER_BORDER_PENDING
-
-    // --- ROBUSTNESS GUARD (intermittent hard-lock fix) ------------------------
+    // --- ROBUSTNESS GUARD (hard-lock fix + residual whole-border-flicker fix) --
     // !wait245 / !wait250 below are `ldx $d012 / cpx #target / bcc loop`. $d012 is
     // the raster counter MOD 256: for beam rasters 256..311 it reads 0..55, all
     // < 245, so !wait245 then spins until the beam wraps back up to raster 245 --
-    // ~250..300 scanlines, INSIDE the IRQ. That stall crosses the frame boundary;
-    // the raster-0 compare latches; RTI re-fires it; the replay path + a DISPLAY
-    // catchup hand the BORDER event to `!due` at beam >= 256 again -> the hook
-    // re-enters late -> a permanent, self-sustaining hard lock (captured
-    // PC=$61F7, RASTER_EVENT=BORDER, RASTER_REPLAY 3999/4720, RASTER_CATCHUPS
-    // 7999; see /reports/intermittent-lock-and-hud-flicker-investigation-report.md).
+    // ~250..300 scanlines, INSIDE the IRQ. That stall crosses the frame boundary
+    // and cascades into a permanent hard lock (captured PC=$61F7, RASTER_EVENT=
+    // BORDER; see /reports/intermittent-lock-and-hud-flicker-investigation-report.md).
+    // The dodge is only physically possible in raster ~237..245 (just before the
+    // raster-247 RSEL close compare). Three-way classify the entry beam:
     //
-    // The dodge is only physically possible in a tight window just before the
-    // raster-247 RSEL=0 close compare. The BORDER event compare is
-    // RASTER_BORDER_LINE (240), so a legitimate entry is raster ~237..245. Accept
-    // ONLY that window; bail on anything earlier (corrupt/spurious event -> would
-    // otherwise busy-wait ~190 lines up to 245) or later (late IRQ / catchup /
-    // beam already wrapped past 255 -> would otherwise spin ~250..300 lines and
-    // cascade into the permanent lock). On a bail the border simply closes
-    // normally for that one frame; nothing hangs and the scheduler stays in
-    // sync. RASTER_BORDER_BAILS counts every skip.
+    //   beam >= 246 (or bit8 set)  -> TOO LATE. The dodge cannot land this frame.
+    //     Abandon BORDER for the frame (clear pending), count RASTER_BORDER_BAILS.
+    //     The lower/upper border closes for that one frame; nothing hangs.
+    //
+    //   beam < 237                 -> TOO EARLY. Under a run of main-thread-late
+    //     frames (heavy RC=8 wave + coarse cost; armFirstBatch's sei window pushed
+    //     to raster ~40-58) an armed BORDER compare can fire early (observed
+    //     beam ~58, RASTER_EVENT=3). Previously this hit the "bail" path, cleared
+    //     RASTER_BORDER_PENDING and abandoned the border -> a 1-8 frame WHOLE-
+    //     BORDER FLASH. Instead: leave RASTER_BORDER_PENDING SET and just return.
+    //     rasterIRQ / dispatchRasterEvents re-arm the BORDER compare (240) right
+    //     after this, so the border still opens on the same frame. Count
+    //     RASTER_BORDER_EARLY. Bounded: the beam only advances, so at most a few
+    //     wasted IRQs per frame before an in-window fire.
+    //
+    //   237 <= beam <= 245         -> IN WINDOW. Clear pending, do the dodge.
     lda VIC_CONTROL_1
     bmi !bail+                              // $d011 bit7 = raster bit8 => beam >= 256 => far too late.
     lda RASTER
-    sec
-    sbc #237                               // beam - 237 ...
-    cmp #(246 - 237)                       // ... in [0..8] i.e. raster 237..245 -> proceed, else bail.
-    bcs !bail+
+    cmp #237
+    bcc !early+                            // beam < 237 => spurious early fire: re-arm, keep pending.
+    cmp #246
+    bcs !bail+                             // beam >= 246 => too late to dodge this frame.
     // beam is now provably in [237 .. 245]; both polls below wait at most ~13
     // lines (usually <5) and can never wrap.
+    lda #0
+    sta RASTER_BORDER_PENDING
 
 #if !HUD_PROOF_ENABLE
     // Diagnostic lower-border marker in slot 7. Disabled by the HUD proof, which
@@ -478,10 +506,21 @@ borderOpenHook:
 borderOpenRestored:
     rts
 !bail:
+    lda #0
+    sta RASTER_BORDER_PENDING               // Too late: abandon BORDER for this frame.
     inc RASTER_BORDER_BAILS                 // Forensic: a late / beam-wrapped border event was skipped.
     bne !bailDone+
     inc RASTER_BORDER_BAILS + 1
 !bailDone:
+    rts
+!early:
+    // Spurious early fire: DO NOT clear RASTER_BORDER_PENDING -- the caller
+    // (rasterIRQ / dispatchRasterEvents) re-arms the BORDER compare at 240 next,
+    // so the border still opens this frame.
+    inc RASTER_BORDER_EARLY
+    bne !earlyDone+
+    inc RASTER_BORDER_EARLY + 1
+!earlyDone:
     rts
 #endif
 
@@ -591,7 +630,9 @@ RASTER_PRESENT_READY:          .byte 0
 RASTER_DISPLAY_PENDING:        .byte 0
 #if BORDER_PROOF_ENABLE
 RASTER_BORDER_PENDING:         .byte 0        // Phase-1 bottom-border experiment; see borderOpenHook.
-RASTER_BORDER_BAILS:           .word 0        // Forensic: borderOpenHook late-entry guard trips (hard-lock fix).
+RASTER_BORDER_BAILS:           .word 0        // Forensic: borderOpenHook internal late-entry guard trips (hard-lock net).
+RASTER_BORDER_SKIPS:           .word 0        // Forensic: dispatchRasterEvents skipped a late BORDER before entering the hook.
+RASTER_BORDER_EARLY:           .word 0        // Forensic: borderOpenHook saw a spurious early fire and re-armed (border still opens).
 #endif
 RASTER_EXPECTED_ASSIGNMENTS:   .byte 0
 RASTER_ASSIGNMENTS_DONE:        .byte 0
