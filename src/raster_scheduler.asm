@@ -67,8 +67,10 @@ publishRasterPlan:
     sta IRQ_VECTOR
     lda #>multiplexIRQ
     sta IRQ_VECTOR + 1
-    lda #$17                                // Fixed row0 badline55; compare high is always zero.
-    sta VIC_CONTROL_1
+    lda RASTER_DISPLAY_FINE                 // publishRasterPlan runs every frame (armFirstBatch) at ~line 17,
+    ora #$18                                // before the first badline: install the SAME whole-frame display
+    sta VIC_CONTROL_1                        // state as rasterFrameReset (RSEL=1, DEN=1, YSCROL=presented fine;
+                                            // compare high always 0) so it never clobbers the fine phase.
     lda #1
     sta IRQ_STATUS
     lda IRQ_ENABLE
@@ -133,8 +135,15 @@ rasterIRQ:
     jmp $ea81                               // VIC events do not run a second full KERNAL service.
 
 rasterFrameReset:
-    lda #$17                                // Every physical frame, including replay with main still building.
-    sta VIC_CONTROL_1
+    // Phase 1.5: establish the whole-frame RSEL=1 display state at line 0, before
+    // the line-51 top border/display compare. YSCROL = the presented fine phase
+    // (RASTER_DISPLAY_FINE, published by applyFineScroll) so the entire visible
+    // character field — matrix rows 0..24 — scrolls uniformly with no mid-frame
+    // $D011 split. This is also the RSEL 0->1 restore after borderOpenHook's late
+    // RSEL 1->0 lower-border dodge. DEN=1, RSEL=1, raster-compare MSB stays 0.
+    lda RASTER_DISPLAY_FINE
+    ora #$18
+    sta VIC_CONTROL_1                        // Every physical frame, including replay with main still building.
     lda RASTER_EXPECTED_ASSIGNMENTS
     sta RASTER_LAST_EXPECTED
     cmp RASTER_ASSIGNMENTS_DONE
@@ -290,93 +299,26 @@ dispatchRasterEvents:
     jsr rasterDisplayHook
     jmp !select-
 
+// Phase 1.5: the legacy RSEL=0 HUD/terrain $D011 split is retired. The whole
+// visible field now scrolls uniformly with YSCROL=fine installed at line 0 by
+// rasterFrameReset (matrix rows 0..24; rows 0 and 24 are blank $D021 spacers),
+// so the display raster event has no mid-frame work. It is kept as a scheduled
+// no-op — the dispatcher plumbing (event merge with the next sprite batch) is
+// deliberately left intact so the sprite scheduler is not touched — that simply
+// consumes RASTER_DISPLAY_PENDING at ~raster 56. The invalid BMM+ECM separator,
+// the $11/$71/$70|fine/$77/$10|fine write chain, rasterHblankDelay and the HUD
+// polling page-cross guards are all removed. RASTER_DISPLAY_NORMAL and
+// RASTER_DISPLAY_LATE remain declared (always 0) for capture-tool symbol parity.
 rasterDisplayHook:
     lda #0
     sta RASTER_DISPLAY_PENDING
-    lda RASTER
-    cmp #59
-    bcc !onTime+
-    inc RASTER_DISPLAY_LATE
-!onTime:
-    // There is no sprite DMA until71:55 and no CIA timer-A IRQ in gameplay.
-    // Fine1 is installed AFTER57 so it cannot truncate the fixed HUD row.
-!wait59:
-    ldx RASTER
-    cpx #59
-    bcc !wait59-
-    lda #$11
-    sta VIC_CONTROL_1
-    lda RASTER_DISPLAY_FINE                 // Presented phase only; SCROLL_FINE may already be pending0.
-    ora #$10
-    sta RASTER_DISPLAY_NORMAL
-    lda #$71                                // Mask with fine1: fine6 here could create a late badline62.
-rasterWaitHudEnd:
-    ldx RASTER
-    cpx #62
-    bcc rasterWaitHudEnd
-    jsr rasterHblankDelay
-    sta VIC_CONTROL_1                       // Write62:56..63:2, after HUD pixels and before transition pixels.
-    lda RASTER_DISPLAY_FINE
-    cmp #7
-    beq !fine7+
-    ora #$70
-!wait63:
-    ldx RASTER
-    cpx #63
-    bcc !wait63-
-    sta VIC_CONTROL_1                       // First terrain fetch64+fine; no late62 or accidental63 badline.
-    jmp !phaseReady+
-!fine7:
-!wait64:
-    ldx RASTER
-    cpx #64
-    bcc !wait64-
-    lda #$77
-    sta VIC_CONTROL_1                       // Fine7 terrain badline is71, never63.
-!phaseReady:
-    ldx RASTER_DISPLAY_FINE
-    cpx #6
-    beq !badline70+
-    lda RASTER_DISPLAY_NORMAL
-rasterWaitPlayfield:
-    ldx RASTER
-    cpx #70
-    bcc rasterWaitPlayfield
-    jsr rasterHblankDelay
-    sta VIC_CONTROL_1                       // Write70:56..71:2, within the horizontal border.
 rasterDisplayRestored:
-    rts
-!badline70:
-    lda RASTER_DISPLAY_NORMAL
-rasterWaitBadline:
-    ldx RASTER
-    cpx #70
-    bcc rasterWaitBadline
-    bit $01                                 // Six read cycles force an early arrival through badline RDY.
-    bit $01                                 // Late polling arrivals still restore before raster71's pixels.
-    sta VIC_CONTROL_1
 rasterBadlineRestored:
     rts
 
-// No cycle-exact IRQ entry is required: nine cycles of raster-poll uncertainty
-// fit in the horizontal border. JSR + this body takes48 CPU cycles, preserves A.
-// Both call sites have no badline or sprite DMA in their target line.
-rasterHblankDelay:
-    ldy #7
-rasterHblankDelayLoop:
-    dey
-    bne rasterHblankDelayLoop
-    rts
-.if ((rasterWaitHudEnd & $ff00) != ((rasterWaitHudEnd+7) & $ff00) || (rasterWaitPlayfield & $ff00) != ((rasterWaitPlayfield+7) & $ff00) || (rasterWaitBadline & $ff00) != ((rasterWaitBadline+7) & $ff00)) {
-    .error "HUD polling branch crosses a page; re-derive the horizontal write window"
-}
-.if ((rasterHblankDelayLoop & $ff00) != ((rasterHblankDelayLoop+3) & $ff00)) {
-    .error "HUD delay loop crosses a page; its48-cycle contract changed"
-}
-
 #if BORDER_PROOF_ENABLE
 // ============================================================================
-// borderOpenHook - PHASE 1 terminal event. Fires from an IRQ compare at
+// borderOpenHook - PHASE 1.5 terminal event. Fires from an IRQ compare at
 // RASTER_BORDER_LINE (240). Two jobs, in order:
 //
 //   1. (diagnostic) if hardware slot BORDER_MARKER_SLOT is NOT enabled for
@@ -388,20 +330,22 @@ rasterHblankDelayLoop:
 //      that frame. No HUD_SAFE_RASTER, no handoff, no reservation, no limit
 //      change. renderSprites rewrites $D015 from the LIVE plan every frame, so
 //      the marker's enable bit cannot leak into a gameplay frame that needs 8.
+//      Same conditions as the Phase-1 marker so the deep-border corruption
+//      result is directly comparable.
 //
-//   2. (the actual proof) Slap-Fight lower-border open. The playfield stays
-//      permanent RSEL=0 (this hook never touches the display hook). At ~raster
-//      243, before the RSEL=0 vertical-border-close compare at 247, set RSEL=1
-//      so that compare is missed. At ~raster 250, before the RSEL=1 close
-//      compare at 251, clear RSEL again so THAT compare is missed too. Neither
-//      close fires -> the vertical border FF is never set -> the lower border
-//      stays open into the overscan region. rasterFrameReset restores $D011 =
-//      $17 (RSEL=0, YSCROL 7) at the top of the next frame as always.
-//      Read-modify-write of $D011 preserves YSCROL / DEN / BMM / ECM exactly;
-//      only bit 3 (RSEL) moves. No ECM. The writes land in the lower crop /
-//      border region (rasters 243..250) so their exact cycle is not visible-
-//      pixel critical - a badline at the polled line only delays the poll exit
-//      by <1 line, still well before the 247 compare.
+//   2. (the proof) Lower-border open, single late RSEL 1->0 dodge. Gameplay is
+//      now genuine RSEL=1 throughout (rasterFrameReset installs RSEL=1 |
+//      YSCROL=fine at line 0), so the RSEL=0 close compare at raster 247 is
+//      already irrelevant. Poll to ~raster 250 and clear RSEL (bit 3) before
+//      the RSEL=1 close compare at raster 251 -> that compare is missed too ->
+//      the vertical border FF is never set this frame -> the lower border stays
+//      open into the overscan region (and, as a single-FF consequence, the top
+//      border also stays open above raster 51). rasterFrameReset restores
+//      RSEL=1 at the next line 0, before the line-51 top compare. There is NO
+//      Phase-1-style RSEL 0->1 setup write. Read-modify-write of $D011 keeps
+//      YSCROL / DEN / BMM / ECM exactly; only bit 3 moves. No ECM. The write
+//      lands in the blank-row-24 / border region (raster ~250) so its exact
+//      cycle is not visible-pixel critical.
 // ============================================================================
 borderOpenHook:
     lda #0
@@ -426,19 +370,12 @@ borderOpenHook:
     sta SPRITE_ENABLE
 !skipMarker:
 
-!wait243:
-    ldx RASTER
-    cpx #243
-    bcc !wait243-
-    lda VIC_CONTROL_1
-    ora #%00001000                          // RSEL 0 -> 1 before the raster-247 close compare.
-    sta VIC_CONTROL_1
 !wait250:
     ldx RASTER
     cpx #250
     bcc !wait250-
     lda VIC_CONTROL_1
-    and #%11110111                          // RSEL 1 -> 0 before the raster-251 close compare.
+    and #%11110111                          // RSEL 1 -> 0 before the raster-251 close compare -> border stays open.
     sta VIC_CONTROL_1
 borderOpenRestored:
     rts

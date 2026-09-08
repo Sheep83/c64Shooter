@@ -414,14 +414,17 @@ init:
     ora #%00001110                          // Character set at $3800 within VIC bank 0.
     sta VIC_MEMORY_SETUP
 
-    // Permanent 24-row display. KERNAL reset leaves $D011 = $1B (RSEL=1);
-    // clearing RSEL fixes the visible aperture at raster 55..246, which lies
-    // wholly inside fetched terrain for every fine phase and so hides both the
-    // top and bottom scroll-edge artefacts (docs/scroll-edge-investigation.md).
-    // DEN, YSCROL and the raster-compare MSB are left as the KERNAL set them;
-    // Gameplay dispatcher writes and menu restoration also keep bit3 clear.
+    // Permanent 25-row display (RSEL=1). Phase 1.5: the legacy RSEL=0 top-char-HUD
+    // presentation is retired; gameplay now runs the normal character display in
+    // 25-row mode throughout its visible field, with matrix row 0 and row 24 as
+    // permanent blank $D021 spacer rows absorbing the top/bottom scroll seams
+    // (see docs/bottom-border-hud-phase1-5-worklog.md). The lower vertical border
+    // is opened by a late RSEL 1->0 dodge in borderOpenHook; rasterFrameReset
+    // restores RSEL=1 before the line-51 top compare each physical frame. KERNAL
+    // reset already leaves $D011 = $1B (RSEL=1, DEN=1) — assert it explicitly and
+    // leave YSCROL / raster-compare MSB as the KERNAL set them.
     lda VIC_CONTROL_1
-    and #%11110111
+    ora #%00011000                          // RSEL=1 (25-row), DEN=1.
     sta VIC_CONTROL_1
 
     lda #0
@@ -3212,12 +3215,13 @@ awardKillScore:
 // prepareBackgroundCoarse critical path. Rebuilds the five fixed-HUD score
 // digits only on the frame after a kill; otherwise ~10 cycles.
 refreshScoreIfDirty:
-    lda SCORE_DIRTY
-    beq !clean+
+    // Phase 1.5: the on-screen score digits lived in the retired fixed HUD row.
+    // The 16-bit score value (SCORE_LO/HI) is still maintained by awardKillScore;
+    // this routine now only consumes the dirty flag so awardKillScore's contract
+    // (and any future HUD that re-reads SCORE_DIRTY) is unchanged. displayScore is
+    // retained but no longer called.
     lda #0
     sta SCORE_DIRTY
-    jmp displayScore                        // Tail call; writes HUD_SCORE_CELL..+4 only.
-!clean:
     rts
 
 // --- Routine: displayScore --------------------------------------------------
@@ -6151,43 +6155,31 @@ BACKGROUND_CODE_END:
     .error "Background copy code overlaps BASIC ROM"
 }
 
-// Fixed matrix row0, private stock glyphs (see HUD_GLYPH_BASE near the top):
-// space, S, C, O, R, E, the ten decimal digits 0..9, then F and R.
+// Phase 1.5: the legacy fixed character HUD (matrix row 0 "SCORE"/"FREE"/"LIVES"
+// text + private glyph set + per-frame digit rebuild) is retired along with the
+// RSEL=0 display split. initFixedHud now only establishes the two permanent
+// blank $D021 spacer rows that absorb the RSEL=1 top/bottom scroll seams:
+//   - matrix row 0  : top spacer (masks the fine-phase idle strip at rasters
+//                     ~51..58 that RSEL=0's 4-line top crop used to hide)
+//   - matrix row 24 : bottom spacer / seam absorber (masks the 7->0 bottom pop
+//                     at rasters ~240..250)
+// Both are screen code 32 (ROM-charset space, all-zero bitmap) so they render as
+// solid $D021 for ANY palette. The scroller never writes row 0 or row 24, so
+// this one-time fill is permanent. Score/lives *bookkeeping* is unchanged
+// (SCORE_LO/HI, awardKillScore, PLAYER_LIVES); only the on-screen presentation
+// is gone. hudStockCodes / fixedHudText / fixedHudFreeLabel / displayScore /
+// displayCycleMinimum are retained but no longer reachable during gameplay.
 .var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57, 6,18)
 initFixedHud:
-    ldx #7
-!glyph:
-    .for (var code = 0; code < hudStockCodes.size(); code++) {
-        lda STAR_CHARSET + hudStockCodes.get(code)*8,x
-        sta STAR_CHARSET + (HUD_GLYPH_BASE+code)*8,x
-    }
-    dex
-    bpl !glyph-
     ldx #39
 !row:
-    lda #HUD_GLYPH_BASE                     // Private blank in the fixed HUD row.
-    sta BG_SCREEN_A,x
     lda #32
-    sta BG_SCREEN_A + 24*40,x               // Unused last matrix row never enters the aperture.
+    sta BG_SCREEN_A,x                       // Matrix row 0: permanent blank top spacer.
+    sta BG_SCREEN_A + 24*40,x               // Matrix row 24: permanent blank bottom spacer / seam absorber.
     lda #1
-    sta $d800,x
+    sta $d800,x                             // Row 0 colour RAM (irrelevant for an all-zero glyph; kept for parity).
     dex
     bpl !row-
-    ldx #10
-!text:
-    lda fixedHudText,x
-    sta BG_SCREEN_A + 2,x
-    dex
-    bpl !text-
-    jsr displayScore                        // Fill the five digit cells from SCORE_LO/HI (0 at game start).
-.if (DEBUG_SHOW_FREE_CYCLES == 1) {
-    ldx #9                                  // "FREE " + five private 0 digits at columns 28..37.
-!free:
-    lda fixedHudFreeLabel,x
-    sta HUD_FREE_LABEL_CELL,x
-    dex
-    bpl !free-
-}
     rts
 .const HUD_G_SPACE = HUD_GLYPH_BASE + 0
 .const HUD_G_S     = HUD_GLYPH_BASE + 1
