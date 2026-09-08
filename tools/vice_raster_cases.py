@@ -102,7 +102,7 @@ def main():
         set_phase(0 if args.all_phases else 7)
         mon.cmd(f'logname "{out / "timing.log"}"')
         mon.cmd('log on')
-        for label in ('rasterInitialApplied', 'rasterAssignmentApplied', 'rasterFrameReset', 'rasterDisplayHook', 'applyLiveRasterBatch'):
+        for label in ('rasterInitialApplied', 'hudSlotReclaimed', 'rasterAssignmentApplied', 'rasterFrameReset', 'rasterDisplayHook', 'applyLiveRasterBatch'):
             if label in sym:
                 mon.cmd(f'trace exec {sym[label]:04x}')
         for label in ('rasterDisplayRestored', 'rasterBadlineRestored', 'rasterInitialMasksApplied', 'rasterBatchMasksApplied'):

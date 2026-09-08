@@ -124,7 +124,7 @@ def main():
     if args.trace:
         mon.cmd(f'logname "{out / "timing.log"}"')
         mon.cmd('log on')
-        for name in ('armFirstBatch', 'multiplexIRQ', 'gameplayPresented', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady', 'rasterFrameReset', 'rasterInitialApplied', 'rasterAssignmentApplied', 'rasterDisplayHook'):
+        for name in ('armFirstBatch', 'multiplexIRQ', 'gameplayPresented', 'shiftBackgroundUpper', 'bgUpperCopied', 'bgUpperReady', 'shiftBackgroundLower', 'bgLowerReady', 'rasterFrameReset', 'rasterInitialApplied', 'hudSlotReclaimed', 'rasterAssignmentApplied', 'rasterDisplayHook'):
             if name in sym:
                 mon.cmd(f'trace exec {sym[name]:04x}')
         if 'RASTER_STATE_BEGIN' in sym:

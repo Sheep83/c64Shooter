@@ -6,7 +6,11 @@
 .const RASTER_EVENT_FRAME = 0
 .const RASTER_EVENT_SPRITES = 1
 .const RASTER_EVENT_DISPLAY = 2
-.const RASTER_DISPLAY_LINE = 56              // After HUD badline55, before the fixed display transition.
+#if HUD_PROOF_ENABLE
+.const RASTER_DISPLAY_LINE = HUD_HANDOFF_RASTER   // repurposed: the HUD->gameplay slot handoff fires here.
+#else
+.const RASTER_DISPLAY_LINE = 56              // no-op display event (Phase 1.5).
+#endif
 
 // ============================================================================
 // BOTTOM-BORDER HUD EXPERIMENT - PHASE 1 "PROVE THE BORDER" (quarantined)
@@ -144,6 +148,9 @@ rasterFrameReset:
     lda RASTER_DISPLAY_FINE
     ora #GAMEPLAY_D011_BASE
     sta VIC_CONTROL_1                        // Every physical frame, including replay with main still building.
+#if HUD_PROOF_ENABLE
+    jsr hudBorderSetup                       // program HUD slots 4..7 at line 1, before their DMA (~raster HUD_Y-1)
+#endif
     lda RASTER_EXPECTED_ASSIGNMENTS
     sta RASTER_LAST_EXPECTED
     cmp RASTER_ASSIGNMENTS_DONE
@@ -299,19 +306,20 @@ dispatchRasterEvents:
     jsr rasterDisplayHook
     jmp !select-
 
-// Phase 1.5: the legacy RSEL=0 HUD/terrain $D011 split is retired. The whole
-// visible field now scrolls uniformly with YSCROL=fine installed at line 0 by
-// rasterFrameReset (matrix rows 0..24; rows 0 and 24 are blank $D021 spacers),
-// so the display raster event has no mid-frame work. It is kept as a scheduled
-// no-op — the dispatcher plumbing (event merge with the next sprite batch) is
-// deliberately left intact so the sprite scheduler is not touched — that simply
-// consumes RASTER_DISPLAY_PENDING at ~raster 56. The invalid BMM+ECM separator,
-// the $11/$71/$70|fine/$77/$10|fine write chain, rasterHblankDelay and the HUD
-// polling page-cross guards are all removed. RASTER_DISPLAY_NORMAL and
-// RASTER_DISPLAY_LATE remain declared (always 0) for capture-tool symbol parity.
+// Phase 1.5 retired the legacy RSEL=0 HUD/terrain $D011 split; the display event
+// became a scheduled no-op at ~raster 56. The top-border-HUD proof REPURPOSES it:
+// RASTER_DISPLAY_LINE is now HUD_HANDOFF_RASTER and this hook runs
+// hudBorderHandoff -- the deferred gameplay sprites are re-applied into hardware
+// slots HUD_SLOT_FIRST..7 here, after the HUD sprites' DMA/display has completed.
+// The dispatcher plumbing (event merge with the next sprite batch) is unchanged.
+// RASTER_DISPLAY_NORMAL / RASTER_DISPLAY_LATE remain declared for capture-tool
+// symbol parity.
 rasterDisplayHook:
     lda #0
     sta RASTER_DISPLAY_PENDING
+#if HUD_PROOF_ENABLE
+    jsr hudBorderHandoff
+#endif
 rasterDisplayRestored:
 rasterBadlineRestored:
     rts
@@ -351,6 +359,10 @@ borderOpenHook:
     lda #0
     sta RASTER_BORDER_PENDING
 
+#if !HUD_PROOF_ENABLE
+    // Diagnostic lower-border marker in slot 7. Disabled by the HUD proof, which
+    // owns slot 7 (see main.asm HUD_SLOT_FIRST); the deep-lower-border corruption
+    // it demonstrated is already documented.
     lda SPRITE_ENABLE
     and #%10000000                          // Slot 7 already live for gameplay this frame?
     bne !skipMarker+
@@ -369,36 +381,39 @@ borderOpenHook:
     ora #%10000000
     sta SPRITE_ENABLE
 !skipMarker:
+#endif
 
-#if GAMEPLAY_BOTTOM_EXTEND
-    // Part-D asymmetric bottom-extend candidate (GAMEPLAY_RSEL = 0 only).
-!wait242:
+    // Open BOTH vertical borders (commercial "no-border" dodge -- see Slap Fight
+    // $1802 / Terra Cresta $483c). Gameplay is RSEL=0, so the border FF close
+    // compare is raster 247. Flip RSEL 0->1 before raster 247 (that compare then
+    // misses); flip RSEL 1->0 before the RSEL=1 compare at raster 251 (that one
+    // misses too). Neither close fires -> the vertical border FF is never set
+    // this frame -> both the lower AND (single-FF consequence) the upper border
+    // stay open into overscan. rasterFrameReset re-establishes RSEL=0 |
+    // YSCROL=fine at line 0. The exposed region below the last badline is VIC
+    // idle graphics whose g-fetch byte ($3FFF / $39FF) is forced to $00 in init,
+    // so it renders as solid $D021 backdrop (not $3FFF stripes). The visible
+    // gameplay TERRAIN aperture is still the raster 55..246 body (the finite
+    // 25-row fetch cannot present a temporally-clean scrolling edge past it --
+    // see the report); the opened border is sprite / player / future-top-HUD
+    // room. The two writes land in raster ~245 / ~250, past every row's g-fetch,
+    // so their exact cycle is not visible-pixel critical.
+!wait245:
     ldx RASTER
-    cpx #242
-    bcc !wait242-
+    cpx #245
+    bcc !wait245-
     lda VIC_CONTROL_1
-    ora #%00001000                          // RSEL 0 -> 1 before the raster-247 RSEL=0 close compare.
+    ora #%00001000                          // RSEL 0 -> 1  (raster-247 RSEL=0 close compare now misses).
     sta VIC_CONTROL_1
-!wait252:
-    ldx RASTER
-    cpx #252
-    bcc !wait252-
-    lda VIC_CONTROL_1
-    and #%11110111                          // RSEL 1 -> 0 AFTER the raster-251 RSEL=1 close compare (FF set at 251).
-    sta VIC_CONTROL_1                        // => aperture 55..250; next-frame top compare is still RSEL=0's line 55.
-borderOpenRestored:
-    rts
-#else
 !wait250:
     ldx RASTER
     cpx #250
     bcc !wait250-
     lda VIC_CONTROL_1
-    and #%11110111                          // GAMEPLAY_RSEL=1: RSEL 1 -> 0 before the raster-251 close -> border open.
-    sta VIC_CONTROL_1                        // GAMEPLAY_RSEL=0: no-op (bit already clear); border closes normally at 247.
+    and #%11110111                          // RSEL 1 -> 0 before the raster-251 RSEL=1 close compare (misses too).
+    sta VIC_CONTROL_1
 borderOpenRestored:
     rts
-#endif
 #endif
 
 // The assignment payload/order is unchanged. Final batch masks are prepared
@@ -521,6 +536,10 @@ RASTER_BATCH_OFFSET:           .byte 0
 RASTER_BATCH_END:              .byte 0
 RASTER_DISPLAY_FINE:           .byte 0
 RASTER_DISPLAY_NORMAL:         .byte 0
+#if HUD_PROOF_ENABLE
+HUD_HO_RC:                     .byte 0        // hudBorderHandoff scratch (IRQ-owned; not the TEMP_* main scratch)
+HUD_HO_MSB:                    .byte 0
+#endif
 SCHED_PLAYER_MASK:             .byte 0
 SCHED_X_MSB_MASK:              .byte 0
 BATCH_PLAYER_MASK:             .fill 16, 0

@@ -10,26 +10,51 @@
 // src/raster_scheduler.asm borderOpenHook.
 #define BORDER_PROOF_ENABLE
 
-// RSEL=1 coarse-scroll-edge experiment. The gameplay display state's RSEL bit:
-//   GAMEPLAY_RSEL = 1  -> genuine 25-row aperture (raster 51..250); the overflow
-//                         rows 0/24 keep the BODY (rows 1..23) temporally clean
-//                         but their own outer edges (raster ~52-55 / ~247-250)
-//                         are not cropped by the aperture -> ~4 px residual.
-//   GAMEPLAY_RSEL = 0  -> 24-row aperture (raster 55..246); the border FF crops
-//                         exactly the overflow rows' imperfect outer edges, so
-//                         BOTH visible edges are fully continuous.
-// See docs/rsel1-scroll-overflow-worklog.md.
+// Top-border sprite HUD proof (time-domain hardware-sprite ownership). Comment
+// this line out to build the engine exactly as the open-border task left it;
+// every added block is `#if HUD_PROOF_ENABLE`-guarded. See the HUD_* consts
+// below and /reports/top-border-sprite-hud-proof-report.md.
+#define HUD_PROOF_ENABLE
+
+// Gameplay display-state RSEL bit (set by rasterFrameReset / publishRasterPlan
+// every frame; borderOpenHook then dodges BOTH border-close compares to open the
+// vertical border top+bottom, commercial style -- see raster_scheduler.asm and
+// /reports/full-200px-gameplay-aperture-architectural-rework-report.md).
+//   GAMEPLAY_RSEL = 0 -> DEN + YSCROL=fine, RSEL=0. Frame-reset base; the border
+//                        FF close compare is raster 247, which borderOpenHook
+//                        misses (RSEL 0->1 @245) along with the RSEL=1 compare
+//                        @251 (RSEL 1->0 @250). The clean scrolling TERRAIN
+//                        aperture is the raster 55..246 body -- a finite 25-row
+//                        character fetch cannot present a temporally-clean
+//                        scrolling edge past its last fetched row (Part A). The
+//                        opened border below/above is sprite + player + future
+//                        top-HUD room; its idle region renders as solid $D021
+//                        because init forces the $3FFF/$39FF idle g-byte to $00.
+//   GAMEPLAY_RSEL = 1 -> as 0 but RSEL=1 (aperture 51..250). Exposes the
+//                        overflow rows' own outer edges (~4 px pop at r52-55 /
+//                        r248-250 once per coarse cycle). Not shipped.
 .const GAMEPLAY_RSEL = 0
 .const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3)   // DEN=1, RSEL per toggle, YSCROL added at runtime.
 
-// Part-D investigation toggle (full-gameplay-aperture task). When 1 AND
-// GAMEPLAY_RSEL = 0, borderOpenHook performs an ASYMMETRIC dodge: RSEL 0->1
-// before the raster-247 close (so the RSEL=0 crop is missed) then RSEL 1->0
-// after raster 251 (so the top compare next frame is still RSEL=0's line 55).
-// Net aperture 55..250 -- +4 px at the bottom, top crop unchanged. Measured to
-// re-expose the overflow row-24 bottom edge at rasters 247..250 (see report);
-// ships as 0. Requires BORDER_PROOF_ENABLE.
-.const GAMEPLAY_BOTTOM_EXTEND = 0
+// ============================================================================
+// TOP-BORDER SPRITE HUD PROOF (time-domain hardware-sprite ownership)
+// See /reports/top-border-sprite-hud-proof-report.md.
+// The opened top border (r~16..51, solid $D021 backdrop) hosts 4 hires HUD
+// sprites early in the frame; the SAME 4 physical slots (4..7) are then handed
+// back to the gameplay multiplexer lower in the frame. NO permanent reservation.
+//   - hudBorderSetup   : line 1 IRQ, programs slots 4..7 = HUD before their DMA.
+//   - renderSprites     : caps its initial write at HUD_SLOT_FIRST (4) slots so
+//                         it never overwrites the HUD; keeps $D015 bits 4..7 set.
+//   - hudBorderHandoff  : repurposed DISPLAY event @ HUD_HANDOFF_RASTER, re-applies
+//                         the deferred gameplay INITIAL_* entries into slots 4..7.
+//   - buildBatchSpriteSchedule floors SLOT_FREE_RASTER[4..7] at the handoff raster.
+.const HUD_SLOT_FIRST      = 4          // HUD owns hardware sprite slots 4..7.
+.const HUD_SPRITE_COUNT    = 4
+.const HUD_Y               = 22         // sprite Y (body raster 22..42); clear of clean terrain @55.
+.const HUD_HANDOFF_RASTER  = 46         // DISPLAY event line: re-arm slots 4..7 for gameplay here.
+.const HUD_SPRITE_BASE     = $2f00      // 4 x 64B hires bitmaps, VIC bank 0 gap $2e6a..$2fff.
+.const HUD_SPRITE_BASE_PTR = HUD_SPRITE_BASE / 64        // $bc; slot ptrs $bc..$bf.
+.const HUD_D010_KEEP       = $80        // HUD sprite index 3 (hw slot 7) sits at X=280 -> keep its $D010 bit.
 
 #import "variables.asm"
 
@@ -389,6 +414,11 @@
 .const INITIALS_SLOTS_SCREEN  = $0400 + (14 * 40) + 18  // Row 14: three letters at cols 18/20/22.
 .const PLAYER_START_X          = 160
 .const PLAYER_START_Y          = 220
+// Player downward travel limit. borderOpenHook opens the lower vertical border,
+// so a sprite now renders through raster ~258 (idle region below the terrain is
+// masked to solid $D021). 237 + 21-line body -> the ship's bottom reaches the
+// open-border backdrop edge; it is no longer clipped by the old 246 crop.
+.const PLAYER_MAX_Y            = 237
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
 .const PLAYER_RESPAWN_TIME     = 100            // Invulnerable blinking frames after repositioning.
 
@@ -444,15 +474,19 @@ init:
     ora #%00001110                          // Character set at $3800 within VIC bank 0.
     sta VIC_MEMORY_SETUP
 
-    // Permanent 25-row display (RSEL=1). Phase 1.5: the legacy RSEL=0 top-char-HUD
-    // presentation is retired; gameplay now runs the normal character display in
-    // 25-row mode throughout its visible field, with matrix row 0 and row 24 as
-    // permanent blank $D021 spacer rows absorbing the top/bottom scroll seams
-    // (see docs/bottom-border-hud-phase1-5-worklog.md). The lower vertical border
-    // is opened by a late RSEL 1->0 dodge in borderOpenHook; rasterFrameReset
-    // restores RSEL=1 before the line-51 top compare each physical frame. KERNAL
-    // reset already leaves $D011 = $1B (RSEL=1, DEN=1) — assert it explicitly and
-    // leave YSCROL / raster-compare MSB as the KERNAL set them.
+    // VIC idle-graphics g-fetch byte -> $00 so the region below the last badline
+    // (exposed once borderOpenHook opens the vertical border) renders as solid
+    // $D021 backdrop instead of the $3FFF ROM-char stripe pattern. $3FFF is the
+    // standard text-mode idle address in VIC bank 0; $39FF is the ECM idle
+    // address. Char codes 224..255 ($3F00..$3FFF) are outside the terrain/HUD/
+    // star allocation (guard at STAR_CHARSET + 224*8 <= $3F00), so this is free.
+    lda #0
+    sta STAR_CHARSET + $7ff                 // $3FFF  (text-mode idle)
+    sta STAR_CHARSET + $1ff                 // $39FF  (ECM idle)
+
+    // Gameplay display state. rasterFrameReset / publishRasterPlan install
+    // DEN + RSEL(per GAMEPLAY_RSEL) + YSCROL=fine every frame; borderOpenHook
+    // opens the vertical border top+bottom (both close compares dodged).
     lda VIC_CONTROL_1
     ora #GAMEPLAY_D011_BASE                 // DEN=1, RSEL per GAMEPLAY_RSEL toggle.
     sta VIC_CONTROL_1
@@ -1706,8 +1740,8 @@ updatePlayer:
     and #%00000010                          // AND A with #%00000010.
     bne !left+                              // Branch to !left+ if the previous result was non-zero/not equal.
     lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
-    cmp #230                                // Compare A with #230; set flags, leaving A unchanged.
-    beq !left+                              // Branch to !left+ if the previous result was zero/equal.
+    cmp #PLAYER_MAX_Y                       // Downward limit (opened lower border; see the const).
+    bcs !left+                              // Y >= PLAYER_MAX_Y: hold.
     inc OBJECT_Y,x                          // Down
 
 !left:
@@ -2992,6 +3026,25 @@ buildBatchSpriteSchedule:
     cpy #8                                  // Compare Y with #8; set flags, leaving Y unchanged.
     bne !initSlots-                         // Branch to !initSlots- if the previous result was non-zero/not equal.
 
+#if HUD_PROOF_ENABLE
+    // HUD slots HUD_SLOT_FIRST..7 are owned by the HUD until hudBorderHandoff at
+    // HUD_HANDOFF_RASTER. Floor their reuse raster so no batch is scheduled into
+    // one before the handoff. (For a deferred gameplay initial sprite the value
+    // is already its Y+24 >= ~79 > HUD_HANDOFF_RASTER; this only lifts the
+    // "unused slot" 0.)
+    ldy #HUD_SLOT_FIRST
+!hudFloor:
+    lda SLOT_FREE_RASTER,y
+    cmp #HUD_HANDOFF_RASTER
+    bcs !hudFloorNext+
+    lda #HUD_HANDOFF_RASTER
+    sta SLOT_FREE_RASTER,y
+!hudFloorNext:
+    iny
+    cpy #8
+    bne !hudFloor-
+#endif
+
     lda SORTED_COUNT                        // Load A from SORTED_COUNT.
     cmp #9                                  // Compare A with #9; set flags, leaving A unchanged.
     bcs !needsSchedule+                     // Branch to !needsSchedule+ if carry is set.
@@ -3481,11 +3534,26 @@ renderSprites:
 
     ldy LIVE_PLAN                           // Load Y from LIVE_PLAN.
     lda RENDER_COUNT,y                      // Load the number of initial hardware sprites used by LIVE_PLAN.
+#if HUD_PROOF_ENABLE
+    // Time-domain HUD ownership: this frame-top write must NOT touch hardware
+    // slots HUD_SLOT_FIRST..7 -- hudBorderSetup owns them until hudBorderHandoff.
+    // Cap the initial write at HUD_SLOT_FIRST slots; entries HUD_SLOT_FIRST..RC-1
+    // are the "deferred" gameplay sprites that hudBorderHandoff re-applies.
+    cmp #HUD_SLOT_FIRST
+    bcc !hudUnderCap+
+    lda #HUD_SLOT_FIRST
+!hudUnderCap:
+    tax
+    lda SPRITE_ENABLE_MASK,x                // first (capped) gameplay slots ...
+    ora #(($ff << HUD_SLOT_FIRST) & $ff)   // ... plus the HUD slots ($f0), kept enabled through their DMA
+    sta SPRITE_ENABLE
+#else
     tax                                     // Copy the count into X for the enable-mask lookup.
     lda SPRITE_ENABLE_MASK,x                // Load a mask with the first X hardware sprite bits set.
     sta SPRITE_ENABLE                       // Disable any stale hardware sprites left from the previous frame.
-    txa                                     // Restore the live sprite count to A.
-    beq !none+                              // If zero sprites are live, there is nothing else to render.
+#endif
+    txa                                     // Restore the (capped) live sprite count to A.
+    beq !none+                              // If zero gameplay sprites, there is nothing else to render.
     sta TEMP_OBJECT                         // Cache the live sprite count for the render loop.
 
     ldx #0                                  // Start rendering into hardware sprite slot 0.
@@ -3530,13 +3598,20 @@ rasterInitialApplied:                       // Diagnostic trace: X is hardware s
     bne !renderLoop-                        // Branch to !renderLoop- if the previous result was non-zero/not equal.
 
     lda TEMP_MSB                            // Load A from TEMP_MSB.
+#if HUD_PROOF_ENABLE
+    ora #HUD_D010_KEEP                      // keep the HUD sprites' X-MSB bit(s) through their DMA
+#endif
     sta SPRITE_OVERFLOW_REGISTER            // Store A in SPRITE_OVERFLOW_REGISTER.
 rasterInitialMasksApplied:
     rts                                     // Return to the calling routine.
 
 !none:
-    sta SPRITE_OVERFLOW_REGISTER            // A is already zero
+#if HUD_PROOF_ENABLE
+    lda #HUD_D010_KEEP                      // no gameplay sprites: $D010 = just the HUD X-MSB bit(s)
+#endif
+    sta SPRITE_OVERFLOW_REGISTER            // (else A is already zero)
     rts                                     // Return to the calling routine.
+
 
 
 // --- Routine: armFirstBatch -------------------------------------------------
@@ -4146,6 +4221,15 @@ starRowLo:
 starRowHi:
     .byte $04,$04,$04,$04,$04,$04,$04,$05,$05,$05,$05,$05,$05,$06,$06,$06,$06,$06,$06,$06,$07,$07,$07,$07,$07
 
+#if HUD_PROOF_ENABLE
+// Per-HUD-slot fixed geometry (slot index 0..3 -> hardware slot HUD_SLOT_FIRST+i).
+// In the lookup-table segment tail; the bitmaps live separately at HUD_SPRITE_BASE.
+hudProofPtr:    .byte HUD_SPRITE_BASE_PTR, HUD_SPRITE_BASE_PTR+1, HUD_SPRITE_BASE_PTR+2, HUD_SPRITE_BASE_PTR+3
+hudProofX:      .byte 40, 120, 200, 280 - 256          // sprite 3 X = 280 -> its $D010 bit is set
+hudProofXMsb:   .byte 0, 0, 0, 1
+hudProofColour: .byte 1, 7, 13, 3                      // white / yellow / lt-green / cyan
+#endif
+
 LOOKUP_TABLES_END:
 .if (LOOKUP_TABLES_END > $2000) {
     .error "Lookup tables overlap engine runtime state"
@@ -4166,6 +4250,44 @@ BORDER_MARKER_SPRITE:
 }
 .if (* > $2000) {
     .error "Border marker sprite overruns into engine runtime state at $2000"
+}
+#endif
+
+#if HUD_PROOF_ENABLE
+// Four hires 24x21 diagnostic HUD sprite bitmaps, 64B-aligned at HUD_SPRITE_BASE
+// ($2f00) in the free VIC-bank-0 gap between BACKGROUND_CONTROL_END (~$2e69) and
+// HEALTH_SPRITE_BASE ($3000). Deliberately DISTINCT so any corruption, flicker
+// or HUD<->gameplay slot swap is unmistakable:
+//   0 ($bc) checkerboard   1 ($bd) horizontal bars
+//   2 ($be) diagonal ramp  3 ($bf) solid frame + a crude "4"
+* = HUD_SPRITE_BASE
+hudProofSprites:
+    // 0 ($bc): checkerboard
+    .byte $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6
+    .byte $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db
+    .byte $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6
+    .byte $00
+    // 1 ($bd): horizontal bars (3 on / 3 off)
+    .byte $ff,$ff,$ff, $ff,$ff,$ff, $ff,$ff,$ff, $00,$00,$00, $00,$00,$00, $00,$00,$00, $ff,$ff,$ff
+    .byte $ff,$ff,$ff, $ff,$ff,$ff, $00,$00,$00, $00,$00,$00, $00,$00,$00, $ff,$ff,$ff, $ff,$ff,$ff
+    .byte $ff,$ff,$ff, $00,$00,$00, $00,$00,$00, $00,$00,$00, $ff,$ff,$ff, $ff,$ff,$ff, $ff,$ff,$ff
+    .byte $00
+    // 2 ($be): diagonal ramp
+    .byte $80,$00,$01, $c0,$00,$03, $e0,$00,$07, $f0,$00,$0f, $f8,$00,$1f, $fc,$00,$3f, $fe,$00,$7f
+    .byte $ff,$00,$ff, $7f,$81,$fe, $3f,$c3,$fc, $1f,$e7,$f8, $0f,$ff,$f0, $07,$ff,$e0, $03,$ff,$c0
+    .byte $01,$ff,$80, $00,$ff,$00, $00,$7e,$00, $00,$3c,$00, $00,$18,$00, $00,$3c,$00, $00,$7e,$00
+    .byte $00
+    // 3 ($bf): solid frame + crude "4"
+    .byte $ff,$ff,$ff, $80,$00,$01, $80,$00,$01, $80,$06,$01, $80,$0e,$01, $80,$1e,$01, $80,$36,$01
+    .byte $80,$66,$01, $80,$7f,$01, $80,$7f,$01, $80,$06,$01, $80,$06,$01, $80,$06,$01, $80,$00,$01
+    .byte $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $ff,$ff,$ff
+    .byte $00
+hudProofSpritesEnd:
+.if (hudProofSprites != HUD_SPRITE_BASE || hudProofSpritesEnd != HUD_SPRITE_BASE + HUD_SPRITE_COUNT * 64) {
+    .error "HUD proof sprite bitmaps must be exactly 4 x 64 bytes at HUD_SPRITE_BASE"
+}
+.if (hudProofSpritesEnd > HEALTH_SPRITE_BASE) {
+    .error "HUD proof sprite bitmaps overrun HEALTH_SPRITE_BASE ($3000)"
 }
 #endif
 
@@ -6212,6 +6334,102 @@ BACKGROUND_CODE_END:
 .if (BACKGROUND_CODE_END > $a000) {
     .error "Background copy code overlaps BASIC ROM"
 }
+
+#if HUD_PROOF_ENABLE
+// --- Routine: hudBorderSetup ----------------------------------------------------
+// Called from rasterFrameReset (line-1 IRQ), before renderSprites and long
+// before the HUD sprites' DMA at ~raster HUD_Y-1. Programs hardware slots
+// HUD_SLOT_FIRST..7 as the four static hires HUD sprites. renderSprites then
+// leaves those slots alone; hudBorderHandoff reclaims them for gameplay at
+// HUD_HANDOFF_RASTER. Clobbers A, X, Y.
+hudBorderSetup:
+    ldx #HUD_SPRITE_COUNT - 1
+!slot:
+    lda hudProofPtr,x
+    sta HW_SPRITE_POINTER + HUD_SLOT_FIRST,x
+    lda hudProofColour,x
+    sta HW_SPRITE_COLOUR + HUD_SLOT_FIRST,x
+    txa
+    asl                                    // (HUD_SLOT_FIRST + x) * 2 register-pair offset
+    tay
+    lda hudProofX,x
+    sta SPR_X + HUD_SLOT_FIRST * 2,y
+    lda #HUD_Y
+    sta SPR_Y + HUD_SLOT_FIRST * 2,y
+    dex
+    bpl !slot-
+    lda SPRITE_MODE                        // $D01C: HUD slots -> hires
+    and #(($01 << HUD_SLOT_FIRST) - 1)     // keep low HUD_SLOT_FIRST bits, clear the HUD slots
+    sta SPRITE_MODE
+    lda SPRITE_OVERFLOW_REGISTER           // $D010: HUD slots' X-MSB = HUD_D010_KEEP
+    and #(($01 << HUD_SLOT_FIRST) - 1)
+    ora #HUD_D010_KEEP
+    sta SPRITE_OVERFLOW_REGISTER
+    lda #0
+    sta $D017                              // no Y expansion
+    sta $D01D                              // no X expansion
+    sta $D01B                              // default sprite/background priority
+    rts
+
+// --- Routine: hudBorderHandoff -----------------------------------------------
+// Dispatched as the (repurposed) DISPLAY event at HUD_HANDOFF_RASTER, i.e. after
+// the HUD sprites' DMA/display has completed and before any gameplay sprite in
+// slots HUD_SLOT_FIRST..7 is needed. Re-applies the deferred gameplay INITIAL_*
+// entries (slots HUD_SLOT_FIRST..RENDER_COUNT-1) that renderSprites skipped, and
+// restores gameplay VIC mode state for those slots. Clobbers A, X, Y.
+hudBorderHandoff:
+    ldy LIVE_PLAN
+    lda RENDER_COUNT,y
+    sta HUD_HO_RC                          // gameplay initial-sprite count (IRQ scratch)
+    lda SPRITE_MODE                        // restore MC for the HUD slots (gameplay sprites are MC)
+    ora #(($ff << HUD_SLOT_FIRST) & $ff)
+    sta SPRITE_MODE
+    lda SPRITE_OVERFLOW_REGISTER           // start $D010 fixup: clear the HUD slots' X-MSB
+    and #(($01 << HUD_SLOT_FIRST) - 1)
+    sta HUD_HO_MSB
+    ldx #HUD_SLOT_FIRST
+!reclaim:
+    cpx HUD_HO_RC
+    bcs !done+                             // slot x >= RENDER_COUNT: no deferred gameplay sprite here
+    txa
+    clc
+    adc LIVE_PLAN
+    tay                                    // y = LIVE_PLAN + x
+    lda INITIAL_SPRITE,y
+    sta HW_SPRITE_POINTER,x
+    lda INITIAL_COLOUR,y
+    sta HW_SPRITE_COLOUR,x
+    lda INITIAL_OBJECT,y
+    bne !notPlayer+
+    lda PLAYER_HW_MASK
+    ora HW_BIT_MASK,x
+    sta PLAYER_HW_MASK                     // the player was a deferred slot this frame
+!notPlayer:
+    lda INITIAL_X_MSB,y
+    beq !noMsb+
+    lda HUD_HO_MSB
+    ora HW_BIT_MASK,x
+    sta HUD_HO_MSB
+!noMsb:
+    lda INITIAL_Y,y
+    pha
+    lda INITIAL_X,y
+    ldy HW_SPRITE_OFFSET,x
+    sta SPR_X,y
+    pla
+    sta SPR_Y,y
+hudSlotReclaimed:                          // Diagnostic trace: X is the hardware slot this handoff just re-applied.
+    inx
+    cpx #8
+    bne !reclaim-
+!done:
+    lda HUD_HO_MSB
+    sta SPRITE_OVERFLOW_REGISTER
+    ldx HUD_HO_RC                          // $D015 = exactly the gameplay initial slots (drop HUD-leftover bits)
+    lda SPRITE_ENABLE_MASK,x
+    sta SPRITE_ENABLE
+    rts
+#endif
 
 // Phase 1.5: the legacy fixed character HUD (matrix row 0 "SCORE"/"FREE"/"LIVES"
 // text + private glyph set + per-frame digit rebuild) is retired along with the

@@ -22,12 +22,19 @@ def main():
         line, cycle, index, clock = match.groups()
         assignments.append((int(clock), int(line), int(cycle), int(index, 16)))
     initial = []
-    if 'rasterInitialApplied' in symbols:
-        address = symbols['rasterInitialApplied']
-        pattern = (rf'#\d+ \(Trace  exec {address:04x}\)\s+(\d+)/\$[0-9a-f]+,\s+'
-                   r'(\d+)/\$[0-9a-f]+\n\.C:[^\n]*?X:([0-9A-Fa-f]+)[^\n]*? (\d+)\n')
-        initial = [(int(m[4]), int(m[1]), int(m[2]), int(m[3], 16))
-                   for m in re.finditer(pattern, trace)]
+    # rasterInitialApplied fires once per frame-top hardware-slot write; with the
+    # top-border sprite HUD (HUD_PROOF_ENABLE) the frame-top write is capped and the
+    # deferred slots are re-applied later by hudBorderHandoff, which traces
+    # hudSlotReclaimed with X = the same hardware slot. Merge both so a HUD frame
+    # still shows the full initial-slot set 0..RENDER_COUNT-1 in beam order.
+    for label in ('rasterInitialApplied', 'hudSlotReclaimed'):
+        if label in symbols:
+            address = symbols[label]
+            pattern = (rf'#\d+ \(Trace  exec {address:04x}\)\s+(\d+)/\$[0-9a-f]+,\s+'
+                       r'(\d+)/\$[0-9a-f]+\n\.C:[^\n]*?X:([0-9A-Fa-f]+)[^\n]*? (\d+)\n')
+            initial += [(int(m[4]), int(m[1]), int(m[2]), int(m[3], 16))
+                        for m in re.finditer(pattern, trace)]
+    initial.sort()
     masks = {}
     for label in ('rasterInitialMasksApplied','rasterBatchMasksApplied'):
         if label in symbols:
@@ -106,10 +113,15 @@ def main():
                     failures.append([frame,'mask write count',label,len(writes),expected_writes])
                 for _,line,cycle,index in writes:
                     if initial_mask:
+                        if count == 0:
+                            continue
                         y = min(get('INITIAL_Y',live+i) for i in range(count))
                     else:
                         first = get('BATCH_FIRST_ASSIGN',index)+live
-                        y = min(get('ASSIGN_Y',i) for i in range(first,first+get('BATCH_ASSIGN_COUNT',index)))
+                        span = get('BATCH_ASSIGN_COUNT',index)
+                        if span == 0:  # spurious/stale mask event; already flagged by 'mask write count'
+                            continue
+                        y = min(get('ASSIGN_Y',i) for i in range(first,first+span))
                     if line*63+cycle > y*63+55:
                         deadlines.append([frame,'mask',label,index,y,line,cycle])
             if 'rasterInitialApplied' in symbols:
