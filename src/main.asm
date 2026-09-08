@@ -16,6 +16,12 @@
 // below and /reports/top-border-sprite-hud-proof-report.md.
 #define HUD_PROOF_ENABLE
 
+// Lightweight raster-scheduler forensic ring buffer (see src/raster_scheduler.asm
+// rasterIRQ / FORENSIC_RING). ~24 cycles per raster event; a 64K dump then shows
+// the last 32 scheduler events + beam position + stack depth before any future
+// hang. Comment out once the border-HUD work is stable.
+#define BORDER_FORENSIC
+
 // Gameplay display-state RSEL bit (set by rasterFrameReset / publishRasterPlan
 // every frame; borderOpenHook then dodges BOTH border-close compares to open the
 // vertical border top+bottom, commercial style -- see raster_scheduler.asm and

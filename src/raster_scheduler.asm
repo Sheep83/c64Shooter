@@ -44,6 +44,15 @@ initRasterScheduler:
 #if BORDER_PROOF_ENABLE
     sta RASTER_BORDER_PENDING
 #endif
+#if BORDER_FORENSIC
+    lda #0
+    sta FORENSIC_HEAD
+    ldx #127
+!forclr:
+    sta FORENSIC_RING,x
+    dex
+    bpl !forclr-
+#endif
     rts
 
 // Publish readiness only after observing raster high with IRQs masked. This
@@ -117,6 +126,30 @@ rasterIRQ:
 !vic:
     lda #1
     sta IRQ_STATUS                          // Acknowledge before chaining, never erase the next event's latch.
+#if BORDER_FORENSIC
+    // Cheap forensic breadcrumb: 32-entry ring of (RASTER_EVENT, $d012, SP,
+    // RASTER_FRAME low) captured at every VIC raster-event dispatch. ~24 cy/event.
+    // On a future hang, one 64K dump shows the last 32 scheduler events + where
+    // the beam was and how deep the stack got. FORENSIC_RING lives at a fixed
+    // address (see the RASTER_STATE block); FORENSIC_HEAD is its 0..124 byte
+    // cursor (4 bytes/entry).
+    ldx FORENSIC_HEAD
+    lda RASTER_EVENT
+    sta FORENSIC_RING,x
+    lda RASTER
+    sta FORENSIC_RING + 1,x
+    tsx
+    txa
+    ldx FORENSIC_HEAD
+    sta FORENSIC_RING + 2,x
+    lda RASTER_FRAME
+    sta FORENSIC_RING + 3,x
+    txa
+    clc
+    adc #4
+    and #%01111111                          // wrap at 128 bytes (32 entries)
+    sta FORENSIC_HEAD
+#endif
     lda RASTER_EVENT
     beq rasterFrameReset
     cmp #RASTER_EVENT_DISPLAY
@@ -359,6 +392,36 @@ borderOpenHook:
     lda #0
     sta RASTER_BORDER_PENDING
 
+    // --- ROBUSTNESS GUARD (intermittent hard-lock fix) ------------------------
+    // !wait245 / !wait250 below are `ldx $d012 / cpx #target / bcc loop`. $d012 is
+    // the raster counter MOD 256: for beam rasters 256..311 it reads 0..55, all
+    // < 245, so !wait245 then spins until the beam wraps back up to raster 245 --
+    // ~250..300 scanlines, INSIDE the IRQ. That stall crosses the frame boundary;
+    // the raster-0 compare latches; RTI re-fires it; the replay path + a DISPLAY
+    // catchup hand the BORDER event to `!due` at beam >= 256 again -> the hook
+    // re-enters late -> a permanent, self-sustaining hard lock (captured
+    // PC=$61F7, RASTER_EVENT=BORDER, RASTER_REPLAY 3999/4720, RASTER_CATCHUPS
+    // 7999; see /reports/intermittent-lock-and-hud-flicker-investigation-report.md).
+    //
+    // The dodge is only physically possible in a tight window just before the
+    // raster-247 RSEL=0 close compare. The BORDER event compare is
+    // RASTER_BORDER_LINE (240), so a legitimate entry is raster ~237..245. Accept
+    // ONLY that window; bail on anything earlier (corrupt/spurious event -> would
+    // otherwise busy-wait ~190 lines up to 245) or later (late IRQ / catchup /
+    // beam already wrapped past 255 -> would otherwise spin ~250..300 lines and
+    // cascade into the permanent lock). On a bail the border simply closes
+    // normally for that one frame; nothing hangs and the scheduler stays in
+    // sync. RASTER_BORDER_BAILS counts every skip.
+    lda VIC_CONTROL_1
+    bmi !bail+                              // $d011 bit7 = raster bit8 => beam >= 256 => far too late.
+    lda RASTER
+    sec
+    sbc #237                               // beam - 237 ...
+    cmp #(246 - 237)                       // ... in [0..8] i.e. raster 237..245 -> proceed, else bail.
+    bcs !bail+
+    // beam is now provably in [237 .. 245]; both polls below wait at most ~13
+    // lines (usually <5) and can never wrap.
+
 #if !HUD_PROOF_ENABLE
     // Diagnostic lower-border marker in slot 7. Disabled by the HUD proof, which
     // owns slot 7 (see main.asm HUD_SLOT_FIRST); the deep-lower-border corruption
@@ -413,6 +476,12 @@ borderOpenHook:
     and #%11110111                          // RSEL 1 -> 0 before the raster-251 RSEL=1 close compare (misses too).
     sta VIC_CONTROL_1
 borderOpenRestored:
+    rts
+!bail:
+    inc RASTER_BORDER_BAILS                 // Forensic: a late / beam-wrapped border event was skipped.
+    bne !bailDone+
+    inc RASTER_BORDER_BAILS + 1
+!bailDone:
     rts
 #endif
 
@@ -522,6 +591,7 @@ RASTER_PRESENT_READY:          .byte 0
 RASTER_DISPLAY_PENDING:        .byte 0
 #if BORDER_PROOF_ENABLE
 RASTER_BORDER_PENDING:         .byte 0        // Phase-1 bottom-border experiment; see borderOpenHook.
+RASTER_BORDER_BAILS:           .word 0        // Forensic: borderOpenHook late-entry guard trips (hard-lock fix).
 #endif
 RASTER_EXPECTED_ASSIGNMENTS:   .byte 0
 RASTER_ASSIGNMENTS_DONE:        .byte 0
@@ -557,6 +627,15 @@ RASTER_STATE_END:
 .if (RASTER_STATE_END - RASTER_STATE_BEGIN > 128) {
     .error "Raster state clear loop exceeds signed X range"
 }
+
+#if BORDER_FORENSIC
+// OUTSIDE the RASTER_STATE clear loop (it would blow the 128-byte X range).
+// 32 x (event, $d012, SP, RASTER_FRAME-low). Zeroed explicitly in
+// initRasterScheduler. Survives in a 64K dump for post-mortem.
+FORENSIC_HEAD:                 .byte 0
+FORENSIC_RING:                 .fill 128, 0
+#endif
+
 .if (* > $6600) {
     .error "Raster dispatcher exceeds its $6000-$65ff allocation (the metatile stage data now begins at $6600)"
 }
