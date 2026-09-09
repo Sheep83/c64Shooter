@@ -163,6 +163,14 @@
     // sprite-pointer mirror happen at the flip. The reason-1 gate is UNCHANGED
     // (Stage 4F removes it). Commented -> Mode-3 (4D-only) behaviour + hash.
     //#define OPT_SS_FLIP_COARSE
+    // 4F: relax ONLY reason 1 (COARSE_DEFER_LIVE) for the proven prepared-page
+    // flip path -- an admitted coarse step may flip while a LIVE reuse batch is
+    // still outstanding, because the flip touches no sprite hardware and no batch
+    // state. Reasons 2 and 3 are still enforced; the legacy in-window fallback
+    // keeps the original reason-1 protection. The raster-IRQ batch also writes
+    // the page-B pointer table so a mid-frame reassignment survives the flip.
+    // Commented -> Stage 4E behaviour + hash (98eb5bbb...) unchanged.
+    //#define OPT_SS_ALLOW_PENDING_LIVE_FLIP
 #endif
 
 #if (OPT_SS_INACTIVE_BUILD && !SCROLL_HITCH_DIAG)
@@ -173,6 +181,9 @@
 #endif
 #if (OPT_SS_FLIP_COARSE && !OPT_SS_INACTIVE_BUILD)
     .error "OPT_SS_FLIP_COARSE needs OPT_SS_INACTIVE_BUILD (it publishes the page that builder prepares)"
+#endif
+#if (OPT_SS_ALLOW_PENDING_LIVE_FLIP && !OPT_SS_FLIP_COARSE)
+    .error "OPT_SS_ALLOW_PENDING_LIVE_FLIP needs OPT_SS_FLIP_COARSE (it relaxes reason 1 only for the flip path)"
 #endif
 
 #if OPT_BG_COARSE_EXTENDED_DEADLINE
@@ -6049,15 +6060,44 @@ prepareBackgroundCoarse:
 !haveRequest:
     lda #0
     sta BG_COARSE_PENDING
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    sta SS_PLF_BYPASSED                     // 4F: fresh admit attempt
+#endif
     // Same three gate checks, same order, same decision -- each failing branch
     // first records its reason, then joins the common !defer path.
     ldx RASTER_BATCH_OFFSET
     cpx RASTER_BATCH_END
     bcs !gateBeam+                          // Variable sprite IRQ/collision work has no place in this copy budget.
-    inc COARSE_DEFER_LIVE
+    // ---- reason 1: a LIVE reuse batch is still outstanding ----
+    inc COARSE_DEFER_LIVE                   // historical "reason-1 fired" diagnostic (== would-have-deferred)
     bne !dLiveHi+
     inc COARSE_DEFER_LIVE + 1
 !dLiveHi:
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // 4F: the prepared-page flip path touches NO sprite hardware and NO batch
+    // state, so a pending LIVE batch need not block it -- but ONLY if the flip is
+    // actually valid this frame. Inlined core-ready check (state==2 && valid &&
+    // ptr-mirrored); no jsr, no extra counter on the common non-ready fall-through.
+    lda SS_BUILD_STATE
+    cmp #2
+    bne !reason1Defer+
+    lda SS_INACTIVE_VALID
+    beq !reason1Defer+
+    lda SS_PTR_MIRROR_READY
+    beq !reason1Defer+
+    inc SS_PENDING_LIVE_FLIP_ATTEMPT        // reason 1 bypassed for the flip path
+    bne !pla1+
+    inc SS_PENDING_LIVE_FLIP_ATTEMPT + 1
+!pla1:
+    lda #1
+    sta SS_PLF_BYPASSED                     // legacy fallback below must NOT run with a pending batch
+    jmp !gateBeam+                          // skip reason 1; reasons 2 and 3 still apply
+!reason1Defer:
+    inc SS_WOULD_DEFER_LIVE                 // reason 1 fired AND the flip was not ready -> a genuine defer
+    bne !wdl1+
+    inc SS_WOULD_DEFER_LIVE + 1
+!wdl1:
+#endif
     lda #1
     sta COARSE_LAST_REASON
     jmp !defer+
@@ -6148,6 +6188,23 @@ prepareBackgroundCoarse:
 #endif
     rts
 !legacyCoarsePath:
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // 4F: a reason-1 bypass whose flip prereq (tag) then failed must NOT run the
+    // legacy in-window mutation -- there IS a pending LIVE batch. Defer instead;
+    // the builder re-tags within a cycle and the next attempt flips.
+    lda SS_PLF_BYPASSED
+    beq !lcpNotBypassed+
+    lda #0
+    sta SS_PLF_BYPASSED
+    inc SS_PLF_TAG_DEFER
+    bne !lcpTd+
+    inc SS_PLF_TAG_DEFER + 1
+!lcpTd:
+    lda #1
+    sta COARSE_LAST_REASON
+    jmp !defer+
+!lcpNotBypassed:
+#endif
     inc SS_LEGACY_COARSE_PATH_COUNT
     bne !lcpHi+
     inc SS_LEGACY_COARSE_PATH_COUNT + 1
@@ -7209,6 +7266,38 @@ SS_TURRET_RECONCILE_MAX:  .byte 0    // max slots touched in a single reconcile
 SS_D018_RASTER:           .byte 0    // raster low byte at the last $D018 flip write
 ssFlipStatsEnd:
 
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+// Stage 4F: reason-1 relaxation state + counters (see prepareBackgroundCoarse).
+SS_PAGEB_ACTIVE:             .byte 0  // $80 <=> $D018 selects page B now; read by the raster-IRQ batch
+SS_PLF_BYPASSED:              .byte 0  // this admit attempt skipped reason 1 (cleared each attempt)
+SS_PLF_PUBLISH_PENDING:       .byte 0  // the armed flip was a reason-1 bypass (consumed by ssPublishCoarseFlip)
+ssPlfStats:
+SS_WOULD_DEFER_LIVE:          .word 0  // times reason 1 WOULD have deferred (a pending LIVE batch was outstanding)
+SS_PENDING_LIVE_FLIP_ATTEMPT: .word 0  //   ... subset where the flip was core-ready -> reason 1 bypassed
+SS_PENDING_LIVE_FLIP_ADMIT:   .word 0  //   ... subset that then passed reasons 2/3 + tag and admitted a flip
+SS_PENDING_LIVE_FLIP_PUBLISH: .word 0  //   ... subset whose ssPublishCoarseFlip actually ran the $D018 flip
+SS_PLF_TAG_DEFER:             .word 0  // reason-1 bypass whose tag then failed -> safe defer (no legacy mutation)
+ssPlfStatsEnd:
+
+// --- Routine: ssFlipCoreReady ---------------------------------------------
+// C=1 iff the inactive page is complete + valid + pointer-mirrored. NO side
+// effects (no counter bumps) -- the reason-1 bypass peeks with this; the real
+// ssFlipPrereqOK (with the tag check + fail counters) still runs at !admitDecided.
+ssFlipCoreReady:
+    lda SS_BUILD_STATE
+    cmp #2
+    bne !no+
+    lda SS_INACTIVE_VALID
+    beq !no+
+    lda SS_PTR_MIRROR_READY
+    beq !no+
+    sec
+    rts
+!no:
+    clc
+    rts
+#endif
+
 // --- Routine: ssFlipCoarseReset ------------------------------------------------
 // From ssInactiveBuildReset (initBackground): drop a pending flip + zero the
 // 4E counters. Ptr-mirror-ready is also cleared (a fresh game re-mirrors).
@@ -7222,6 +7311,19 @@ ssFlipCoarseReset:
     sta ssFlipStats,x
     dex
     bpl !clr-
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    lda #0
+    sta SS_PAGEB_ACTIVE
+    sta SS_PLF_BYPASSED
+    sta SS_PLF_PUBLISH_PENDING
+    ldx #(ssPlfStatsEnd - ssPlfStats - 1)
+!clrPlf:
+    sta ssPlfStats,x
+    dex
+    bpl !clrPlf-
+    lda #$07                             // a fresh game boots on page A
+    sta ssBatchPtrStore + 2
+#endif
     rts
 
 // --- Routine: ssFlipPrereqOK -------------------------------------------------
@@ -7292,12 +7394,41 @@ ssFlipNoteAdmit:
     bne !b+
     inc SS_FLIP_PATH_COUNT + 1
 !b:
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    lda SS_PLF_BYPASSED                     // 4F: was this admit a reason-1 bypass?
+    beq !notPlf+
+    lda #0
+    sta SS_PLF_BYPASSED
+    lda #1
+    sta SS_PLF_PUBLISH_PENDING              // ssPublishCoarseFlip will count the publish
+    inc SS_PENDING_LIVE_FLIP_ADMIT
+    bne !notPlf+
+    inc SS_PENDING_LIVE_FLIP_ADMIT + 1
+!notPlf:
+#endif
     rts
 
 // --- Routine: ssFlipMirrorPtrs -------------------------------------------------
-// Copy the live hardware sprite-pointer table $07F8..$07FF to the INACTIVE page's
-// own table (page base + $3F8). ~50 cy. Sets SS_PTR_MIRROR_READY.
+// Keep page B's hardware sprite-pointer table ($2BF8) equal to the live table
+// ($07F8). Called every frame (finishBackgroundCoarse) AFTER renderSprites, so
+// whichever page $D018 then selects has this frame's initial pointers.
+//   4E: mirrored $07F8 -> the INACTIVE page's +$3F8 (self-copy when B is active).
+//   4F: ALWAYS $07F8 -> $2BF8, so page B stays current for the whole time it is
+//   the displayed page (renderSprites still writes only $07F8). The raster-IRQ
+//   batch dual-writes $2BF8 for its own mid-frame reassignments.
+// ~50 cy. Sets SS_PTR_MIRROR_READY.
 ssFlipMirrorPtrs:
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    ldx #7
+!m:
+    lda $07f8,x
+    sta $2bf8,x                            // = BG_SPRITE_PTRS_B
+    dex
+    bpl !m-
+    lda #1
+    sta SS_PTR_MIRROR_READY
+    rts
+#else
     ldy BG_ACTIVE_PAGE
     lda #$07
     clc
@@ -7314,6 +7445,7 @@ ssFlipMirrorPtrs:
     lda #1
     sta SS_PTR_MIRROR_READY
     rts
+#endif
 
 // --- Routine: ssReconcileTurretsOnNewPage -----------------------------------
 // For every TURRET_POOL slot, put the CHARACTER cells of its 2x2 body on the
@@ -7491,6 +7623,17 @@ ssPublishCoarseFlip:
     lda BG_ACTIVE_PAGE
     eor #1
     sta BG_ACTIVE_PAGE
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    tax
+    lsr                                  // C = new BG_ACTIVE_PAGE bit0
+    lda #0
+    ror                                 // A = $80 (page B) or $00 (page A)
+    sta SS_PAGEB_ACTIVE
+    lda #$07                             // patch applyLiveRasterBatch's pointer store to the ACTIVE page
+    clc
+    adc ssActiveHiDelta,x                // $07 (page A) or $2B (page B)
+    sta ssBatchPtrStore + 2
+#endif
     inc SS_PAGE_SWAP_COUNT
     bne !s+
     inc SS_PAGE_SWAP_COUNT + 1
@@ -7499,6 +7642,16 @@ ssPublishCoarseFlip:
     sta SS_FLIP_PENDING
     lda #1
     sta SS_FLIP_HOLDOFF                   // keep the 4D build tick clear for this frame's build phase too
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    lda SS_PLF_PUBLISH_PENDING            // 4F: this flip was published over an outstanding LIVE batch
+    beq !notPlfPub+
+    lda #0
+    sta SS_PLF_PUBLISH_PENDING
+    inc SS_PENDING_LIVE_FLIP_PUBLISH
+    bne !notPlfPub+
+    inc SS_PENDING_LIVE_FLIP_PUBLISH + 1
+!notPlfPub:
+#endif
     rts
 #endif
 
@@ -7675,6 +7828,12 @@ hudBorderSetup:
 !slot:
     lda hudProofPtr,x
     sta HW_SPRITE_POINTER + HUD_SLOT_FIRST,x
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    bit SS_PAGEB_ACTIVE                    // 4F: also write page B only while it is displayed
+    bpl !hbsNoB+
+    sta $2bf8 + HUD_SLOT_FIRST,x
+!hbsNoB:
+#endif
     lda hudProofColour,x
     sta HW_SPRITE_COLOUR + HUD_SLOT_FIRST,x
     txa
@@ -7736,6 +7895,12 @@ hudBorderHandoff:
     tay                                    // y = LIVE_PLAN + x
     lda INITIAL_SPRITE,y
     sta HW_SPRITE_POINTER,x
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    bit SS_PAGEB_ACTIVE                    // 4F: also write page B only while it is displayed
+    bpl !hbhNoB+
+    sta $2bf8,x
+!hbhNoB:
+#endif
     lda INITIAL_COLOUR,y
     sta HW_SPRITE_COLOUR,x
     lda INITIAL_OBJECT,y

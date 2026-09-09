@@ -623,7 +623,14 @@ applyLiveRasterBatch:
 !assignment:
     ldx ASSIGN_SLOT,y
     lda ASSIGN_SPRITE,y
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+ssBatchPtrStore:
+    sta $07f8,x                            // 4F: hi byte self-modified to the ACTIVE page's pointer table
+                                           // ($07F8 / $2BF8) once per $D018 flip (main thread, IRQ armed but
+                                           // its batches not yet firing -> no race). ZERO per-assignment cost.
+#else
     sta HW_SPRITE_POINTER,x
+#endif
     lda ASSIGN_COLOUR,y
     sta HW_SPRITE_COLOUR,x
     txa

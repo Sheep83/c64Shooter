@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--trace', action='store_true')
     parser.add_argument('--stress', action='store_true', help='Accelerate the existing spawner through monitor data writes')
     parser.add_argument('--dense', action='store_true', help='Seed16 stationary legal objects producing8 closely spaced batches; keep real scrolling/main loop')
+    parser.add_argument('--y199', action='store_true', help='Stage 4F: 8 enemies Y=199 + player Y=235 (pending-LIVE reuse); keep real scrolling')
     parser.add_argument('--turret-playtest', action='store_true', help='Aim real player cannons at turret0 near a coarse transition and turret2 near bottom exit; capture subsequent wraps')
     parser.add_argument('--symbols', type=Path, default=Path('build/main.vs'))
     parser.add_argument('--out', type=Path, default=Path('build/scroll-test'))
@@ -107,13 +108,22 @@ def main():
     mon.cmd(f'break {sym["applyFineScroll"]:04x}')
     mon.cmd('x')
     mon.cmd('jpdb 1 ef')
-    if args.dense:
+    if args.dense or args.y199:
         def put(name, values):
             mon.cmd(f'> {sym[name]:04x} '+' '.join(f'{v:02x}' for v in values))
-        put('OBJECT_ACTIVE',[1]*16)
-        put('OBJECT_TYPE',[1]+[2]*15)
-        put('OBJECT_Y',list(range(100,129,4))+list(range(136,165,4)))
-        put('OBJECT_X',[24+32*(i%8) for i in range(16)])
+        if args.y199:
+            # Stage 4F fixture: 8 enemies at Y=199 + player at Y=235 -> a LIVE reuse
+            # batch outstanding around raster ~223 on every frame (the historical
+            # reason-1 / COARSE_DEFER_LIVE trigger). Real scrolling / main loop kept.
+            put('OBJECT_ACTIVE',[1]*9+[0]*7)
+            put('OBJECT_TYPE',[1]+[2]*8+[0]*7)
+            put('OBJECT_Y',[235]+[199]*8+[0]*7)
+            put('OBJECT_X',[80]+[40+24*i for i in range(8)]+[0]*7)
+        else:
+            put('OBJECT_ACTIVE',[1]*16)
+            put('OBJECT_TYPE',[1]+[2]*15)
+            put('OBJECT_Y',list(range(100,129,4))+list(range(136,165,4)))
+            put('OBJECT_X',[24+32*(i%8) for i in range(16)])
         put('OBJECT_X_MSB',[0]*16)
         put('OBJECT_SPRITE',[sym['blankSprite']//64]*16)
         put('OBJECT_PATH_TIMER',[255]*16)
