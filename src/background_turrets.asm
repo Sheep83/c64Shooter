@@ -523,6 +523,7 @@ positionBackgroundTurrets:
 !turret:
     lda #0
     sta TURRET_VISIBLE,x
+    sta TURRET_PAINT_ROW,x                  // presentation row; recomputed below when a body row is on screen
     lda TURRET_SLOT_AUTH,x
     bmi !next+
     lda TURRET_SLOT_ROW_LO,x                // rel(16) = (slotRow(16) - SCROLL_ROW(16)) mod SLR
@@ -553,8 +554,14 @@ positionBackgroundTurrets:
     lda TURRET_REL_HI
     bne !next+                              // rel >= 256 -> far below the aperture; not visible.
     lda TURRET_REL_LO
+    cmp #24
+    bcs !next+                              // rel >= 24: no body row on the aperture at all
+    clc                                     // rel 0..23 -> the top body pair sits on matrix row rel + 1,
+    adc #1                                  // exactly where installTurretRow / ssReconcileTurretSlot write it.
+    sta TURRET_PAINT_ROW,x                  // Colour follows the GLYPHS, not the combat gate below.
+    lda TURRET_REL_LO
     cmp #23
-    bcs !next+
+    bcs !next+                              // combat / sprite-Y projection only for rel 0..22
     asl
     asl
     asl
@@ -670,20 +677,17 @@ pulseTurretColour:
     stx TURRET_INDEX
     lda TURRET_SLOT_AUTH,x
     bmi !next+
-    lda TURRET_VISIBLE,x
-    beq !restoreOnly+
     lda TURRET_HEALTH,x
     beq !restoreOnly+
-    lda TURRET_Y,x                          // matrix row of the turret's top-left cell:
-    sec
-    sbc RASTER_DISPLAY_FINE                 //   (TURRET_Y - fine - 64) / 8 + 1  == relative row + 1
-    sbc #63                                 // carry still set from the previous sbc.
-    lsr
-    lsr
-    lsr
-    clc
-    adc #1
-    bne !haveRow+                           // (a visible turret is always matrix row >= 2)
+    // Colour follows the GLYPHS. TURRET_PAINT_ROW is rel + 1, the same matrix row
+    // installTurretRow / ssReconcileTurretSlot write the top body pair to, and is
+    // 0 only when no body row is on the aperture. This used to gate on
+    // TURRET_VISIBLE and re-derive the row from TURRET_Y, but TURRET_VISIBLE is a
+    // COMBAT predicate (full 16px body inside 72..231): a turret straddling the
+    // top or bottom aperture edge is still DRAWN, yet got no colour and rendered
+    // in flat terrain colour until its whole body was inside.
+    lda TURRET_PAINT_ROW,x
+    bne !haveRow+
 !restoreOnly:
     lda #0                                  // Nothing to paint this frame: only restore the old cells.
 !haveRow:
@@ -820,6 +824,15 @@ TURRET_FIRE_TIMER:      .fill TURRET_POOL,0
 TURRET_HIT_TIMER:       .fill TURRET_POOL,0
 TURRET_DEAD_RESTORED:   .fill TURRET_POOL,0    // 1 once the covered terrain codes are poked back
 TURRET_CRAM_ROW:        .fill TURRET_POOL,0
+// PRESENTATION row for the colour pulse: rel + 1 (the matrix row carrying the top
+// body pair), or 0 when no body row is on the aperture. Distinct from
+// TURRET_VISIBLE, which is a COMBAT predicate (full 16px body inside 72..231).
+// pulseTurretColour used to gate on TURRET_VISIBLE, so a turret whose glyphs ARE
+// drawn -- installTurretRow / ssReconcileTurretSlot gate only on AUTH + HEALTH --
+// but whose body straddles the top or bottom aperture edge got no colour at all
+// and rendered in flat terrain colour. See
+// /reports/four-turret-cluster-flicker-forensics.md
+TURRET_PAINT_ROW:       .fill TURRET_POOL,0
 TURRET_SLOT_AUTH:       .fill TURRET_POOL,0    // authored index in this slot; $ff = free
 TURRET_SLOT_ROW_LO:     .fill TURRET_POOL,0
 TURRET_SLOT_ROW_HI:     .fill TURRET_POOL,0

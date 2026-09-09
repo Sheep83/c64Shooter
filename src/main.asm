@@ -45,6 +45,63 @@
 //#define SOFT_EDGE_MASK
 
 // ============================================================================
+// STAGE 5A -- SCROLL EDGE MASK (supersedes SOFT_EDGE_MASK; see
+// /reports/stage5a-seamless-scroll-edge-masking.md).
+//
+// THE DEFECT (measured, Stage 5A objective 1). The 25-row VIC fetch puts matrix
+// row 0 at rasters 48+fine..55+fine and matrix row 24 at 240+fine..247+fine, so
+// the TERRAIN FIELD'S OUTER BOUNDARY IS AT RASTER 48+fine (top) AND 247+fine
+// (bottom). Both therefore walk down one raster per fine step and snap back up 7
+// rasters at each coarse 7->0 wrap -- an 8 px sawtooth on both edges at the
+// coarse cadence (~3.9 Hz). That boundary jump, not the terrain content, is the
+// visible "pop": the body 55..246 is temporally clean at every phase.
+//
+// THE FIX. Content at any FIXED raster is exactly continuous, including across
+// the coarse step (measured: rasters 56/120/200/246/247 all continuous). So the
+// cure is simply to present a FIXED aperture and hide everything outside it. The
+// normal RSEL=0 vertical border would do this for free (it covers <=54 / >=247),
+// but the top-border sprite HUD needs the vertical border FF held clear from the
+// previous frame, and the FF can only be cleared at raster 51/55 -- so it cannot
+// be closed over rasters 44..54 while the HUD is displayed at 23..43. The mask
+// therefore has to come from the graphics mode.
+//
+// MECHANISM. Outside the aperture the display is put into the VIC's INVALID text
+// mode (ECM=1 with MCM=1), whose sequencer output is black for both display and
+// idle state, whatever the matrix/charset/colour registers hold. That makes the
+// mask ONE register write -- a single store of a pre-computed $D011 -- instead of
+// the four ($D011+$D016+$D022+$D023) that SOFT_EDGE_MASK's grey ECM band needed
+// and could not fit in the ~22-cycle inter-g-access window. The band is black,
+// which matches the already-black side border ($D020 = 0), so the surround
+// becomes a uniform black letterbox rather than today's grey top/bottom strips.
+// Nothing else changes: badlines, c/g-accesses and therefore the whole raster
+// schedule are identical, sprites are unaffected (the HUD keeps its band), the
+// charset is NOT mutated, and only $D01E (sprite/sprite) is used for collision so
+// the foreground/background sequencer change cannot affect gameplay.
+//
+// TIMING. ECM=1 is part of GAMEPLAY_D011_BASE, so rasterFrameReset /
+// publishRasterPlan install the band state every frame; the body is opened by one
+// store at EDGE_MASK_BODY_RASTER (rasterDisplayHook, after the HUD handoff) and
+// closed again by one store at EDGE_MASK_BAND_RASTER (borderOpenHook, between its
+// two RSEL dodge writes). Both are reached by a 7-cycle `cmp RASTER / bcs` poll,
+// so the store lands at cycle ~6..12 of the target line -- before that line's
+// first g-access at cycle 16, and after the previous line's last at cycle 55.
+// Comment out to build exactly as Stage 4J.
+#define SCROLL_EDGE_MASK
+
+// Historical scroll hitch, Phase B(b). ON: the legacy in-window coarse fallback
+// executes against whichever screen page is displayed, so the coarse step always
+// completes. OFF: Phase B(a) behaviour -- the page-B case is refused and deferred
+// (no corruption, but the terrain can stall for many frames while the starved
+// inactive-page builder catches up). The refuse-and-defer code remains compiled
+// in either way as the out-of-range safety net.
+// See /reports/historical-scroll-hitch-phase-b-page-aware-fallback.md
+#define LEGACY_FALLBACK_PAGE_AWARE
+
+#if (SCROLL_EDGE_MASK && SOFT_EDGE_MASK)
+    .error "SCROLL_EDGE_MASK supersedes SOFT_EDGE_MASK -- enable only one"
+#endif
+
+// ============================================================================
 // SCROLL-HITCH STAGE 0/1 (Astra review follow-up). Three independent toggles,
 // separate from the SOFT_EDGE_MASK experiment above. See
 // /reports/scroll-hitch-stage0-stage1-baseline-and-low-risk-optimisations.md.
@@ -260,7 +317,45 @@
 // seamless extension of $D021. The palette constants come from the level-config
 // import further down; the scheduler code (imported later still) uses them directly.
 #else
+#if SCROLL_EDGE_MASK
+// Stage 5A: ECM=1 is the whole-frame BAND state, so every $D011 install
+// (rasterFrameReset, publishRasterPlan) leaves the display masked; the body is
+// opened by a single store at EDGE_MASK_BODY_RASTER and re-masked at
+// EDGE_MASK_BAND_RASTER. MCM stays 1 throughout, so ECM=1 is the invalid text
+// mode -> black. BMM stays 0.
+.const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3)   // DEN=1, RSEL; YSCROL added at runtime. NO ECM here --
+                                                        // see EDGE_MASK_D011_BAND below.
+// Stage 5B -- DISPLAY-STATE OWNERSHIP. The band bit is deliberately NOT part of
+// GAMEPLAY_D011_BASE. That constant is also ORed into $D011 by `init` to build
+// the GLOBAL boot display state, so putting ECM in it leaked the gameplay mask
+// into every non-gameplay screen from power-on: the attract/title and high-score
+// starfield draw with char codes 240..251, ECM masks a code to 6 bits, and
+// 240..251 & 63 = 48..59 -- the ROM digit glyphs. That both replaced the stars
+// with cycling digits AND destroyed their smooth motion, because the four glyph
+// phases 240..243 (the star's 2-pixel sub-row steps) collapse to '0','1','2','3'
+// so only the whole-row STAR_Y step remained. See
+// /reports/stage5b-display-state-containment.md.
+// The band bit is therefore owned SOLELY by the gameplay raster chain:
+// rasterFrameReset ORs it in at line 1 (that chain only runs while the gameplay
+// IRQ is installed), the mask event clears it at EDGE_MASK_BODY_RASTER, and
+// borderOpenHook re-sets it at EDGE_MASK_BAND_RASTER. endGame tears the chain
+// down and clears the bit, so no non-gameplay state can ever inherit it.
+.const EDGE_MASK_D011_BAND = $40                        // ECM; with MCM=1 this is the invalid text mode -> black.
+// First raster of the clean fixed aperture (ECM cleared here). Must be strictly
+// AFTER hudBorderHandoff's last write. Measured entry raster of the mask block:
+// 49..50 (--stress), 49..57 (authored wave, p99 56). The badline path below has
+// to arrive two lines earlier still, so 60 gives it ~2 lines of margin over the
+// observed worst case and the normal path ~3. EDGE_MASK_LATE / EDGE_MASK_FALLBACK
+// count any frame that still entered late; both must stay 0. Raising this costs
+// one raster of aperture each.
+.const EDGE_MASK_BODY_RASTER = 58
+// First masked raster at the bottom. Row 24's last continuity-relevant g-access
+// is raster 247; raster 248 is the first that alternates terrain/idle with fine,
+// and is never a badline (the badline range ends at 247).
+.const EDGE_MASK_BAND_RASTER = 248
+#else
 .const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3)   // DEN=1, RSEL per toggle, YSCROL added at runtime.
+#endif
 #endif
 
 // ============================================================================
@@ -278,7 +373,14 @@
 .const HUD_SLOT_FIRST      = 4          // HUD owns hardware sprite slots 4..7.
 .const HUD_SPRITE_COUNT    = 4
 .const HUD_Y               = 22         // sprite Y (body raster 22..42); clear of clean terrain @55.
+#if SCROLL_EDGE_MASK
+// Stage 5A review: fire the handoff as early as is safe (the HUD sprites' last
+// displayed line is 43, fetched at the end of line 42), so the mask line -- and
+// with it the top of the fixed aperture -- can sit at 57 instead of 60.
+.const HUD_HANDOFF_RASTER  = 43         // DISPLAY event line: re-arm slots 4..7 for gameplay here.
+#else
 .const HUD_HANDOFF_RASTER  = 46         // DISPLAY event line: re-arm slots 4..7 for gameplay here.
+#endif
 // hudBorderHandoff ENTERS at raster ~46-49 but its per-slot reclaim writes finish
 // as late as raster ~55 (measured, capF timing.log: last hudSlotReclaimed p50 53,
 // max 55; rasterDisplayRestored max 56). buildBatchSpriteSchedule must not mark an
@@ -424,6 +526,9 @@
 .if (BG_SCREEN_B < $0400 || (BG_SCREEN_B + $400) > $4000) {
     .error "BG_SCREEN_B must lie inside VIC bank 0"
 }
+// Phase B(b): page-B coarse routines. Top of the $6600..$87ff CPU-only region,
+// so the level's stage tables below keep maximum headroom. ~370 bytes.
+.const LEGACY_PAGEB_SEGMENT       = $8640
 #if OPT_SS_RELOCATE
 // 4A: the CPU-only occupants of $2700..$2EFF move here (outside VIC bank 0,
 // always-RAM $8000-$9FFF region; the VIC in bank 0 never fetches from here).
@@ -991,7 +1096,7 @@ endGame:
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
 
     lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
-#if SOFT_EDGE_MASK
+#if (SOFT_EDGE_MASK || SCROLL_EDGE_MASK)
     and #%00111000                          // OVER/menu. Also clear bit 6 (ECM): the soft-edge mask may
 #else
     and #%11111000                          // OVER/menu - the gameplay display event may have
@@ -3950,6 +4055,15 @@ rasterInitialMasksApplied:
 // --- Routine: armFirstBatch -------------------------------------------------
 // Publish LIVE_PLAN into the shared physical-frame event chain.
 armFirstBatch:
+#if OPT_SS_FLIP_COARSE
+    jsr ssFlipMirrorPtrs                    // Publication-race repair: mirror BEFORE this routine arms the sprite
+                                             // IRQ. renderSprites (the immediately preceding call) has just written
+                                             // this frame's entire initial plan to $07F8, and no LIVE batch can have
+                                             // fired yet, so the copy can never stamp a stale plan over a newer
+                                             // batch pointer in $2BF8. It previously ran at the tail of
+                                             // finishBackgroundCoarse -- AFTER arming -- so on a late main-thread
+                                             // frame a batch could publish $2BF8 first and the mirror clobbered it.
+#endif
     sei                                     // Publish only a complete LIVE plan.
     jsr publishRasterPlan
     cli
@@ -4536,7 +4650,12 @@ spritePointers:
     .byte enemySpriteA / 64             // Object 15
 
 // --- Read-only engine lookup tables ----------------------------------------
-* = $1f00
+// Base was $1f00 until the sprite-pointer publication-race repair added a call
+// at armFirstBatch's entry and the main code block reached $1f01. These are
+// alignment-free read-only tables and the block below still ends far short of
+// the $1fc0 border-marker sprite, so the origin simply moves up.
+.const ENGINE_LOOKUP_SEGMENT = $1f20
+* = ENGINE_LOOKUP_SEGMENT
 HW_BIT_MASK:
     .byte %00000001,%00000010,%00000100,%00001000
     .byte %00010000,%00100000,%01000000,%10000000
@@ -6025,6 +6144,11 @@ copyIncomingRowToScreen:
     lda starRowLo,y
     sta TEXT_DST
     lda starRowHi,y
+#if OPT_SECOND_SCREEN
+    ldy BG_ACTIVE_PAGE                      // B(b): the incoming row belongs to the DISPLAYED page
+    clc
+    adc ssActiveHiDelta,y
+#endif
     sta TEXT_DST + 1
 
     ldy #39
@@ -6230,20 +6354,77 @@ prepareBackgroundCoarse:
     jmp !defer+
 !lcpNotBypassed:
 #endif
-    inc SS_LEGACY_COARSE_PATH_COUNT
-    bne !lcpHi+
-    inc SS_LEGACY_COARSE_PATH_COUNT + 1
-!lcpHi:
-    inc SS_FLIP_FALLBACK
+    inc SS_FLIP_FALLBACK                    // legacy fallback REACHED (attempts = executions + page-B blocks)
     bne !lcpHi2+
     inc SS_FLIP_FALLBACK + 1
 !lcpHi2:
+    // ---- Phase B(b): page-aware legacy fallback ------------------------------
+    // The in-window coarse path below is fixed-address SINGLE-SCREEN code:
+    // saveCrossingRow / shiftBackgroundUpper / shiftBackgroundLower /
+    // restoreCrossingRow all target BG_SCREEN_A ($0400), and
+    // renderStageRowToScreen's row-0 write did too. Running that with page B
+    // displayed left the VISIBLE matrix untouched while SCROLL_ROW advanced and
+    // SCROLL_FINE reset: a ~7px backward snap plus a permanent one-row
+    // display/logic desync that the next flip turned into a duplicated turret
+    // body. Measured 10/10 page-B events produced a visible freeze, 0/9 page-A.
+    //
+    // B(a) refused the page-B case and deferred. That removed the corruption but
+    // stalled the terrain for up to 36 frames while the starved builder caught
+    // up. B(b) instead executes the SAME coarse step against whichever page is
+    // displayed, so the step always completes. SS_LEGACY_PAGE latches the page
+    // for the upper half so finishBackgroundCoarse's lower half cannot disagree
+    // with it. See /reports/historical-scroll-hitch-phase-b-page-aware-fallback.md
+    lda BG_ACTIVE_PAGE
+    sta SS_LEGACY_PAGE                      // latched for the lower half next frame
+    beq !lcpPageA+                          // 0 = page A displayed
+#if LEGACY_FALLBACK_PAGE_AWARE
+    cmp #1
+    bne !lcpBadPage+                        // defensive: page value must be 0 or 1
+    inc SS_LEGACY_PAGEB_EXEC                // legacy path EXECUTED against page B
+    bne !lcpHi+
+    inc SS_LEGACY_PAGEB_EXEC + 1
+    jmp !lcpHi+
+!lcpBadPage:
+#endif
+    // Safety net (also the whole behaviour when LEGACY_FALLBACK_PAGE_AWARE is
+    // off): refuse and take the ordinary defer -- no matrix write, no SCROLL_ROW,
+    // no SCROLL_FINE, no VIC phase change; retried next frame.
+    inc SS_LEGACY_PAGEB_BLOCK
+    bne !lcpBlkHi+
+    inc SS_LEGACY_PAGEB_BLOCK + 1
+!lcpBlkHi:
+    inc SS_LEGACY_BLOCK_STREAK
+    lda SS_LEGACY_BLOCK_STREAK
+    cmp SS_LEGACY_BLOCK_STREAK_MAX
+    bcc !lcpBlkNoMax+
+    sta SS_LEGACY_BLOCK_STREAK_MAX
+!lcpBlkNoMax:
+#if SCROLL_HITCH_DIAG
+    lda #4                                  // reason 4: legacy fallback refused, page B active
+    sta COARSE_LAST_REASON
+#endif
+    jmp !defer+
+!lcpPageA:
+    inc SS_LEGACY_COARSE_PATH_COUNT         // legacy path EXECUTED against page A
+    bne !lcpHi+
+    inc SS_LEGACY_COARSE_PATH_COUNT + 1
+!lcpHi:
+    lda #0
+    sta SS_LEGACY_BLOCK_STREAK              // a completed coarse step ends any refusal streak
 #endif
 !waitRead:
     lda RASTER
     cmp #160
     bcc !waitRead-
 
+#if OPT_SS_FLIP_COARSE
+    lda SS_LEGACY_PAGE                      // B(b): operate on the DISPLAYED page
+    beq !lcpUpperA+
+    jsr saveCrossingRowB                    // Capture old row 12 before the shift below overwrites it.
+    jsr shiftBackgroundUpperB
+    jmp bgUpperCopied
+!lcpUpperA:
+#endif
     jsr saveCrossingRow                     // Capture old row 12 before the shift below overwrites it.
     jsr shiftBackgroundUpper
 bgUpperCopied:
@@ -6322,16 +6503,20 @@ finishBackgroundCoarse:
     beq !done+
     lda #0
     sta BG_COARSE_FINISH
+#if OPT_SS_FLIP_COARSE
+    lda SS_LEGACY_PAGE                      // B(b): same page the upper half used
+    beq !lcpLowerA+
+    jsr shiftBackgroundLowerB
+    jsr restoreCrossingRowB
+    jmp bgLowerReady
+!lcpLowerA:
+#endif
     jsr shiftBackgroundLower
     jsr restoreCrossingRow
 bgLowerReady:
 !done:
-#if OPT_SS_FLIP_COARSE
-    jmp ssFlipMirrorPtrs                    // 4E Option B: keep the INACTIVE page's $3F8 pointer table current
-                                             // every frame so it is ready the instant it becomes ACTIVE (ends rts).
-#else
-    rts
-#endif
+    rts                                     // 4E Option B mirror moved to armFirstBatch's entry (see there); the
+                                             // row shifts above never reach $07e8-$07ff / the pointer table.
 
 // --- Routine: planCoarseBulletSuppression --------------------------------
 // PRESENTATION ONLY. Called after buildBatchSpriteSchedule and before
@@ -6824,7 +7009,16 @@ BACKGROUND_CONTROL_END:
 // ============================================================================
 // Stage 4 second-screen support (CPU-only, outside VIC bank 0).
 // ============================================================================
-* = $9900
+// Base was $9900 until the Phase B(a) page-B fallback gate grew the relocated
+// background-control block past $98fa. This block is CPU-only (no VIC alignment
+// requirement), so it simply starts higher; it still ends far below the BASIC
+// ROM at $a000. The assert below turns any future collision into a build error
+// naming the real constraint instead of a bare memory-overlap message.
+.const SS_STAGE4_BASE_ADDR = $9980
+.if (BACKGROUND_CONTROL_END > SS_STAGE4_BASE_ADDR) {
+    .error "Relocated background-control block overruns the Stage 4 second-screen block"
+}
+* = SS_STAGE4_BASE_ADDR
 ssStage4Base:
 
 BG_ACTIVE_PAGE:        .byte 0             // 0 = displaying page A ($0400), 1 = page B ($2800)
@@ -7308,6 +7502,19 @@ SS_PAGE_SWAP_COUNT:       .word 0    // BG_ACTIVE_PAGE toggles performed by ssPu
 SS_TURRET_RECONCILE_COUNT:.word 0    // turret pool slots touched by the reconcile (running total)
 SS_TURRET_RECONCILE_MAX:  .byte 0    // max slots touched in a single reconcile
 SS_D018_RASTER:           .byte 0    // raster low byte at the last $D018 flip write
+// Phase B(a) safe-fallback gate. SS_FLIP_FALLBACK now counts legacy-path ATTEMPTS;
+// SS_LEGACY_COARSE_PATH_COUNT counts the page-A subset actually EXECUTED, and
+// SS_LEGACY_PAGEB_BLOCK the page-B subset REFUSED (deferred instead). Invariant:
+// SS_FLIP_FALLBACK == SS_LEGACY_COARSE_PATH_COUNT + SS_LEGACY_PAGEB_BLOCK.
+SS_LEGACY_PAGEB_BLOCK:    .word 0    // legacy fallback refused (safety net / B(a) mode) -> safe defer
+SS_LEGACY_BLOCK_STREAK:   .byte 0    // consecutive such refusals since the last completed coarse step
+SS_LEGACY_BLOCK_STREAK_MAX: .byte 0  // longest such streak this game
+// Phase B(b). SS_FLIP_FALLBACK still counts ATTEMPTS; the three outcomes below
+// partition it: page-A execution, page-B execution, refusal.
+// Invariant: SS_FLIP_FALLBACK == SS_LEGACY_COARSE_PATH_COUNT
+//                              + SS_LEGACY_PAGEB_EXEC + SS_LEGACY_PAGEB_BLOCK.
+SS_LEGACY_PAGEB_EXEC:     .word 0    // legacy fallback executed against page B (B(b) path)
+SS_LEGACY_PAGE:           .byte 0    // page the upper half ran on; the lower half must match
 ssFlipStatsEnd:
 
 #if OPT_SS_ALLOW_PENDING_LIVE_FLIP
@@ -7428,6 +7635,8 @@ ssFlipPrereqOK:
 // prepareBackgroundCoarse calls this immediately after decrementing SCROLL_ROW
 // on the flip path (so it is charged to the same admit the legacy counters see).
 ssFlipNoteAdmit:
+    lda #0
+    sta SS_LEGACY_BLOCK_STREAK              // Phase B(a): a normal flip ends any page-B refusal streak
     lda #1
     sta SS_FLIP_PENDING
     inc SS_FLIP_ADMIT
@@ -7567,18 +7776,36 @@ ssReconcileTurretSlot:
     sta TURRET_CELL_ROW
     jmp !haveTop+
 !relHi:
-    lda TURRET_REL_LO                     // only rel == SLR-1 lands a body row on the new page
-    cmp #<(STAGE_LOGICAL_ROWS - 1)
-    beq !relHiLo+
-    rts
-!relHiLo:
+    // Matrix row m holds world row SCROLL_ROW + m - 1 (renderStageRowToScreen:
+    // BG_LOGICAL_ROW = SCROLL_ROW + BG_DEST_ROW - 1), so the top body row is
+    // ALWAYS rel + 1 -- including where rel wraps negative:
+    //   rel == SLR-1 (rel == -1): top matrix row 0,  bottom row 1
+    //   rel == SLR-2 (rel == -2): top above aperture, bottom row 0
+    // The old code collapsed both onto "top = -1, bottom = 0". That put the
+    // BOTTOM glyph pair in row 0 where the TOP pair belongs and left row 1 --
+    // the first fully visible aperture row -- as bare terrain for one whole
+    // coarse cycle as each turret scrolled in, and never handled rel == SLR-2 at
+    // all. installTurretRow (the legacy/render path) drives off BG_LOGICAL_ROW
+    // and always got this right, so the two publication paths disagreed: the
+    // visible top-edge glyph flickered between them turret by turret.
+    // See /reports/passive-top-row-turret-flicker-investigation.md
     lda TURRET_REL_HI
     cmp #>(STAGE_LOGICAL_ROWS - 1)
-    beq !aboveTop+
-    rts
-!aboveTop:
-    lda #$ff                              // top matrix row = -1 (above aperture); bottom = 0
+    bne !noBodyRow+
+    lda TURRET_REL_LO
+    cmp #<(STAGE_LOGICAL_ROWS - 1)
+    bne !tryAboveTop+
+    lda #0                                // rel == -1: top body IS matrix row 0
     sta TURRET_CELL_ROW
+    jmp !haveTop+
+!tryAboveTop:
+    cmp #<(STAGE_LOGICAL_ROWS - 2)
+    bne !noBodyRow+
+    lda #$ff                              // rel == -2: top matrix row -1 (above aperture); bottom = 0
+    sta TURRET_CELL_ROW
+    jmp !haveTop+
+!noBodyRow:
+    rts
 !haveTop:
     lda TURRET_INDEX
     asl
@@ -7769,6 +7996,7 @@ restoreCrossingRow:
     }
     rts                                     // 40 bytes: 320 cycles + RTS.
 
+
 // --- Authored wave triggers (relocated here; the pre-$1f00 code region is full)
 // When WAVE_TRIGGER_COUNT > 0 the stage supplies its own encounter timing: a
 // trigger fires the instant its authored world/logical row reaches the TOP edge
@@ -7883,10 +8111,16 @@ hudBorderSetup:
     lda hudProofPtr,x
     sta HW_SPRITE_POINTER + HUD_SLOT_FIRST,x
 #if OPT_SS_ALLOW_PENDING_LIVE_FLIP
-    bit SS_PAGEB_ACTIVE                    // 4F: also write page B only while it is displayed
-    bpl !hbsNoB+
+    // Publication-race repair: write page B UNCONDITIONALLY, not just while B is
+    // displayed. The old `bit SS_PAGEB_ACTIVE / bpl` gate kept $2BF8 current only
+    // for a page already on screen, but hudBorderSetup (raster ~2) and
+    // hudBorderHandoff (~45) straddle ssFlipMirrorPtrs's once-per-frame mirror
+    // (~23). While page A was displayed, $2BF8 therefore captured the HUD-era
+    // pointers from setup and never the gameplay pointers from handoff -- so the
+    // first frame after an A->B flip displayed HUD sprite images in every
+    // reclaimed slot. Page B is not fetched by the VIC while inactive, so this
+    // store is always safe, and it is CHEAPER than the gate it replaces.
     sta $2bf8 + HUD_SLOT_FIRST,x
-!hbsNoB:
 #endif
 #if OPT_SS_FLIP_COARSE && !OPT_SS_ALLOW_PENDING_LIVE_FLIP
     // 4H: Mode B has no SS_PAGEB_ACTIVE (that flag is 4F-only), but needs the
@@ -7965,10 +8199,7 @@ hudBorderHandoff:
     lda INITIAL_SPRITE,y
     sta HW_SPRITE_POINTER,x
 #if OPT_SS_ALLOW_PENDING_LIVE_FLIP
-    bit SS_PAGEB_ACTIVE                    // 4F: also write page B only while it is displayed
-    bpl !hbhNoB+
-    sta $2bf8,x
-!hbhNoB:
+    sta $2bf8,x                            // publication-race repair: unconditional (see hudBorderSetup)
 #endif
 #if OPT_SS_FLIP_COARSE && !OPT_SS_ALLOW_PENDING_LIVE_FLIP
     // 4H: same reasoning as hudBorderSetup above. Y is already live here
@@ -8108,6 +8339,84 @@ TERRAIN_CHARSET_END:
 // begins at $8800) is otherwise unused - no code or VIC-bank data lives here.
 // decodeStageCharacterRow reaches both tables through absolute / 16-bit-pointer
 // addressing, so their absolute placement is unconstrained below $A000.
+#if OPT_SS_FLIP_COARSE
+// ===========================================================================
+// Phase B(b): page-B counterparts of the four fixed-address coarse routines.
+//
+// Placed at the TOP of the $6600..$87ff region so the level's stage tables,
+// which grow downward-to-upward from $6600, keep the maximum possible headroom
+// (a full-budget 10x400 stage needs ~4 KB of stageMetatileRows).
+//
+// WHY NOT MIRROR-UNROLLED LIKE PAGE A: an unrolled copy of shiftBackgroundUpper
+// + shiftBackgroundLower + the two crossing-row routines is 6,004 bytes. It does
+// not fit here alongside a full-budget level, and $a000..$bfff is BASIC ROM (the
+// program never writes $01, so that RAM is not reachable). Indexed addressing
+// costs at minimum 9 cycles/byte (lda abs,x 4 + sta abs,x 5) against page A's 8,
+// so these are unrolled 8-deep to amortise the loop arithmetic down to ~10.4
+// cycles/byte -- ~21% slower than page A for ~1/13th of the code.
+//
+// The page-A routines are UNTOUCHED and keep their exact bytes and cycle count.
+//
+// Both shifts move a contiguous block DOWN one row (dst = src + 40), so bytes
+// MUST be processed from the top downward or a source byte is clobbered before
+// it is read. Chunks are <= 240 bytes (8-bit index) and are emitted
+// highest-chunk-first; within a chunk X descends by 8 and the 8 unrolled pairs
+// descend too, so the whole traversal is strictly descending.
+// ===========================================================================
+* = LEGACY_PAGEB_SEGMENT
+legacyPageBBase:
+
+// Copy `len` bytes from BG_SCREEN_B+src down-shifted by one row (dst = src + 40).
+.macro ssShiftChunkB(src, len) {
+        ldx #len - 8
+    !c:
+        .for (var k = 7; k >= 0; k--) {
+            lda BG_SCREEN_B + src + k, x
+            sta BG_SCREEN_B + src + 40 + k, x
+        }
+        txa
+        sec
+        sbc #8
+        tax
+        bcs !c-
+}
+
+// rows 1..12 <- rows 0..11 : 480 bytes at offset 0. Chunks 240..479 then 0..239.
+shiftBackgroundUpperB:
+    ssShiftChunkB(240, 240)
+    ssShiftChunkB(0, 240)
+    rts
+
+// rows 14..24 <- rows 13..23 : 440 bytes at offset 520. Chunks 760..959 then 520..759.
+shiftBackgroundLowerB:
+    ssShiftChunkB(13 * 40 + 240, 200)
+    ssShiftChunkB(13 * 40, 240)
+    rts
+
+saveCrossingRowB:
+    ldx #39
+!c:
+    lda BG_SCREEN_B + 12 * 40, x
+    sta BG_CROSSING_ROW, x
+    dex
+    bpl !c-
+    rts
+
+restoreCrossingRowB:
+    ldx #39
+!c:
+    lda BG_CROSSING_ROW, x
+    sta BG_SCREEN_B + 13 * 40, x
+    dex
+    bpl !c-
+    rts
+
+legacyPageBEnd:
+.if (legacyPageBEnd > $8800) {
+    .error "Phase B(b) page-B coarse routines collide with the background turret segment ($8800)"
+}
+#endif
+
 * = $6600
 #import "generated/level1/stage_test.asm"
 .if (METATILE_DEFS_END - metatileDefs != METATILE_DEF_COUNT * METATILE_W * METATILE_H) {
@@ -8117,9 +8426,15 @@ TERRAIN_CHARSET_END:
     .error "STAGE_METATILE_ROWS disagrees with the generated stageMetatileRows byte count"
 }
 STAGE_TEST_END:
+#if OPT_SS_FLIP_COARSE
+.if (STAGE_TEST_END > LEGACY_PAGEB_SEGMENT) {
+    .error "Metatile stage data collides with the Phase B(b) page-B coarse routines"
+}
+#else
 .if (STAGE_TEST_END > $8800) {
     .error "Metatile stage data collides with the background turret segment ($8800)"
 }
+#endif
 .if (STAGE_TEST_END > $a000) {
     .error "Test stage assets overlap BASIC ROM"
 }
@@ -8249,6 +8564,11 @@ bgConsumePredecodedRow:
     lda starRowLo,y
     sta TEXT_DST
     lda starRowHi,y
+#if OPT_SECOND_SCREEN
+    ldy BG_ACTIVE_PAGE                      // B(b): stage the row onto the DISPLAYED page
+    clc
+    adc ssActiveHiDelta,y
+#endif
     sta TEXT_DST + 1
     ldy #39
 !hitCopy:

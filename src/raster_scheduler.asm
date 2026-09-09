@@ -24,6 +24,9 @@
 // region.
 // ============================================================================
 .const RASTER_EVENT_BORDER  = 3
+#if SCROLL_EDGE_MASK
+.const RASTER_EVENT_MASK    = 4             // Stage 5A review: aperture-open as a first-class raster event.
+#endif
 .const RASTER_BORDER_LINE   = 240           // IRQ compare; the hook then polls to 243 / 250.
 .const BORDER_MARKER_SLOT   = 7             // Diagnostic only; see report for why this slot is safe.
 .const BORDER_MARKER_X      = 160
@@ -31,6 +34,18 @@
 .const BORDER_MARKER_COLOUR = 1             // Solid white block ($D02E for slot 7; bitmap is all %11).
 
 initRasterScheduler:
+#if SCROLL_EDGE_MASK
+    // Stage 5B: ESTABLISH the gameplay band here, at the single gameplay-entry
+    // point (called only from startGame), so the very first presented frame is
+    // already masked. publishRasterPlan only PRESERVES the band, and on frame 1
+    // it can run before the first rasterFrameReset -- without this the first
+    // frame of every game would render with the edges unmasked. endGame clears
+    // the bit again, so ownership stays strictly inside gameplay.
+    lda VIC_CONTROL_1
+    ora #EDGE_MASK_D011_BAND
+    and #%01111111                          // never write the raster-compare MSB
+    sta VIC_CONTROL_1
+#endif
     lda #1
     sta $dc0d                               // Suspend KERNAL timer-A IRQ only; the timer/random source keeps running.
     lda #0
@@ -39,8 +54,14 @@ initRasterScheduler:
     sta RASTER_STATE_BEGIN,x
     dex
     bpl !clear-
+#if SCROLL_EDGE_MASK
+    lda #2                                  // 2 = HUD handoff still due, 1 = aperture-open still due, 0 = done.
+    sta RASTER_DISPLAY_PENDING
+    lda #1
+#else
     lda #1
     sta RASTER_DISPLAY_PENDING
+#endif
 #if BORDER_PROOF_ENABLE
     sta RASTER_BORDER_PENDING
 #endif
@@ -80,9 +101,17 @@ publishRasterPlan:
     sta IRQ_VECTOR
     lda #>multiplexIRQ
     sta IRQ_VECTOR + 1
+#if SCROLL_EDGE_MASK
+    lda VIC_CONTROL_1                        // PRESERVE the live band/body state -- forcing the band here would
+    and #EDGE_MASK_D011_BAND                 // black the frame if this ever ran after the aperture had opened,
+    ora RASTER_DISPLAY_FINE                  // and forcing the body would unmask the top band.
+    ora #GAMEPLAY_D011_BASE
+    sta VIC_CONTROL_1
+#else
     lda RASTER_DISPLAY_FINE                 // publishRasterPlan runs every frame (armFirstBatch) at ~line 17,
     ora #GAMEPLAY_D011_BASE                 // before the first badline: install the SAME whole-frame display
     sta VIC_CONTROL_1                        // state as rasterFrameReset (RSEL=1, DEN=1, YSCROL=presented fine;
+#endif
                                             // compare high always 0) so it never clobbers the fine phase.
     lda #1
     sta IRQ_STATUS
@@ -152,17 +181,31 @@ rasterIRQ:
 #endif
     lda RASTER_EVENT
     beq rasterFrameReset
+#if SCROLL_EDGE_MASK
+    cmp #RASTER_EVENT_SPRITES
+    beq !batchIrq+
+#endif
     cmp #RASTER_EVENT_DISPLAY
     beq !display+
 #if BORDER_PROOF_ENABLE
     cmp #RASTER_EVENT_BORDER
     beq !border+
 #endif
+#if SCROLL_EDGE_MASK
+    cmp #RASTER_EVENT_MASK
+    beq !mask+
+!batchIrq:
+#endif
     jsr applyLiveRasterBatch
     jmp !next+
 #if BORDER_PROOF_ENABLE
 !border:
     jsr borderOpenHook
+    jmp !next+
+#endif
+#if SCROLL_EDGE_MASK
+!mask:
+    jsr edgeMaskOpenHook
     jmp !next+
 #endif
 !display:
@@ -180,6 +223,11 @@ rasterFrameReset:
     // RSEL 1->0 lower-border dodge. DEN=1, RSEL=1, raster-compare MSB stays 0.
     lda RASTER_DISPLAY_FINE
     ora #GAMEPLAY_D011_BASE
+#if SCROLL_EDGE_MASK
+    ora #EDGE_MASK_D011_BAND                 // Stage 5B: the band is established HERE, inside the gameplay raster
+                                             // chain, not in the shared base constant -- so it cannot be inherited
+                                             // by init/menu/high-score/GAME OVER. Cleared again at the aperture.
+#endif
     sta VIC_CONTROL_1                        // Every physical frame, including replay with main still building.
 #if HUD_PROOF_ENABLE
     jsr hudBorderSetup                       // program HUD slots 4..7 at line 1, before their DMA (~raster HUD_Y-1)
@@ -201,8 +249,14 @@ rasterFrameReset:
     lda #0
     sta RASTER_EXPECTED_ASSIGNMENTS
     sta RASTER_ASSIGNMENTS_DONE
+#if SCROLL_EDGE_MASK
+    lda #2                                  // 2 = HUD handoff still due, 1 = aperture-open still due, 0 = done.
+    sta RASTER_DISPLAY_PENDING
+    lda #1
+#else
     lda #1
     sta RASTER_DISPLAY_PENDING
+#endif
 #if BORDER_PROOF_ENABLE
     sta RASTER_BORDER_PENDING               // Re-arm the terminal border event every physical frame.
 #endif
@@ -262,7 +316,16 @@ dispatchRasterEvents:
     lda BATCH_RASTER,x
     sta RASTER_TARGET
     lda RASTER_DISPLAY_PENDING
-    beq !sprite+
+    beq !sprite+                            // (unchanged cost per dispatch once both phases are done)
+#if SCROLL_EDGE_MASK
+    cmp #1
+    bne !dispPhase+
+    jsr edgeMaskArmLine                     // A = arm line for this phase
+    cmp RASTER_TARGET
+    bcc !mask+
+    jmp !sprite+
+!dispPhase:
+#endif
     lda #RASTER_DISPLAY_LINE
     cmp RASTER_TARGET
     bcc !display+
@@ -272,7 +335,15 @@ dispatchRasterEvents:
     jmp !current+
 !noBatch:
     lda RASTER_DISPLAY_PENDING
+#if SCROLL_EDGE_MASK
+    beq !noDisp2+
+    cmp #1
+    beq !mask+
+    jmp !display+
+!noDisp2:
+#else
     bne !display+
+#endif
 #if BORDER_PROOF_ENABLE
     lda RASTER_BORDER_PENDING               // Terminal border event: after every sprite batch AND the
     bne !border+                            // display hook, before the epoch/frame-zero transition.
@@ -290,6 +361,28 @@ dispatchRasterEvents:
     lda #RASTER_EVENT_BORDER
     sta RASTER_EVENT
     jmp !current+
+#endif
+#if SCROLL_EDGE_MASK
+!mask:
+    jsr edgeMaskArmLine
+    sta RASTER_TARGET
+    lda #RASTER_EVENT_MASK
+    sta RASTER_EVENT
+    // Own arm/serve decision: the hook re-polls to its exact line anyway, so a
+    // near or past target is simply served now -- WITHOUT counting it as a
+    // RASTER_CATCHUPS event (that metric is a scheduler-health signal for sprite
+    // batches, and the generic !due path was inflating it ~100x here).
+    lda VIC_CONTROL_1
+    bmi !service+
+    lda RASTER
+    clc
+    adc #3
+    bcs !service+
+    cmp RASTER_TARGET
+    bcs !service+
+    lda RASTER_TARGET
+    sta RASTER
+    rts
 #endif
 !display:
     lda #RASTER_DISPLAY_LINE
@@ -322,14 +415,28 @@ dispatchRasterEvents:
     inc RASTER_CATCHUPS + 1
 !service:
     lda RASTER_EVENT
+#if SCROLL_EDGE_MASK
+    cmp #RASTER_EVENT_SPRITES               // batches first: the catch-up chain must not pay for the new event
+    beq !batch+
+#endif
     cmp #RASTER_EVENT_DISPLAY
     beq !hook+
 #if BORDER_PROOF_ENABLE
     cmp #RASTER_EVENT_BORDER
     beq !borderHook+
 #endif
+#if SCROLL_EDGE_MASK
+    cmp #RASTER_EVENT_MASK
+    beq !maskHook+
+#endif
+!batch:
     jsr applyLiveRasterBatch
     jmp !select-
+#if SCROLL_EDGE_MASK
+!maskHook:
+    jsr edgeMaskOpenHook
+    jmp !select-
+#endif
 #if BORDER_PROOF_ENABLE
 !borderHook:
     // Scheduler-level hardening (residual whole-border flicker). borderOpenHook's
@@ -371,8 +478,12 @@ dispatchRasterEvents:
 // RASTER_DISPLAY_NORMAL / RASTER_DISPLAY_LATE remain declared for capture-tool
 // symbol parity.
 rasterDisplayHook:
+#if SCROLL_EDGE_MASK
+    dec RASTER_DISPLAY_PENDING              // 2 -> 1: the aperture-open phase is still due
+#else
     lda #0
     sta RASTER_DISPLAY_PENDING
+#endif
 #if HUD_PROOF_ENABLE
     jsr hudBorderHandoff
 #endif
@@ -413,6 +524,115 @@ rasterDisplayHook:
 rasterDisplayRestored:
 rasterBadlineRestored:
     rts
+
+#if SCROLL_EDGE_MASK
+// --- edgeMaskOpenHook (Stage 5A review) --------------------------------------
+// The aperture-open transition as its own raster event, armed by
+// dispatchRasterEvents 2 lines (3 on the badline phase) before
+// EDGE_MASK_BODY_RASTER, so the IRQ returns to the main thread for the gap after
+// the HUD handoff instead of busy-waiting it away. IRQ entry + rasterIRQ +
+// dispatch + this hook's preamble is ~90 cycles, which is why the arm line is
+// two lines early rather than one.
+edgeMaskOpenHook:
+    dec RASTER_DISPLAY_PENDING              // 1 -> 0: both display-phase events done this frame
+    // STAGE 5A -- open the fixed aperture. $D011 currently carries the whole-frame
+    // BAND state (ECM=1 -> invalid text mode -> black), installed by
+    // rasterFrameReset / publishRasterPlan. Clear ECM at EDGE_MASK_BODY_RASTER so
+    // every raster from there to EDGE_MASK_BAND_RASTER-1 shows normal multicolour
+    // terrain. The switch MUST land between the previous line's last g-access
+    // (cycle 55) and this line's first (cycle 16), so the body value is computed
+    // BEFORE the poll and published by a single 4-cycle store.
+edgeMaskEntry:                              // Stage 5A trace point: raster on entry to the mask block.
+    lda VIC_CONTROL_1
+    and #%00111111                          // ECM=0, RST8=0; DEN/RSEL/YSCROL preserved.
+    tax                                     // X = body $D011, ready to store.
+    lda VIC_CONTROL_1
+    bmi !edgeBodyLate+                      // beam >= 256: hopeless, store now.
+    lda RASTER_DISPLAY_FINE
+    and #7
+    cmp #(EDGE_MASK_BODY_RASTER & 7)        // Is the body raster itself a BADLINE this frame? A badline
+    beq !edgeBodyBadline+                   // steals cycles 12..54, so a store polled into that line is
+                                            // not reliably ahead of its g-accesses -- take the early path.
+    lda #EDGE_MASK_BODY_RASTER - 2          // PRIME the poll one line early. The final loop must already
+    cmp RASTER                              // be spinning when the beam crosses into the body raster:
+    bcc !edgeBodyFinal+                     // its reads are then 7 cycles apart from a point inside the
+!edgeBodyPrime:                             // previous line, so the first read that sees the new raster
+    cmp RASTER                              // lands in cycles 0..6 -- ahead of both the sprite-DMA steal
+    bcs !edgeBodyPrime-                     // (0..10) and a badline stall (12..54) on that line.
+!edgeBodyFinal:
+    lda #EDGE_MASK_BODY_RASTER - 1
+    cmp RASTER
+    bcc !edgeBodyLate+                      // already at/past the body raster: store now, and count it.
+!edgeBodyWait:
+    cmp RASTER                              // 4 cy; C=1 while target-1 >= beam.
+    bcs !edgeBodyWait-                      // 3/2 cy -> 7-cycle loop.
+edgeMaskBodyApplied:                        // Stage 5A trace point: exact raster/cycle of the switch.
+    stx VIC_CONTROL_1                       // single store: band -> body.
+    jmp !edgeBodyDone+
+!edgeBodyLate:
+    stx VIC_CONTROL_1                       // Late: the aperture opens a line or two low on this frame.
+    inc EDGE_MASK_LATE                      // Diagnostic only; must stay 0 in the regression suite.
+    bne !edgeBodyDone+
+    inc EDGE_MASK_LATE + 1
+    jmp !edgeBodyDone+
+!edgeBodyBadline:
+    // The body raster is a badline this frame, so land the store in the PREVIOUS
+    // line's tail instead: after that line's last g-access (cycle 55) and before
+    // the body raster's first (cycle 16). The previous line provably is NOT a
+    // badline (two badlines cannot be adjacent), so the fixed delay below is not
+    // stretched and the landing point is deterministic.
+    lda #EDGE_MASK_BODY_RASTER - 3
+    cmp RASTER
+    bcc !edgeBodyPrevFinal+                 // already past: fall straight into the final poll.
+!edgeBodyPrevPrime:
+    cmp RASTER                              // prime, exactly as the normal path does.
+    bcs !edgeBodyPrevPrime-
+!edgeBodyPrevFinal:
+    lda #EDGE_MASK_BODY_RASTER - 2
+    cmp RASTER
+    bcc !edgeBodyLate2+                     // already at/past the previous line: too late to place it.
+!edgeBodyPrevWait:
+    cmp RASTER
+    bcs !edgeBodyPrevWait-                  // exits at cycle 3..9 of the previous line.
+    ldy #10                                 // +51 cycles -> store starts at cycle 54..60 of that line,
+!edgeBodyPad:                               // so its write lands at cycle 57..62 (or 0..2 of the body
+    dey                                     // raster) -- past the previous line's g-accesses, ahead of
+    bne !edgeBodyPad-                       // the body raster's, and clear of the badline stall entirely.
+edgeMaskBodyAppliedEarly:                   // Stage 5A trace point (badline-phase path).
+    stx VIC_CONTROL_1
+    jmp !edgeBodyDone+
+!edgeBodyLate2:
+    // Too late to place the store in the previous line's tail. Degrade to the
+    // normal in-line path rather than storing blind: on this phase that risks the
+    // body raster's own badline stall (aperture one line low for this frame), but
+    // never opens the aperture EARLY. Counted separately; must stay 0.
+    inc EDGE_MASK_FALLBACK
+    bne !edgeBodyFallback+
+    inc EDGE_MASK_FALLBACK + 1
+!edgeBodyFallback:
+    lda #EDGE_MASK_BODY_RASTER - 1
+    cmp RASTER
+    bcc !edgeBodyLate-                      // even the body raster has passed: store now.
+!edgeBodyFallbackWait:
+    cmp RASTER
+    bcs !edgeBodyFallbackWait-
+    stx VIC_CONTROL_1
+    jmp !edgeBodyDone+
+!edgeBodyDone:
+    rts
+
+// A = the $D012 compare to arm for the aperture-open event this frame.
+edgeMaskArmLine:
+    lda RASTER_DISPLAY_FINE
+    and #7
+    cmp #(EDGE_MASK_BODY_RASTER & 7)
+    beq !badline+
+    lda #EDGE_MASK_BODY_RASTER - 5          // measured compare->hook latency is 2..3 lines (7-cycle entry +
+    rts                                     // KERNAL $FF48 stub + dispatcher, +43 when a badline sits in the
+!badline:                                   // way, which it does on half the phases), hence 5 lines of lead;
+    lda #EDGE_MASK_BODY_RASTER - 6          // the badline-phase early-store path needs one more line still.
+    rts
+#endif
 
 #if BORDER_PROOF_ENABLE
 // ============================================================================
@@ -576,6 +796,24 @@ borderOpenHook:
     sta EXTRA_COLOUR_1                      // $D022 = backdrop for the band (mixed code bits 6-7 must not stripe).
     sta EXTRA_COLOUR_2                      // $D023 = backdrop for the band.
 #endif
+#if SCROLL_EDGE_MASK
+    // STAGE 5A -- close the fixed aperture. A still holds the $D011 value just
+    // written at raster 245 (RSEL=1 for the dodge), so OR in ECM to build the band
+    // value without re-reading. Row 24's last continuity g-access is raster 247;
+    // raster 248 is the first that alternates terrain/idle with the fine phase, so
+    // the band must be live for 248's g-accesses. The beam is provably in [245,246]
+    // here, so the poll is bounded to ~3 lines and cannot wrap. !wait250 below is a
+    // read-modify-write, so it preserves ECM when it clears RSEL.
+    ora #%01000000                          // ECM=1 (invalid text mode -> black), RSEL=1 kept.
+    and #%01111111                          // RST8=0.
+    tax                                     // X = band $D011, ready to store.
+    lda #EDGE_MASK_BAND_RASTER - 1          // 247: last body raster.
+!edgeBandWait:
+    cmp RASTER                              // 7-cycle poll, as above.
+    bcs !edgeBandWait-
+edgeMaskBandApplied:                        // Stage 5A trace point: exact raster/cycle of the switch.
+    stx VIC_CONTROL_1                       // single store: body -> band, before raster 248's g-accesses.
+#endif
 !wait250:
     ldx RASTER
     cpx #250
@@ -714,12 +952,19 @@ RASTER_STATE_BEGIN:
 RASTER_EVENT:                  .byte 0
 RASTER_TARGET:                 .byte 0
 RASTER_PRESENT_READY:          .byte 0
-RASTER_DISPLAY_PENDING:        .byte 0
+RASTER_DISPLAY_PENDING:        .byte 0        // (SCROLL_EDGE_MASK: 2 = handoff due, 1 = aperture-open due, 0 = done)
 #if BORDER_PROOF_ENABLE
 RASTER_BORDER_PENDING:         .byte 0        // Phase-1 bottom-border experiment; see borderOpenHook.
 RASTER_BORDER_BAILS:           .word 0        // Forensic: borderOpenHook internal late-entry guard trips (hard-lock net).
 RASTER_BORDER_SKIPS:           .word 0        // Forensic: dispatchRasterEvents skipped a late BORDER before entering the hook.
 RASTER_BORDER_EARLY:           .word 0        // Forensic: borderOpenHook saw a spurious early fire and re-armed (border still opens).
+#endif
+#if SCROLL_EDGE_MASK
+EDGE_MASK_FALLBACK:            .word 0        // Stage 5A forensic: the badline-phase early store could not be
+                                              // placed, so the in-line path was used. MUST stay 0.
+EDGE_MASK_LATE:                .word 0        // Stage 5A forensic: rasterDisplayHook reached the aperture-open
+                                              // poll at/after EDGE_MASK_BODY_RASTER, so the band ran a line or
+                                              // two into the body on that frame. MUST stay 0.
 #endif
 RASTER_EXPECTED_ASSIGNMENTS:   .byte 0
 RASTER_ASSIGNMENTS_DONE:        .byte 0

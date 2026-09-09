@@ -1,0 +1,230 @@
+--- a/src/main.asm
++++ b/src/main.asm
+@@ -45,6 +45,54 @@
+ //#define SOFT_EDGE_MASK
+ 
+ // ============================================================================
++// STAGE 5A -- SCROLL EDGE MASK (supersedes SOFT_EDGE_MASK; see
++// /reports/stage5a-seamless-scroll-edge-masking.md).
++//
++// THE DEFECT (measured, Stage 5A objective 1). The 25-row VIC fetch puts matrix
++// row 0 at rasters 48+fine..55+fine and matrix row 24 at 240+fine..247+fine, so
++// the TERRAIN FIELD'S OUTER BOUNDARY IS AT RASTER 48+fine (top) AND 247+fine
++// (bottom). Both therefore walk down one raster per fine step and snap back up 7
++// rasters at each coarse 7->0 wrap -- an 8 px sawtooth on both edges at the
++// coarse cadence (~3.9 Hz). That boundary jump, not the terrain content, is the
++// visible "pop": the body 55..246 is temporally clean at every phase.
++//
++// THE FIX. Content at any FIXED raster is exactly continuous, including across
++// the coarse step (measured: rasters 56/120/200/246/247 all continuous). So the
++// cure is simply to present a FIXED aperture and hide everything outside it. The
++// normal RSEL=0 vertical border would do this for free (it covers <=54 / >=247),
++// but the top-border sprite HUD needs the vertical border FF held clear from the
++// previous frame, and the FF can only be cleared at raster 51/55 -- so it cannot
++// be closed over rasters 44..54 while the HUD is displayed at 23..43. The mask
++// therefore has to come from the graphics mode.
++//
++// MECHANISM. Outside the aperture the display is put into the VIC's INVALID text
++// mode (ECM=1 with MCM=1), whose sequencer output is black for both display and
++// idle state, whatever the matrix/charset/colour registers hold. That makes the
++// mask ONE register write -- a single store of a pre-computed $D011 -- instead of
++// the four ($D011+$D016+$D022+$D023) that SOFT_EDGE_MASK's grey ECM band needed
++// and could not fit in the ~22-cycle inter-g-access window. The band is black,
++// which matches the already-black side border ($D020 = 0), so the surround
++// becomes a uniform black letterbox rather than today's grey top/bottom strips.
++// Nothing else changes: badlines, c/g-accesses and therefore the whole raster
++// schedule are identical, sprites are unaffected (the HUD keeps its band), the
++// charset is NOT mutated, and only $D01E (sprite/sprite) is used for collision so
++// the foreground/background sequencer change cannot affect gameplay.
++//
++// TIMING. ECM=1 is part of GAMEPLAY_D011_BASE, so rasterFrameReset /
++// publishRasterPlan install the band state every frame; the body is opened by one
++// store at EDGE_MASK_BODY_RASTER (rasterDisplayHook, after the HUD handoff) and
++// closed again by one store at EDGE_MASK_BAND_RASTER (borderOpenHook, between its
++// two RSEL dodge writes). Both are reached by a 7-cycle `cmp RASTER / bcs` poll,
++// so the store lands at cycle ~6..12 of the target line -- before that line's
++// first g-access at cycle 16, and after the previous line's last at cycle 55.
++// Comment out to build exactly as Stage 4J.
++#define SCROLL_EDGE_MASK
++
++#if (SCROLL_EDGE_MASK && SOFT_EDGE_MASK)
++    .error "SCROLL_EDGE_MASK supersedes SOFT_EDGE_MASK -- enable only one"
++#endif
++
++// ============================================================================
+ // SCROLL-HITCH STAGE 0/1 (Astra review follow-up). Three independent toggles,
+ // separate from the SOFT_EDGE_MASK experiment above. See
+ // /reports/scroll-hitch-stage0-stage1-baseline-and-low-risk-optimisations.md.
+@@ -260,8 +308,29 @@
+ // seamless extension of $D021. The palette constants come from the level-config
+ // import further down; the scheduler code (imported later still) uses them directly.
+ #else
++#if SCROLL_EDGE_MASK
++// Stage 5A: ECM=1 is the whole-frame BAND state, so every $D011 install
++// (rasterFrameReset, publishRasterPlan) leaves the display masked; the body is
++// opened by a single store at EDGE_MASK_BODY_RASTER and re-masked at
++// EDGE_MASK_BAND_RASTER. MCM stays 1 throughout, so ECM=1 is the invalid text
++// mode -> black. BMM stays 0.
++.const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3) | $40  // DEN=1, RSEL, ECM=1; YSCROL added at runtime.
++// First raster of the clean fixed aperture (ECM cleared here). Must be strictly
++// AFTER hudBorderHandoff's last write. Measured entry raster of the mask block:
++// 49..50 (--stress), 49..57 (authored wave, p99 56). The badline path below has
++// to arrive two lines earlier still, so 60 gives it ~2 lines of margin over the
++// observed worst case and the normal path ~3. EDGE_MASK_LATE / EDGE_MASK_FALLBACK
++// count any frame that still entered late; both must stay 0. Raising this costs
++// one raster of aperture each.
++.const EDGE_MASK_BODY_RASTER = 60
++// First masked raster at the bottom. Row 24's last continuity-relevant g-access
++// is raster 247; raster 248 is the first that alternates terrain/idle with fine,
++// and is never a badline (the badline range ends at 247).
++.const EDGE_MASK_BAND_RASTER = 248
++#else
+ .const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3)   // DEN=1, RSEL per toggle, YSCROL added at runtime.
+ #endif
++#endif
+ 
+ // ============================================================================
+ // TOP-BORDER SPRITE HUD PROOF (time-domain hardware-sprite ownership)
+@@ -991,7 +1060,7 @@
+     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
+ 
+     lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
+-#if SOFT_EDGE_MASK
++#if (SOFT_EDGE_MASK || SCROLL_EDGE_MASK)
+     and #%00111000                          // OVER/menu. Also clear bit 6 (ECM): the soft-edge mask may
+ #else
+     and #%11111000                          // OVER/menu - the gameplay display event may have
+--- a/src/raster_scheduler.asm
++++ b/src/raster_scheduler.asm
+@@ -410,6 +410,92 @@
+     lda #TERRAIN_MC_COLOUR_2
+     sta EXTRA_COLOUR_2                      // $D023 restored for the body.
+ #endif
++#if SCROLL_EDGE_MASK
++    // STAGE 5A -- open the fixed aperture. $D011 currently carries the whole-frame
++    // BAND state (ECM=1 -> invalid text mode -> black), installed by
++    // rasterFrameReset / publishRasterPlan. Clear ECM at EDGE_MASK_BODY_RASTER so
++    // every raster from there to EDGE_MASK_BAND_RASTER-1 shows normal multicolour
++    // terrain. The switch MUST land between the previous line's last g-access
++    // (cycle 55) and this line's first (cycle 16), so the body value is computed
++    // BEFORE the poll and published by a single 4-cycle store.
++edgeMaskEntry:                              // Stage 5A trace point: raster on entry to the mask block.
++    lda VIC_CONTROL_1
++    and #%00111111                          // ECM=0, RST8=0; DEN/RSEL/YSCROL preserved.
++    tax                                     // X = body $D011, ready to store.
++    lda VIC_CONTROL_1
++    bmi !edgeBodyLate+                      // beam >= 256: hopeless, store now.
++    lda RASTER_DISPLAY_FINE
++    and #7
++    cmp #(EDGE_MASK_BODY_RASTER & 7)        // Is the body raster itself a BADLINE this frame? A badline
++    beq !edgeBodyBadline+                   // steals cycles 12..54, so a store polled into that line is
++                                            // not reliably ahead of its g-accesses -- take the early path.
++    lda #EDGE_MASK_BODY_RASTER - 2          // PRIME the poll one line early. The final loop must already
++    cmp RASTER                              // be spinning when the beam crosses into the body raster:
++    bcc !edgeBodyFinal+                     // its reads are then 7 cycles apart from a point inside the
++!edgeBodyPrime:                             // previous line, so the first read that sees the new raster
++    cmp RASTER                              // lands in cycles 0..6 -- ahead of both the sprite-DMA steal
++    bcs !edgeBodyPrime-                     // (0..10) and a badline stall (12..54) on that line.
++!edgeBodyFinal:
++    lda #EDGE_MASK_BODY_RASTER - 1
++    cmp RASTER
++    bcc !edgeBodyLate+                      // already at/past the body raster: store now, and count it.
++!edgeBodyWait:
++    cmp RASTER                              // 4 cy; C=1 while target-1 >= beam.
++    bcs !edgeBodyWait-                      // 3/2 cy -> 7-cycle loop.
++edgeMaskBodyApplied:                        // Stage 5A trace point: exact raster/cycle of the switch.
++    stx VIC_CONTROL_1                       // single store: band -> body.
++    jmp !edgeBodyDone+
++!edgeBodyLate:
++    stx VIC_CONTROL_1                       // Late: the aperture opens a line or two low on this frame.
++    inc EDGE_MASK_LATE                      // Diagnostic only; must stay 0 in the regression suite.
++    bne !edgeBodyDone+
++    inc EDGE_MASK_LATE + 1
++    jmp !edgeBodyDone+
++!edgeBodyBadline:
++    // The body raster is a badline this frame, so land the store in the PREVIOUS
++    // line's tail instead: after that line's last g-access (cycle 55) and before
++    // the body raster's first (cycle 16). The previous line provably is NOT a
++    // badline (two badlines cannot be adjacent), so the fixed delay below is not
++    // stretched and the landing point is deterministic.
++    lda #EDGE_MASK_BODY_RASTER - 3
++    cmp RASTER
++    bcc !edgeBodyPrevFinal+                 // already past: fall straight into the final poll.
++!edgeBodyPrevPrime:
++    cmp RASTER                              // prime, exactly as the normal path does.
++    bcs !edgeBodyPrevPrime-
++!edgeBodyPrevFinal:
++    lda #EDGE_MASK_BODY_RASTER - 2
++    cmp RASTER
++    bcc !edgeBodyLate2+                     // already at/past the previous line: too late to place it.
++!edgeBodyPrevWait:
++    cmp RASTER
++    bcs !edgeBodyPrevWait-                  // exits at cycle 3..9 of the previous line.
++    ldy #10                                 // +51 cycles -> store starts at cycle 54..60 of that line,
++!edgeBodyPad:                               // so its write lands at cycle 57..62 (or 0..2 of the body
++    dey                                     // raster) -- past the previous line's g-accesses, ahead of
++    bne !edgeBodyPad-                       // the body raster's, and clear of the badline stall entirely.
++edgeMaskBodyAppliedEarly:                   // Stage 5A trace point (badline-phase path).
++    stx VIC_CONTROL_1
++    jmp !edgeBodyDone+
++!edgeBodyLate2:
++    // Too late to place the store in the previous line's tail. Degrade to the
++    // normal in-line path rather than storing blind: on this phase that risks the
++    // body raster's own badline stall (aperture one line low for this frame), but
++    // never opens the aperture EARLY. Counted separately; must stay 0.
++    inc EDGE_MASK_FALLBACK
++    bne !edgeBodyFallback+
++    inc EDGE_MASK_FALLBACK + 1
++!edgeBodyFallback:
++    lda #EDGE_MASK_BODY_RASTER - 1
++    cmp RASTER
++    bcc !edgeBodyLate-                      // even the body raster has passed: store now.
++!edgeBodyFallbackWait:
++    cmp RASTER
++    bcs !edgeBodyFallbackWait-
++    stx VIC_CONTROL_1
++    jmp !edgeBodyDone+
++!edgeBodyDone:
++#endif
+ rasterDisplayRestored:
+ rasterBadlineRestored:
+     rts
+@@ -576,6 +662,24 @@
+     sta EXTRA_COLOUR_1                      // $D022 = backdrop for the band (mixed code bits 6-7 must not stripe).
+     sta EXTRA_COLOUR_2                      // $D023 = backdrop for the band.
+ #endif
++#if SCROLL_EDGE_MASK
++    // STAGE 5A -- close the fixed aperture. A still holds the $D011 value just
++    // written at raster 245 (RSEL=1 for the dodge), so OR in ECM to build the band
++    // value without re-reading. Row 24's last continuity g-access is raster 247;
++    // raster 248 is the first that alternates terrain/idle with the fine phase, so
++    // the band must be live for 248's g-accesses. The beam is provably in [245,246]
++    // here, so the poll is bounded to ~3 lines and cannot wrap. !wait250 below is a
++    // read-modify-write, so it preserves ECM when it clears RSEL.
++    ora #%01000000                          // ECM=1 (invalid text mode -> black), RSEL=1 kept.
++    and #%01111111                          // RST8=0.
++    tax                                     // X = band $D011, ready to store.
++    lda #EDGE_MASK_BAND_RASTER - 1          // 247: last body raster.
++!edgeBandWait:
++    cmp RASTER                              // 7-cycle poll, as above.
++    bcs !edgeBandWait-
++edgeMaskBandApplied:                        // Stage 5A trace point: exact raster/cycle of the switch.
++    stx VIC_CONTROL_1                       // single store: body -> band, before raster 248's g-accesses.
++#endif
+ !wait250:
+     ldx RASTER
+     cpx #250
+@@ -721,6 +825,13 @@
+ RASTER_BORDER_SKIPS:           .word 0        // Forensic: dispatchRasterEvents skipped a late BORDER before entering the hook.
+ RASTER_BORDER_EARLY:           .word 0        // Forensic: borderOpenHook saw a spurious early fire and re-armed (border still opens).
+ #endif
++#if SCROLL_EDGE_MASK
++EDGE_MASK_FALLBACK:            .word 0        // Stage 5A forensic: the badline-phase early store could not be
++                                              // placed, so the in-line path was used. MUST stay 0.
++EDGE_MASK_LATE:                .word 0        // Stage 5A forensic: rasterDisplayHook reached the aperture-open
++                                              // poll at/after EDGE_MASK_BODY_RASTER, so the band ran a line or
++                                              // two into the body on that frame. MUST stay 0.
++#endif
+ RASTER_EXPECTED_ASSIGNMENTS:   .byte 0
+ RASTER_ASSIGNMENTS_DONE:        .byte 0
+ RASTER_LAST_EXPECTED:          .byte 0

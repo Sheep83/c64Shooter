@@ -51,6 +51,9 @@ def main():
     parser.add_argument('--physical', action='store_true', help='Capture raster 311 of every physical PAL frame')
     parser.add_argument('--trace', action='store_true')
     parser.add_argument('--stress', action='store_true', help='Accelerate the existing spawner through monitor data writes')
+    parser.add_argument('--passive', action='store_true',
+                        help='Genuinely passive capture: after the title screen the joystick stays NEUTRAL for every frame (no fire, no movement). Use this for scrolling / background-turret / presentation diagnostics -- the default holds FIRE every frame, which shoots and destroys turrets '
+                             'and has previously invalidated passive-symptom investigations.')
     parser.add_argument('--dense', action='store_true', help='Seed16 stationary legal objects producing8 closely spaced batches; keep real scrolling/main loop')
     parser.add_argument('--y199', action='store_true', help='Stage 4F: 8 enemies Y=199 + player Y=235 (pending-LIVE reuse); keep real scrolling')
     parser.add_argument('--turret-playtest', action='store_true', help='Aim real player cannons at turret0 near a coarse transition and turret2 near bottom exit; capture subsequent wraps')
@@ -107,7 +110,7 @@ def main():
         mon.cmd('delete')
     mon.cmd(f'break {sym["applyFineScroll"]:04x}')
     mon.cmd('x')
-    mon.cmd('jpdb 1 ef')
+    mon.cmd('jpdb 1 ff' if args.passive else 'jpdb 1 ef')
     if args.dense or args.y199:
         def put(name, values):
             mon.cmd(f'> {sym[name]:04x} '+' '.join(f'{v:02x}' for v in values))
@@ -216,7 +219,8 @@ def main():
                 mon.cmd(f'jpdb 1 {255 ^ direction:02x}')
             (out/'turret-events.json').write_text(json.dumps(turret_events,indent=2))
         else:
-            mon.cmd('jpdb 1 ff' if args.dense else f'jpdb 1 {255 ^ (16 | direction):02x}')
+            mon.cmd('jpdb 1 ff' if (args.dense or args.passive)
+                    else f'jpdb 1 {255 ^ (16 | direction):02x}')
         if args.physical:
             mon.cmd(f'condition {physical_break} if RL == $000')
             mon.cmd('x')
