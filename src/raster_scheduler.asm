@@ -376,6 +376,40 @@ rasterDisplayHook:
 #if HUD_PROOF_ENABLE
     jsr hudBorderHandoff
 #endif
+#if SOFT_EDGE_MASK
+    // SOFT-EDGE MASK, leave the top band. rasterFrameReset / publishRasterPlan
+    // install $D011 with ECM=1, so the idle strip (rasters ~16..47) and matrix
+    // row 0's blankable top glyph rows (rasters ~48..54) render as $D021
+    // backdrop. Clear ECM here, at raster ~55, so the clean scrolling body
+    // 55..246 renders normally (full 128-code multicolour text). This hook fires
+    // at raster ~46-49; a short bounded poll + pad lands the switch after row 0's
+    // raster-54 g-access and before row 1's raster-55/56 g-access. If the hook
+    // entered late, switch immediately (a rare heavy-frame catchup).
+    lda VIC_CONTROL_1
+    bmi !softEdgeBodyNow+                   // beam >= 256: switch now.
+    lda RASTER
+    cmp #(SOFT_EDGE_BODY_RESTORE_RASTER + 2)
+    bcs !softEdgeBodyNow+                   // already past raster 56: switch now (late catchup).
+!softEdgeBodyWait:
+    ldx RASTER
+    cpx #SOFT_EDGE_BODY_RESTORE_RASTER      // 55: row 0's g-access at fine 7 ends here.
+    bcc !softEdgeBodyWait-
+    ldy #10                                 // Pad so the switch lands AFTER raster 55's g-access and
+!softEdgeBodyPad:                            // before raster 56's: raster <=55 stays ECM-blank, raster
+    dey                                     // 56 (first body row) gets its real terrain g-fetch. Clean
+    bne !softEdgeBodyPad-                    // full lines either side -- no jittery mid-scanline split.
+!softEdgeBodyNow:
+    lda VIC_CONTROL_1
+    and #%00111111                          // ECM = 0 (bit 7 = raster-compare MSB, always 0 for this scheduler).
+    sta VIC_CONTROL_1
+    lda VIC_CONTROL_2
+    ora #%00010000                          // MCM = 1 (global multicolour terrain for the body).
+    sta VIC_CONTROL_2
+    lda #TERRAIN_MC_COLOUR_1
+    sta EXTRA_COLOUR_1                      // $D022 restored for the body.
+    lda #TERRAIN_MC_COLOUR_2
+    sta EXTRA_COLOUR_2                      // $D023 restored for the body.
+#endif
 rasterDisplayRestored:
 rasterBadlineRestored:
     rts
@@ -438,6 +472,23 @@ borderOpenHook:
     //     wasted IRQs per frame before an in-window fire.
     //
     //   237 <= beam <= 245         -> IN WINDOW. Clear pending, do the dodge.
+#if SOFT_EDGE_MASK
+    // The SOFT_EDGE band-swap block below (and, when HUD_PROOF is off, the marker
+    // block) can push !bail / !early past 8-bit branch range -- route via jmp.
+    lda VIC_CONTROL_1
+    bpl !guardLo+
+    jmp !bail+                              // $d011 bit7 = raster bit8 => beam >= 256 => far too late.
+!guardLo:
+    lda RASTER
+    cmp #237
+    bcs !guardHi+
+    jmp !early+                            // beam < 237 => spurious early fire: re-arm, keep pending.
+!guardHi:
+    cmp #246
+    bcc !inWindow+
+    jmp !bail+                             // beam >= 246 => too late to dodge this frame.
+!inWindow:
+#else
     lda VIC_CONTROL_1
     bmi !bail+                              // $d011 bit7 = raster bit8 => beam >= 256 => far too late.
     lda RASTER
@@ -445,6 +496,7 @@ borderOpenHook:
     bcc !early+                            // beam < 237 => spurious early fire: re-arm, keep pending.
     cmp #246
     bcs !bail+                             // beam >= 246 => too late to dodge this frame.
+#endif
     // beam is now provably in [237 .. 245]; both polls below wait at most ~13
     // lines (usually <5) and can never wrap.
     lda #0
@@ -496,6 +548,34 @@ borderOpenHook:
     lda VIC_CONTROL_1
     ora #%00001000                          // RSEL 0 -> 1  (raster-247 RSEL=0 close compare now misses).
     sta VIC_CONTROL_1
+#if SOFT_EDGE_MASK
+    // SOFT-EDGE MASK, bottom band. Row 24's terrain g-fetch spans rasters
+    // 240+fine .. 247+fine; its outermost pixels (rasters >=248) have no world
+    // row to scroll into and pop once per coarse 7->0. Enter Extended Color Mode
+    // here (raster ~247, after row 24's continuity-relevant g-accesses <=247) so
+    // every raster from ~248 through the border and the next frame's top band
+    // (until softEdgeBodyRestore at raster 55) renders each cell as pure $D021
+    // backdrop: char code masked to 6 bits indexes the zeroed $3800..$39FF
+    // window. MCM must be cleared first (ECM+MCM is the invalid black mode);
+    // $D022/$D023 become the backdrop colour so mixed code bits 6-7 don't stripe.
+!wait247:
+    ldx RASTER
+    cpx #(SOFT_EDGE_BAND_RASTER - 1)        // 247: row 24's last continuity g-access.
+    bcc !wait247-
+    ldy #10                                 // Pad so the mode switch lands AFTER raster 248's g-access
+!softEdgeBandPad:                            // (cycle ~55) and before raster 249's: raster <=248 keeps
+    dey                                     // its real terrain g-fetch, raster >=249 is a clean full
+    bne !softEdgeBandPad-                    // ECM-blank line (no jittery mid-scanline split).
+    lda VIC_CONTROL_2
+    and #%11101111                          // MCM = 0 first (ECM+MCM is the invalid all-black mode).
+    sta VIC_CONTROL_2
+    lda VIC_CONTROL_1
+    ora #%01000000                          // ECM = 1.
+    sta VIC_CONTROL_1
+    lda #TERRAIN_BACKGROUND_COLOUR
+    sta EXTRA_COLOUR_1                      // $D022 = backdrop for the band (mixed code bits 6-7 must not stripe).
+    sta EXTRA_COLOUR_2                      // $D023 = backdrop for the band.
+#endif
 !wait250:
     ldx RASTER
     cpx #250

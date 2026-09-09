@@ -110,6 +110,10 @@ initBackgroundTurrets:
 }
     lda #1
     sta TURRET_PULSE_TIMER                  // Step the pulse on the first gameplay frame.
+#if OPT_TURRET_GLYPH_DIRTY
+    lda #1
+    sta TURRET_GLYPH_DIRTY                  // Force a (re)publish of the shared static body glyphs this game.
+#endif
     jsr publishTurretGlyphs                 // Publish the ONE shared body glyph set.
     jmp updateTurretStream                  // Admit turrets already inside the boot aperture.
 
@@ -477,6 +481,10 @@ installTurretRow:
 // to terrain (updateBackgroundTurrets only flags the kill; poking screen RAM
 // mid-frame would tear a partly-fetched row).
 publishTurretGlyphs:
+#if OPT_TURRET_GLYPH_DIRTY
+    lda TURRET_GLYPH_DIRTY
+    beq !glyphsClean+                       // static body art already resident: skip the 32-byte charset copy
+#endif
     ldx #31
 !copy:
     lda turretArt + TURRET_STATIC_STYLE*32,x
@@ -484,6 +492,11 @@ publishTurretGlyphs:
     dex
     bpl !copy-
     inc TURRET_GLYPH_PUBLICATIONS
+#if OPT_TURRET_GLYPH_DIRTY
+    lda #0
+    sta TURRET_GLYPH_DIRTY
+#endif
+!glyphsClean:
     ldx #TURRET_POOL - 1
 !deadScan:
     lda TURRET_SLOT_AUTH,x
@@ -826,6 +839,15 @@ TURRET_GROUND_OFFSET:   .byte 0
 TURRET_SHOTS_FIRED:     .byte 0
 TURRET_DESTROYED:       .byte 0
 TURRET_GLYPH_PUBLICATIONS: .byte 0
+#if OPT_TURRET_GLYPH_DIRTY
+TURRET_GLYPH_DIRTY:     .byte 0          // Stage-1 opt 2: nonzero => publishTurretGlyphs must re-copy the
+                                         // shared static body glyph set into the charset. Set by
+                                         // setupStarfieldCharset (ROM copy clobbers codes 226..229) and
+                                         // initBackgroundTurrets (per game); cleared after the copy. The
+                                         // 32-byte source (turretArt style TURRET_STATIC_STYLE) is
+                                         // assembled-constant; nothing writes $3F10.. during gameplay
+                                         // (hit flash is colour-RAM only, kills poke screen RAM).
+#endif
 BULLET_SPAWN_X_LO:     .byte 0
 BULLET_SPAWN_X_HI:     .byte 0
 BULLET_SPAWN_Y:        .byte 0

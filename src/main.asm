@@ -22,6 +22,120 @@
 // hang. Comment out once the border-HUD work is stable.
 #define BORDER_FORENSIC
 
+// TOP + BOTTOM SOFT-EDGE MASK. The clean scrolling TERRAIN body is raster 55..246.
+// The 25-row VIC character fetch also displays a sacrificial outer row at each end
+// (matrix row 0 at raster ~48..54, matrix row 24 at raster ~248..254). Those rows
+// carry real overflow terrain so the row0/row1 and row23/row24 seams stay
+// continuous, but their OUTERMOST pixels have no further world row to scroll into,
+// so ~4-6 px there pop once per coarse 7->0 step. This mask blanks ONLY those
+// outer scanlines (<=54 and >=248) to solid $D021 backdrop, leaving 55..246
+// untouched, using a mid-frame Extended Color Mode (ECM) band -- the same
+// mechanism Slap Fight / Terra Cresta use for their edge transitions. Comment out
+// to build the engine exactly as before; every added block is `#if SOFT_EDGE_MASK`.
+// See /reports/soft-edge-masking-and-astra-handoff-report.md.
+//
+// SHIPPED OFF (AMBER). The ECM band works -- it blanks the sacrificial outer
+// scanlines to $D021 -- but the mid-scanline ECM<->text mode switch at the mask
+// boundary cannot be made cycle-exact from the variable-entry raster IRQs without
+// a stable-raster prologue, so the boundary raster shows a ~1-8 px per-frame
+// shimmer that trades the once-per-coarse-cycle pop for a continuous one. A clean
+// mask needs the finite 25-row fetch addressed in the scroller (a $D018-page /
+// bitmap edge row), which is the architectural review's remit. The code stays,
+// guarded, so Astra can measure it; re-enable to reproduce.
+//#define SOFT_EDGE_MASK
+
+// ============================================================================
+// SCROLL-HITCH STAGE 0/1 (Astra review follow-up). Three independent toggles,
+// separate from the SOFT_EDGE_MASK experiment above. See
+// /reports/scroll-hitch-stage0-stage1-baseline-and-low-risk-optimisations.md.
+//
+//   SCROLL_HITCH_DIAG        -- Stage 0 diagnostic counters that classify why a
+//                              coarse 7->0 transition deferred (pending LIVE
+//                              batch / beam past 256 / raster cutoff) and track
+//                              the longest consecutive fine-7 hold. Counters
+//                              only; no behaviour change. Bounded; ~a few
+//                              `inc abs` on the (rare) deferral path.
+//   OPT_NOREUSE_BATCH_EXIT   -- Stage 1 opt 1: skip beginRasterPlanMasks + the
+//                              8-slot SLOT_FREE_RASTER init + the HUD floor loop
+//                              when SORTED_COUNT < 9 (no hardware-sprite reuse
+//                              batch can exist). BUILD batch count is still
+//                              zeroed; that scratch is only read on the >=9
+//                              batch path.
+//   OPT_TURRET_GLYPH_DIRTY   -- Stage 1 opt 2: only re-copy the 32-byte shared
+//                              static turret body glyph set into the charset
+//                              when it is actually dirty (boot / per-game init),
+//                              not unconditionally every frame. Explicit
+//                              TURRET_GLYPH_DIRTY flag.
+//
+// SCROLL-HITCH STAGE 2 (Astra review follow-up). See
+// /reports/scroll-hitch-stage2-incoming-row-predecode.md.
+//
+//   OPT_BG_ROW_PREDECODE     -- Stage 2: decode the ONE terrain row the next
+//                              coarse 7->0 step will reveal into a private
+//                              40-byte staging buffer (BG_PREDECODED_ROW) on an
+//                              earlier, non-raster-critical frame, tagged with
+//                              its exact 16-bit logical row. prepareBackgroundCoarse
+//                              then copies that 40-byte row into the screen inside
+//                              the raster-160..184 window instead of running the
+//                              ~1,400-clock decodeStageCharacterRow there. Live
+//                              turret overlay (installTurretRow) still runs at the
+//                              real reveal point. Tag/validity driven; on any
+//                              miss (startup, wrap request, discontinuous
+//                              SCROLL_ROW, stale tag) the exact Stage 1 in-window
+//                              decode path runs unchanged. Terrain-only cache.
+//
+// SCROLL-HITCH STAGE 3 (Astra review follow-up). See
+// /reports/scroll-hitch-stage3-predecode-aware-coarse-deadline.md.
+//
+//   OPT_BG_COARSE_EXTENDED_DEADLINE
+//                           -- Stage 3: the CPU-late coarse-admission gate
+//                              (reason 3) picks one of TWO deadlines. When the
+//                              engine can PROVE, at the gate, that this exact
+//                              coarse step will consume a valid matching Stage 2
+//                              predecoded row (bgCoarseHitGuaranteed), it judges
+//                              the arrival raster against the later, measured
+//                              BG_COARSE_HIT_LATEST_START (the short ~99-line HIT
+//                              reveal path). Otherwise -- MISS, stale/absent
+//                              cache, impending stage wrap, predecode disabled --
+//                              it keeps the conservative BG_COARSE_LATEST_START
+//                              (184), which is safe for the full ~128-line
+//                              fallback reveal. Requires OPT_BG_ROW_PREDECODE
+//                              (no cache => no guaranteed HIT => conservative
+//                              only). The pending-LIVE (reason 1) and beam
+//                              (reason 2) gates are UNCHANGED.
+//
+// All Stage 0/1/2/3 toggles default ON. Comment a line to build without that
+// change; with SCROLL_HITCH_DIAG + OPT_NOREUSE_BATCH_EXIT + OPT_TURRET_GLYPH_DIRTY
+// commented the engine is byte-identical to Astra baseline
+// 1fadf2b42cc30b333622014af1a1cf163afd8ea607150f76a89a22709aea22dd; with
+// OPT_BG_ROW_PREDECODE also commented the build is byte-identical to the Stage 1
+// default 681935dc5179f35160bcd7c8b98b5df44daaed0e2cd4118d9a9e4a913a883af5;
+// with OPT_BG_COARSE_EXTENDED_DEADLINE also commented the build is byte-identical
+// to the Stage 2 default 561ad2fa66223b6086fb3bb7eb3f6f061144b3eb81db895010c736617c1cd5fd.
+#define SCROLL_HITCH_DIAG
+#define OPT_NOREUSE_BATCH_EXIT
+#define OPT_TURRET_GLYPH_DIRTY
+#define OPT_BG_ROW_PREDECODE
+#define OPT_BG_COARSE_EXTENDED_DEADLINE
+
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+#if !SCROLL_HITCH_DIAG
+    .error "OPT_BG_COARSE_EXTENDED_DEADLINE needs SCROLL_HITCH_DIAG (its deadline-class counters)"
+#endif
+#if !OPT_BG_ROW_PREDECODE
+    .error "OPT_BG_COARSE_EXTENDED_DEADLINE needs OPT_BG_ROW_PREDECODE (no cache => no guaranteed HIT)"
+#endif
+// Stage 3 16-bit-counter helper (used before the Stage 2 bgIncWord definition
+// further down the file). Emits nothing when unused.
+.macro bgIncWord(w) {
+    inc w
+    bne !noHi+
+    inc w + 1
+!noHi:
+}
+#define BG_INC_WORD_MACRO_DEFINED
+#endif
+
 // Gameplay display-state RSEL bit (set by rasterFrameReset / publishRasterPlan
 // every frame; borderOpenHook then dodges BOTH border-close compares to open the
 // vertical border top+bottom, commercial style -- see raster_scheduler.asm and
@@ -40,7 +154,21 @@
 //                        overflow rows' own outer edges (~4 px pop at r52-55 /
 //                        r248-250 once per coarse cycle). Not shipped.
 .const GAMEPLAY_RSEL = 0
+#if SOFT_EDGE_MASK
+// Bit 6 (ECM) is part of the whole-frame base state so the top sacrificial band
+// (rasters ~16..54) stays in ECM after rasterFrameReset / publishRasterPlan; the
+// DISPLAY event (softEdgeBodyRestore) clears it at raster 55 for the clean body,
+// and borderOpenHook (softEdgeBandEnter) re-sets it at raster ~248 for the bottom
+// band + border. BMM stays 0; MCM is toggled separately (ECM+MCM is invalid).
+.const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3) | $40   // DEN=1, RSEL, ECM=1; YSCROL added at runtime.
+.const SOFT_EDGE_BODY_RESTORE_RASTER = 55                      // last blanked raster is 54; body g-fetch starts 55.
+.const SOFT_EDGE_BAND_RASTER         = 248                     // first blanked raster; row 24 g-fetch ends 247.
+// $D022/$D023 during the ECM band = the terrain backdrop colour so the band is a
+// seamless extension of $D021. The palette constants come from the level-config
+// import further down; the scheduler code (imported later still) uses them directly.
+#else
 .const GAMEPLAY_D011_BASE = $10 | (GAMEPLAY_RSEL << 3)   // DEN=1, RSEL per toggle, YSCROL added at runtime.
+#endif
 
 // ============================================================================
 // TOP-BORDER SPRITE HUD PROOF (time-domain hardware-sprite ownership)
@@ -232,6 +360,26 @@
 // scroll every N real frames; same fine/coarse algorithm. Divider 1 is the
 // engineering stress config; 2 is the intended gameplay value.
 .const BG_COARSE_LATEST_START = 184                // Exclusive; no remaining sprite batches may interrupt the copy.
+                                                   // CONSERVATIVE reason-3 deadline: safe for the full ~128-line
+                                                   // predecode-MISS / stage-1 fallback reveal.
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+// EXTENDED reason-3 deadline, applied ONLY when bgCoarseHitGuaranteed proves the
+// impending coarse step will take the Stage 2 predecode-HIT reveal (~99 lines,
+// vs ~128 for a MISS). Measured (Stage 3 report Sections 4/5/7):
+//   * a HIT admitted at gate-arrival raster A reaches bgUpperReady at ~A+99 and
+//     sets RASTER_PRESENT_READY at ~A+101 (trail ~2 lines).
+//   * fixed-build deadline sweep, moderate (burn 3) and hard (burn 5) pre-gate
+//     stress: replay/catchup/incomplete = 0 for every extended deadline up to
+//     and including 196; the first RASTER_REPLAY_FRAMES appears at 200 (worst
+//     bgUpperReady ~299), and by 214 replay is persistent (worst ~311).
+//   * at 196 the worst observed bgUpperReady is 295 -> RASTER_PRESENT_READY ~297
+//     -- ~15 lines below physical line 0 and ~4 lines below the empirical replay
+//     onset. This is deliberately NOT the highest value that survived a run.
+.const BG_COARSE_HIT_LATEST_START = 196
+.if (BG_COARSE_HIT_LATEST_START <= BG_COARSE_LATEST_START) {
+    .error "BG_COARSE_HIT_LATEST_START must be later than the conservative deadline"
+}
+#endif
 
 // 4x4 character metatile stage (stage_test.asm): a metatile stage row is
 // METATILES_PER_ROW IDs wide (one screen width); a metatile stage row
@@ -670,6 +818,13 @@ gameLoop:
     // are simply not called; the fixed "FREE 00000" HUD label stays static.
     // Re-enable by uncommenting this one call.
     //jsr updateCycleDebug                  // Record the worst-case remaining free-cycle budget this frame.
+#if OPT_BG_ROW_PREDECODE
+    jsr predecodeNextStageRow              // Stage-2: decode the NEXT coarse-reveal terrain row into the
+                                            // private staging buffer now, off the raster-critical path. A
+                                            // cheap tag-compare no-op once the row is already staged (incl.
+                                            // every held fine-7 frame). Placed after all deadline-sensitive
+                                            // sprite/plan work and before the coarse admission test.
+#endif
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
     jsr noteCoarseSuppressionOutcome        // Diagnostic: record whether a suppression avoided / failed to
                                             // avoid a deferral, and whether an omitted projectile returned.
@@ -713,13 +868,26 @@ endGame:
     sta SPRITE_OVERFLOW_REGISTER            // Clear the 9th-bit sprite-X register too.
 
     lda VIC_CONTROL_1                       // Restore the non-scrolling YSCROL=3 position for GAME
+#if SOFT_EDGE_MASK
+    and #%00111000                          // OVER/menu. Also clear bit 6 (ECM): the soft-edge mask may
+#else
     and #%11111000                          // OVER/menu - the gameplay display event may have
-    ora #3                                  // left this at any of 0-7. Bit 3 (RSEL) is preserved,
-    sta VIC_CONTROL_1                       // so the 24-row mode set in init stays in effect.
+#endif
+    ora #3                                  // have left ECM set. Bit 3 (RSEL) is preserved, so the
+    sta VIC_CONTROL_1                       // 24-row mode set in init stays in effect.
 
     lda VIC_CONTROL_2                       // Leave global multicolour text mode; the menu / GAME OVER
     and #%11101111                          // / hi-score screens are plain hires text and were never
     sta VIC_CONTROL_2                       // authored for MC. initBackground re-enables it per game.
+#if SOFT_EDGE_MASK
+    lda #TERRAIN_MC_COLOUR_1                // Restore $D022/$D023 in case the game ended mid-ECM-band with
+    sta EXTRA_COLOUR_1                      // them forced to the backdrop colour. Harmless for the hires
+    lda #TERRAIN_MC_COLOUR_2                // menu; initBackground rewrites both per game anyway.
+    sta EXTRA_COLOUR_2
+    jsr setupStarfieldCharset              // Re-copy the full char ROM font (+ star glyphs) -> $3800.
+                                            // initBackground zeroed codes 0..63 for the ECM soft-edge
+                                            // band; the menu / GAME OVER text needs them back.
+#endif
 
     lda #0
     sta BACKGROUND_COLOUR                   // Restore the black menu / GAME OVER backdrop; initBackground
@@ -1411,6 +1579,10 @@ setupStarfieldCharset:
     inx
     cpx #STAR_GLYPH_BYTES
     bne !copyStarGlyphs-
+#if OPT_TURRET_GLYPH_DIRTY
+    lda #1
+    sta TURRET_GLYPH_DIRTY                  // The ROM copy above overwrote turret glyph codes 226..229.
+#endif
     rts
 
 // --- Routine: setupStarfield ------------------------------------------------
@@ -3010,6 +3182,24 @@ buildClippedInitialSprite:
 // --- Routine: buildBatchSpriteSchedule -------------------------------------
 // Build BUILD_PLAN's raster batches for sorted objects beyond the first eight.
 buildBatchSpriteSchedule:
+#if OPT_NOREUSE_BATCH_EXIT
+    // Stage-1 opt 1. Fewer than 9 sorted objects => there is no 9th+ object to
+    // place into a recycled hardware sprite slot, so NO reuse batch can exist.
+    // The batch path (SORTED_COUNT >= 9) is the only reader of beginRasterPlanMasks'
+    // masks (SCHED_/BATCH_*_MASK), the 8-entry SLOT_FREE_RASTER init and the HUD
+    // slot floor -- all pure scratch, fully rebuilt at the top of that path when
+    // it runs. Only BUILD's batch count must be valid (0). Zero it and return;
+    // identical downstream state, ~650-750 CPU clocks saved. The unchanged
+    // `SORTED_COUNT < 9 -> rts` further down still stands for OPT-off builds.
+    lda SORTED_COUNT
+    cmp #9
+    bcs !hasReuse+
+    ldy BUILD_PLAN
+    lda #0
+    sta BATCH_COUNT,y
+    rts
+!hasReuse:
+#endif
     jsr beginRasterPlanMasks               // BUILD-only final hardware masks, outside the IRQ loop.
     lda #0                                  // Load A from #0.
     ldy BUILD_PLAN                          // Load Y from BUILD_PLAN.
@@ -5317,6 +5507,25 @@ initBackground:
     lda #$ff
     sta SUPPRESS_LAST_ID
     sta SUPPRESS_PREV_ID
+#if SCROLL_HITCH_DIAG
+    lda #0                                  // Reset the coarse-deferral classification counters per game.
+    sta COARSE_DEFER_LIVE
+    sta COARSE_DEFER_LIVE + 1
+    sta COARSE_DEFER_BEAM
+    sta COARSE_DEFER_BEAM + 1
+    sta COARSE_DEFER_CUTOFF
+    sta COARSE_DEFER_CUTOFF + 1
+    sta COARSE_ADMIT
+    sta COARSE_ADMIT + 1
+    sta COARSE_HOLD_RUN
+    sta COARSE_HOLD_MAX
+    sta COARSE_HOLD_MAX_REASON
+    sta COARSE_LAST_REASON
+#endif
+#if OPT_BG_ROW_PREDECODE
+    jsr bgPredecodeReset                    // Stage-2: drop the staged row + zero the cache counters (and,
+                                            // Stage-3, the deadline-class counters) before SCROLL_ROW reseed.
+#endif
     lda #<STAGE_START_ROW                    // Bottom-origin: gameplay begins at the AUTHORED BOTTOM of the
     sta SCROLL_ROW                           // level (matrix row 23 shows logical row STAGE_LOGICAL_ROWS-1).
     lda #>STAGE_START_ROW                    // The !rowLoop below fills the whole initial viewport from the
@@ -5367,6 +5576,22 @@ initBackground:
     tya
     bne !terrainTailByte-
 !terrainCopyDone:
+#if SOFT_EDGE_MASK
+    // Soft-edge mask uses ECM for the sacrificial bands (rasters <=54 / >=248).
+    // In ECM the char code is masked to 6 bits, so EVERY on-screen code (terrain
+    // 96..167, turret private 226..239) indexes glyph 0..63 at $3800..$39FF.
+    // Zero that 512-byte window so an ECM cell renders as pure background. Nothing
+    // on the PLAYING matrix references codes 0..63 (metatiles emit 96+, code 32's
+    // ROM glyph is already all-zero), so this is invisible for the body; endGame
+    // re-copies char ROM 0..63 for the menu / GAME OVER text.
+    lda #0
+    tax
+!zeroEcmGlyphs:
+    sta STAR_CHARSET + $000,x
+    sta STAR_CHARSET + $100,x
+    inx
+    bne !zeroEcmGlyphs-
+#endif
     jsr initBackgroundTurrets               // Capture only the12 replaced glyph underlays; reset per-game health.
 
     // Global multicolour text mode for the playfield. $D016 is otherwise unused
@@ -5436,8 +5661,15 @@ renderStageRowToScreen:
     sbc #0
     sta BG_LOGICAL_ROW_HI
     jsr wrapBgLogicalRow                    // One 16-bit modulo-STAGE_LOGICAL_ROWS reduction.
+#if OPT_BG_ROW_PREDECODE
+    jsr bgConsumePredecodedRow             // Stage-2: C=1 => the staged terrain row for THIS logical row
+    bcs !bgRowInstalled+                    // was just copied to screen row 0 (decode skipped). C=0 =>
+#endif                                       // fall through to the exact Stage 1 in-window decode+copy.
     jsr decodeStageCharacterRow             // Expand the metatile stage into BG_INCOMING_ROW.
     jsr copyIncomingRowToScreen              // Character bytes -> screen row BG_DEST_ROW.
+#if OPT_BG_ROW_PREDECODE
+!bgRowInstalled:
+#endif
     jmp installTurretRow                    // Safe world-character installation; raw incoming buffer is unchanged.
 
 // --- Routine: wrapBgLogicalRow -------------------------------------------------
@@ -5673,6 +5905,60 @@ updateBackgroundScroll:
 // overwrites it, so the bytes need not be reproducible from any formula.
 // Called AFTER BUILD preparation, before the unchanged frame-start wait.
 prepareBackgroundCoarse:
+#if SCROLL_HITCH_DIAG
+    // The instrumented gate below adds enough bytes that `beq !done+` from here
+    // would overflow the 8-bit branch, so take an early rts instead (identical).
+    lda BG_COARSE_PENDING
+    bne !haveRequest+
+    rts
+!haveRequest:
+    lda #0
+    sta BG_COARSE_PENDING
+    // Same three gate checks, same order, same decision -- each failing branch
+    // first records its reason, then joins the common !defer path.
+    ldx RASTER_BATCH_OFFSET
+    cpx RASTER_BATCH_END
+    bcs !gateBeam+                          // Variable sprite IRQ/collision work has no place in this copy budget.
+    inc COARSE_DEFER_LIVE
+    bne !dLiveHi+
+    inc COARSE_DEFER_LIVE + 1
+!dLiveHi:
+    lda #1
+    sta COARSE_LAST_REASON
+    jmp !defer+
+!gateBeam:
+    lda VIC_CONTROL_1                       // Do not start late and run over sprite presentation at line 0.
+    bpl !gateCutoff+
+    inc COARSE_DEFER_BEAM
+    bne !dBeamHi+
+    inc COARSE_DEFER_BEAM + 1
+!dBeamHi:
+    lda #2
+    sta COARSE_LAST_REASON
+    jmp !defer+
+!gateCutoff:
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+    // Stage 3: pick the conservative or the extended reason-3 deadline (proof +
+    // compare + counter classification are in bgCoarseReason3Defer, out of this
+    // near-full $2920 segment). C=1 => defer reason 3; C=0 => admit.
+    jsr bgCoarseReason3Defer
+    bcc !waitRead+
+    lda #3
+    sta COARSE_LAST_REASON
+    jmp !defer+
+#else
+    lda RASTER
+    cmp #BG_COARSE_LATEST_START
+    bcc !waitRead+
+    inc COARSE_DEFER_CUTOFF
+    bne !dCutHi+
+    inc COARSE_DEFER_CUTOFF + 1
+!dCutHi:
+    lda #3
+    sta COARSE_LAST_REASON
+    jmp !defer+
+#endif
+#else
     lda BG_COARSE_PENDING
     beq !done+
     lda #0
@@ -5686,6 +5972,7 @@ prepareBackgroundCoarse:
     lda RASTER
     cmp #BG_COARSE_LATEST_START
     bcs !defer+
+#endif
 !waitRead:
     lda RASTER
     cmp #160
@@ -5720,10 +6007,31 @@ bgUpperReady:
     sta SCROLL_FINE                         // Published by applyFineScroll at the next raster 0.
     lda #1
     sta BG_COARSE_FINISH
+#if SCROLL_HITCH_DIAG
+    inc COARSE_ADMIT
+    bne !admitHi+
+    inc COARSE_ADMIT + 1
+!admitHi:
+    lda #0
+    sta COARSE_HOLD_RUN                     // hitch (if any) is over: reset the consecutive-deferral run
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+    jsr bgCoarseNoteReady                   // record the latest bgUpperReady raster this game (diag)
+#endif
+#endif
 !done:
     rts
 !defer:
     inc BG_COARSE_DEFERRED                  // Diagnostic counter: preserve a whole old frame if overloaded.
+#if SCROLL_HITCH_DIAG
+    inc COARSE_HOLD_RUN
+    lda COARSE_HOLD_RUN
+    cmp COARSE_HOLD_MAX
+    bcc !holdRecorded+
+    sta COARSE_HOLD_MAX
+    lda COARSE_LAST_REASON
+    sta COARSE_HOLD_MAX_REASON
+!holdRecorded:
+#endif
     lda #SCROLL_FRAME_DIVIDER - 1
     sta SCROLL_FRAME_COUNT                  // Retry next frame; no matrix or VIC phase has changed.
     rts
@@ -5962,7 +6270,22 @@ noteCoarseSuppressionOutcome:
 
 BG_COARSE_PENDING:     .byte 0
 BG_COARSE_FINISH:      .byte 0
-BG_COARSE_DEFERRED:    .byte 0
+BG_COARSE_DEFERRED:    .byte 0          // Legacy single counter: total coarse deferrals (all reasons).
+#if SCROLL_HITCH_DIAG
+// Scroll-hitch Stage 0: classify each coarse 7->0 deferral by reason and track
+// the longest run of consecutive deferrals (a "held fine-7" hitch). Counters
+// only -- prepareBackgroundCoarse's decision is unchanged. Reason codes:
+// 1 = a LIVE sprite batch is still outstanding; 2 = beam already wrapped past
+// 255; 3 = current raster >= BG_COARSE_LATEST_START. Read from a state dump.
+COARSE_DEFER_LIVE:     .word 0          // reason 1: pending-LIVE structural obstruction
+COARSE_DEFER_BEAM:     .word 0          // reason 2: raster-hi set at admission attempt
+COARSE_DEFER_CUTOFF:   .word 0          // reason 3: CPU-late -- past the raster cutoff
+COARSE_ADMIT:          .word 0          // coarse transitions actually admitted
+COARSE_HOLD_RUN:       .byte 0          // current consecutive-deferral run (0 while scrolling normally)
+COARSE_HOLD_MAX:       .byte 0          // longest consecutive-deferral run observed this game
+COARSE_HOLD_MAX_REASON:.byte 0          // reason code of the frame that set COARSE_HOLD_MAX
+COARSE_LAST_REASON:    .byte 0          // reason code of the most recent deferral
+#endif
 BG_INCOMING_ROW:       .fill 40, 0      // 40-byte holding buffer for stage data not yet on screen:
                                          // decodeStageCharacterRow expands one logical stage row here;
                                          // copyIncomingRowToScreen then copies it to a screen row. Never
@@ -6566,6 +6889,332 @@ STAGE_TEST_END:
 .if (STAGE_TEST_END > $a000) {
     .error "Test stage assets overlap BASIC ROM"
 }
+#if OPT_BG_ROW_PREDECODE
+// ============================================================================
+// Scroll-hitch Stage 2: incoming-row terrain predecode
+// ----------------------------------------------------------------------------
+// The coarse 7->0 transition (prepareBackgroundCoarse) reveals ONE new terrain
+// row at matrix row 0. Stage 1 decoded it (decodeStageCharacterRow, ~1,400
+// clocks) INSIDE the raster-160..184 window. Stage 2 decodes that row on an
+// earlier, non-raster-critical frame into BG_PREDECODED_ROW, tagged with its
+// exact 16-bit logical row; the window then only copies 40 bytes to screen and
+// runs the live turret overlay.
+//
+// NEXT-ROW FORMULA. renderStageRowToScreen with BG_DEST_ROW = 0 decodes
+//   (SCROLL_ROW_new + 0 - 1) mod STAGE_LOGICAL_ROWS,
+// and the coarse step first sets SCROLL_ROW_new = SCROLL_ROW - 1, or, when
+// SCROLL_ROW == 0, SCROLL_ROW_new = STAGE_LOGICAL_ROWS - 1. Both collapse to
+//   target = (SCROLL_ROW - 2) mod STAGE_LOGICAL_ROWS.
+// SCROLL_ROW is in [0, SLR-1], so target-before-fold is in [-2, SLR-3]; the
+// only underflow is SCROLL_ROW 0 or 1, folded up by one SLR. This is NOT the
+// Stage 0/1 report's shorthand "SCROLL_ROW - 1" -- renderStageRowToScreen's own
+// "- 1" stacks on the coarse step's "- 1".
+//
+// The tag IS the invalidation mechanism: a discontinuous SCROLL_ROW change (a
+// wrap, a test-fixture poke, a future level reinit) makes the required row no
+// longer equal the stored tag, so bgConsumePredecodedRow falls back to the
+// exact in-window decode and predecodeNextStageRow restages next frame. A stage
+// wrap additionally forces the fallback via TURRET_STREAM_REWIND (set in the
+// same coarse step) so there is never any doubt at the loop point.
+// ============================================================================
+
+#if !BG_INC_WORD_MACRO_DEFINED
+.macro bgIncWord(w) {
+    inc w
+    bne !noHi+
+    inc w + 1
+!noHi:
+}
+#endif
+
+// --- Routine: predecodeNextStageRow -----------------------------------------
+// Frame-loop call, AFTER the sort/BUILD/suppression work and BEFORE
+// prepareBackgroundCoarse. Cheap tag-compare no-op whenever the correct row is
+// already staged -- including every held fine-7 frame during a pending-LIVE
+// hold (SCROLL_ROW, hence the target, does not move). Otherwise decodes the
+// target row's TERRAIN into BG_PREDECODED_ROW and tags it. No turret overlay.
+// Clobbers A/X/Y and the decodeStageCharacterRow scratch (BG_INCOMING_ROW,
+// TEXT_SRC, BG_ROW_IDS, BG_DEF_BASE, BG_COL, BG_OUT_BASE, BG_TILE_ROW_OFS,
+// BG_METATILE_ROW(_HI), BG_ROW_BASE(_HI), BG_LOGICAL_ROW(16)) -- all provably
+// dead at this call site: their only readers are decodeStageCharacterRow /
+// renderStageRowToScreen / installTurretRow (init + the coarse admit path that
+// runs AFTER this call and re-initialises them) and cacheTurretGroundCodes
+// (runs earlier, in updateTurretStream, and consumes them within its own body).
+predecodeNextStageRow:
+    lda SCROLL_ROW                          // target(16) = SCROLL_ROW(16) - 2
+    sec
+    sbc #2
+    sta BG_LOGICAL_ROW
+    lda SCROLL_ROW_HI
+    sbc #0
+    sta BG_LOGICAL_ROW_HI
+    bcs !haveTarget+                        // no borrow => SCROLL_ROW >= 2, target already in range
+    lda BG_LOGICAL_ROW                      // SCROLL_ROW was 0 or 1: fold up by one STAGE_LOGICAL_ROWS
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta BG_LOGICAL_ROW
+    lda BG_LOGICAL_ROW_HI
+    adc #>STAGE_LOGICAL_ROWS
+    sta BG_LOGICAL_ROW_HI
+!haveTarget:
+    lda BG_PREDECODE_VALID                  // already staged for exactly this row? (the fine-7 hold no-op)
+    beq !stage+
+    lda BG_PREDECODE_ROW_LO
+    cmp BG_LOGICAL_ROW
+    bne !stage+
+    lda BG_PREDECODE_ROW_HI
+    cmp BG_LOGICAL_ROW_HI
+    beq !done+
+!stage:
+    jsr decodeStageCharacterRow            // TERRAIN ONLY -> BG_INCOMING_ROW
+    ldy #39
+!copy:
+    lda BG_INCOMING_ROW,y
+    sta BG_PREDECODED_ROW,y
+    dey
+    bpl !copy-
+    lda BG_LOGICAL_ROW
+    sta BG_PREDECODE_ROW_LO
+    lda BG_LOGICAL_ROW_HI
+    sta BG_PREDECODE_ROW_HI
+    lda #1
+    sta BG_PREDECODE_VALID
+    bgIncWord(BG_PREDECODE_PREPARED)
+!done:
+    rts
+
+// --- Routine: bgConsumePredecodedRow --------------------------------------
+// Called by renderStageRowToScreen AFTER wrapBgLogicalRow (so BG_LOGICAL_ROW(16)
+// is the exact required row) and BEFORE decodeStageCharacterRow. Only the
+// BG_DEST_ROW == 0 coarse reveal can be served from the cache; the 25 init-row
+// fills and every non-zero dest row always decode.
+//   Exit C=1: the staged 40-byte terrain row was copied to screen row 0
+//             (TEXT_DST left at screen row 0, exactly as copyIncomingRowToScreen
+//             leaves it); the caller must NOT decode. BG_PREDECODE_VALID cleared.
+//   Exit C=0: nothing consumed; the caller runs the unchanged decode + copy.
+bgConsumePredecodedRow:
+    lda BG_DEST_ROW
+    bne !decodeNoStats+                     // init rows 1..24: never cached, not counted
+    lda BG_PREDECODE_VALID
+    beq !fallback+                          // nothing staged yet (startup / just consumed)
+    lda TURRET_STREAM_REWIND
+    bne !fallbackWrap+                      // stage wrapped in THIS coarse step: decode the loop row fresh
+    lda BG_PREDECODE_ROW_LO
+    cmp BG_LOGICAL_ROW
+    bne !fallbackTag+
+    lda BG_PREDECODE_ROW_HI
+    cmp BG_LOGICAL_ROW_HI
+    bne !fallbackTag+
+    // ---- HIT: install the staged terrain into screen row 0 ----
+    lda #0
+    sta BG_PREDECODE_VALID
+    bgIncWord(BG_PREDECODE_HIT)
+    ldy #0                                  // BG_DEST_ROW == 0 here
+    lda starRowLo,y
+    sta TEXT_DST
+    lda starRowHi,y
+    sta TEXT_DST + 1
+    ldy #39
+!hitCopy:
+    lda BG_PREDECODED_ROW,y
+    sta (TEXT_DST),y
+    dey
+    bpl !hitCopy-
+    sec
+    rts
+!fallbackWrap:
+    bgIncWord(BG_PREDECODE_INVAL)
+    jmp !fallback+
+!fallbackTag:
+    bgIncWord(BG_PREDECODE_TAGMISS)
+!fallback:
+    bgIncWord(BG_PREDECODE_MISS)
+!decodeNoStats:
+    clc
+    rts
+
+// --- Routine: bgPredecodeReset -------------------------------------------
+// initBackground, before SCROLL_ROW is seeded. Drop any staged row and zero the
+// per-game cache counters.
+bgPredecodeReset:
+    lda #0
+    sta BG_PREDECODE_VALID
+    ldx #(bgPredecodeStatsEnd - bgPredecodeStats - 1)
+!clr:
+    sta bgPredecodeStats,x
+    dex
+    bpl !clr-
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+    lda #0
+    ldx #(bgCoarseStage3StateEnd - bgCoarseStage3State - 1)
+!clr3:
+    sta bgCoarseStage3State,x
+    dex
+    bpl !clr3-
+#endif
+    rts
+
+BG_PREDECODED_ROW:     .fill 40, 0      // 40 terrain character codes for the next coarse reveal (row 0).
+                                         // Terrain only -- installTurretRow overlays live turret bodies at
+                                         // the real reveal point. NOT aliased with BG_INCOMING_ROW /
+                                         // BG_CROSSING_ROW (both keep their existing lifetimes).
+BG_PREDECODE_VALID:    .byte 0          // nonzero => BG_PREDECODED_ROW + tag below are usable
+BG_PREDECODE_ROW_LO:   .byte 0          // 16-bit LE logical-row tag the buffer was decoded for
+BG_PREDECODE_ROW_HI:   .byte 0
+bgPredecodeStats:
+BG_PREDECODE_PREPARED: .word 0          // decode-into-buffer operations this game (first stage + restages)
+BG_PREDECODE_HIT:      .word 0          // coarse reveals served from the buffer (in-window decode skipped)
+BG_PREDECODE_MISS:     .word 0          // coarse reveals that fell back to the in-window decode (total)
+BG_PREDECODE_TAGMISS:  .word 0          //   ... subset: a row was staged but its tag did not match
+BG_PREDECODE_INVAL:    .word 0          //   ... subset: forced by a stage wrap in the same coarse step
+bgPredecodeStatsEnd:
+
+#if OPT_BG_COARSE_EXTENDED_DEADLINE
+// ============================================================================
+// Scroll-hitch Stage 3: predecode-aware CPU-late coarse-admission deadline
+// ----------------------------------------------------------------------------
+// bgCoarseHitGuaranteed is the gate-time predicate. It returns C=1 iff the
+// coarse step about to be admitted is GUARANTEED to consume the Stage 2
+// predecoded row via bgConsumePredecodedRow's HIT path (the short ~99-line
+// reveal instead of the ~128-line MISS/fallback reveal), so prepareBackgroundCoarse
+// may judge the arrival raster against the later BG_COARSE_HIT_LATEST_START.
+//
+// The conditions are exactly bgConsumePredecodedRow's HIT conditions, evaluated
+// with the PRE-decrement SCROLL_ROW still current at the gate:
+//   * BG_PREDECODE_VALID != 0
+//   * NOT an impending stage wrap (SCROLL_ROW(16) != 0). bgUpperCopied sets
+//     TURRET_STREAM_REWIND on a wrap BEFORE the consume, which forces the
+//     consumer's MISS path regardless of the tag -- so a wrap step must use the
+//     conservative deadline.
+//   * BG_PREDECODE_ROW tag == (SCROLL_ROW - 2) mod STAGE_LOGICAL_ROWS. This is
+//     precisely the row bgConsumePredecodedRow will require after the coarse
+//     step's SCROLL_ROW-- and renderStageRowToScreen's wrapBgLogicalRow (Stage 2
+//     report S3/S11). BG_DEST_ROW is structurally 0 for the coarse reveal, so it
+//     is not re-checked.
+// Between this predicate and the consume only SCROLL_ROW-- (non-wrap) and
+// BG_DEST_ROW:=0 run; saveCrossingRow / shiftBackgroundUpper and the raster IRQ
+// path touch neither the tag, the valid bit nor SCROLL_ROW -- so a C=1 here is
+// still true at the consume.
+//
+// The target arithmetic below MUST stay identical to predecodeNextStageRow's
+// (Stage 2). Proven equivalent for all SCROLL_ROW 0..STAGE_LOGICAL_ROWS-1 by
+// the Stage 3 probe (Section 6/11).
+bgCoarseHitGuaranteed:
+    lda BG_PREDECODE_VALID
+    beq !noCache+
+    lda SCROLL_ROW
+    ora SCROLL_ROW_HI
+    beq !unqual+                           // SCROLL_ROW == 0 -> wrap step -> consumer forces MISS
+    lda SCROLL_ROW                          // gateRow(16) = SCROLL_ROW(16) - 2  (SCROLL_ROW >= 1 here)
+    sec
+    sbc #2
+    sta BG_COARSE_GATE_ROW
+    lda SCROLL_ROW_HI
+    sbc #0
+    sta BG_COARSE_GATE_ROW + 1
+    bcs !cmpTag+                            // no borrow => SCROLL_ROW >= 2, in range
+    lda BG_COARSE_GATE_ROW                  // SCROLL_ROW was 1: fold up by one STAGE_LOGICAL_ROWS
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta BG_COARSE_GATE_ROW
+    lda BG_COARSE_GATE_ROW + 1
+    adc #>STAGE_LOGICAL_ROWS
+    sta BG_COARSE_GATE_ROW + 1
+!cmpTag:
+    lda BG_PREDECODE_ROW_LO
+    cmp BG_COARSE_GATE_ROW
+    bne !unqual+
+    lda BG_PREDECODE_ROW_HI
+    cmp BG_COARSE_GATE_ROW + 1
+    bne !unqual+
+#if SCROLL_HITCH_DIAG
+    bgIncWord(COARSE_DL_EXT)
+#endif
+    sec
+    rts
+!unqual:                                    // cache present but this step cannot use the HIT path
+#if SCROLL_HITCH_DIAG
+    bgIncWord(COARSE_CACHE_VALID_UNQUAL)
+#endif
+!noCache:
+#if SCROLL_HITCH_DIAG
+    bgIncWord(COARSE_DL_CONS)
+#endif
+    clc
+    rts
+
+// --- Routine: bgCoarseReason3Defer ---------------------------------------
+// The whole reason-3 (CPU-late) gate, lifted out of the near-full $2920 code
+// segment. Picks the effective deadline (extended iff bgCoarseHitGuaranteed),
+// compares the current raster, updates the classification counters.
+//   Exit C=1: defer reason 3 (COARSE_DEFER_CUTOFF + COARSE_CUT_EXT/_CONS bumped)
+//   Exit C=0: admit             (COARSE_ADMIT_EXT bumped if the extended
+//             deadline was the one in force)
+// COARSE_DL_USED holds the deadline this request was judged against.
+bgCoarseReason3Defer:
+    jsr bgCoarseHitGuaranteed              // clobbers A; C=1 => guaranteed Stage 2 HIT
+    lda #BG_COARSE_LATEST_START            // conservative (reload -- the sub trashed A)
+    bcc !haveDl+
+    lda #BG_COARSE_HIT_LATEST_START        // guaranteed HIT: the extended deadline is safe
+!haveDl:
+    sta COARSE_DL_USED
+    lda RASTER
+    cmp COARSE_DL_USED
+    bcc !admit+                             // RASTER < deadline -> admit
+    bgIncWord(COARSE_DEFER_CUTOFF)          // legacy Stage 0 reason-3 counter
+    lda COARSE_DL_USED
+    cmp #BG_COARSE_HIT_LATEST_START
+    bne !deferCons+
+    bgIncWord(COARSE_CUT_EXT)
+    jmp !deferDone+
+!deferCons:
+    bgIncWord(COARSE_CUT_CONS)
+!deferDone:
+    sec
+    rts
+!admit:
+    lda COARSE_DL_USED
+    cmp #BG_COARSE_HIT_LATEST_START
+    bne !admitDone+
+    bgIncWord(COARSE_ADMIT_EXT)
+!admitDone:
+    clc
+    rts
+
+// --- Routine: bgCoarseNoteReady ----------------------------------------
+// bgUpperReady tail (also lifted out of $2920): record the latest bgUpperReady
+// raster this game as raster-256, only while the beam is past line 256 (an
+// earlier finish is always safe). Answers "how close did admitted transitions
+// come to physical line 0".
+bgCoarseNoteReady:
+    lda VIC_CONTROL_1
+    bpl !done+
+    lda RASTER
+    cmp COARSE_UPPER_READY_RASTER_MAX
+    bcc !done+
+    sta COARSE_UPPER_READY_RASTER_MAX
+!done:
+    rts
+
+bgCoarseStage3State:
+COARSE_DL_USED:               .byte 0      // effective reason-3 deadline the last request was judged against
+BG_COARSE_GATE_ROW:          .word 0      // bgCoarseHitGuaranteed scratch: (SCROLL_ROW - 2) mod SLR
+COARSE_DL_EXT:               .word 0      // coarse requests judged under the extended HIT deadline
+COARSE_DL_CONS:              .word 0      // coarse requests judged under the conservative deadline
+COARSE_CACHE_VALID_UNQUAL:   .word 0      //   subset of _CONS: cache VALID but wrap / tag mismatch
+COARSE_ADMIT_EXT:            .word 0      // admits granted under the extended deadline
+COARSE_CUT_EXT:              .word 0      // reason-3 defers under the extended deadline
+COARSE_CUT_CONS:             .word 0      // reason-3 defers under the conservative deadline
+COARSE_UPPER_READY_RASTER_MAX:.byte 0     // latest bgUpperReady raster this game, minus 256 (only tracked
+                                          // while beam >= 256; 0 => bgUpperReady always finished before line 256)
+bgCoarseStage3StateEnd:
+#endif
+
+.if (* > $8800) {
+    .error "Stage 2/3 predecode routines/state collide with the background turret segment ($8800)"
+}
+#endif
+
 
 // Separate CPU allocation; no overlap with VIC-bank data or diagnostic callers.
 // Turret BEHAVIOUR + guards; PLACEMENT (TURRET_COUNT/turretCols/turretRows) is
