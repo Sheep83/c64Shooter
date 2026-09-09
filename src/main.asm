@@ -140,8 +140,7 @@
 //                               A and B logically identical -- display-page proof
 //                               only; the coarse-scroll path is unchanged.
 //
-//   Stages 4D+ (inactive-page coarse construction, flip-on-coarse, reason-1
-//   removal) are NOT implemented in this pass.
+//   Stage 4E+ (flip-on-coarse, reason-1 removal) is NOT implemented in this pass.
 //
 //   With OPT_SECOND_SCREEN commented the build is byte-identical to the Stage 3
 //   default f2abc225159e81bfc6f911bea28558dbe55821eb9546bb8cab45b0893f027991.
@@ -152,6 +151,28 @@
     #define OPT_SS_RELOCATE
     #define OPT_SS_PAGE_B
     #define OPT_SS_FLIP_PROOF
+    // 4D: incrementally build the exact next coarse screen state in the INACTIVE
+    // page (terrain only; turret overlay stays a flip-time / Stage-4E concern).
+    // The real coarse-admission path (prepareBackgroundCoarse) is unchanged.
+    // Commented -> the OPT_SECOND_SCREEN build stays byte-identical to the
+    // 4A+4B+4C baseline (326f1686f3cf3d05...).
+    //#define OPT_SS_INACTIVE_BUILD
+    // 4E: publish an admitted coarse step as a $D018 page flip to the already-
+    // prepared INACTIVE page, SKIPPING the legacy visible-matrix mutation
+    // (shiftBackgroundUpper/Lower + crossing-row). Turret CHAR reconcile + Option-B
+    // sprite-pointer mirror happen at the flip. The reason-1 gate is UNCHANGED
+    // (Stage 4F removes it). Commented -> Mode-3 (4D-only) behaviour + hash.
+    //#define OPT_SS_FLIP_COARSE
+#endif
+
+#if (OPT_SS_INACTIVE_BUILD && !SCROLL_HITCH_DIAG)
+    .error "OPT_SS_INACTIVE_BUILD needs SCROLL_HITCH_DIAG (shared coarse-state / SCROLL_ROW semantics)"
+#endif
+#if (OPT_SS_INACTIVE_BUILD && !OPT_BG_ROW_PREDECODE)
+    .error "OPT_SS_INACTIVE_BUILD needs OPT_BG_ROW_PREDECODE (shares BG_PREDECODED_ROW for the incoming row)"
+#endif
+#if (OPT_SS_FLIP_COARSE && !OPT_SS_INACTIVE_BUILD)
+    .error "OPT_SS_FLIP_COARSE needs OPT_SS_INACTIVE_BUILD (it publishes the page that builder prepares)"
 #endif
 
 #if OPT_BG_COARSE_EXTENDED_DEADLINE
@@ -6056,14 +6077,14 @@ prepareBackgroundCoarse:
     // compare + counter classification are in bgCoarseReason3Defer, out of this
     // near-full $2920 segment). C=1 => defer reason 3; C=0 => admit.
     jsr bgCoarseReason3Defer
-    bcc !waitRead+
+    bcc !admitDecided+
     lda #3
     sta COARSE_LAST_REASON
     jmp !defer+
 #else
     lda RASTER
     cmp #BG_COARSE_LATEST_START
-    bcc !waitRead+
+    bcc !admitDecided+
     inc COARSE_DEFER_CUTOFF
     bne !dCutHi+
     inc COARSE_DEFER_CUTOFF + 1
@@ -6086,6 +6107,55 @@ prepareBackgroundCoarse:
     lda RASTER
     cmp #BG_COARSE_LATEST_START
     bcs !defer+
+#endif
+!admitDecided:
+#if OPT_SS_FLIP_COARSE
+    // Stage 4E: if the INACTIVE page is a complete, correctly-tagged next-coarse
+    // state and its pointer table is mirrored, publish by page flip instead of
+    // mutating the visible matrix. SCROLL_ROW is decremented HERE (same as the
+    // legacy path); ssPublishCoarseFlip (finishBackgroundCoarse, next frame top)
+    // does the $D018 write + role swap + turret CHAR reconcile.
+    jsr ssFlipPrereqOK
+    bcc !legacyCoarsePath+
+    lda SCROLL_ROW
+    ora SCROLL_ROW_HI
+    bne !flipNoWrap+
+    lda #<STAGE_LOGICAL_ROWS
+    sta SCROLL_ROW
+    lda #>STAGE_LOGICAL_ROWS
+    sta SCROLL_ROW_HI
+    lda #1
+    sta TURRET_STREAM_REWIND
+    sta WAVE_TRIGGER_REWIND
+!flipNoWrap:
+    lda SCROLL_ROW
+    sec
+    sbc #1
+    sta SCROLL_ROW
+    lda SCROLL_ROW_HI
+    sbc #0
+    sta SCROLL_ROW_HI
+    lda #0
+    sta SCROLL_FINE                         // published by applyFineScroll next frame top
+    jsr ssFlipNoteAdmit                     // SS_FLIP_PENDING=1, SS_FLIP_ADMIT++, SS_FLIP_PATH_COUNT++
+#if SCROLL_HITCH_DIAG
+    inc COARSE_ADMIT
+    bne !flipAdmHi+
+    inc COARSE_ADMIT + 1
+!flipAdmHi:
+    lda #0
+    sta COARSE_HOLD_RUN
+#endif
+    rts
+!legacyCoarsePath:
+    inc SS_LEGACY_COARSE_PATH_COUNT
+    bne !lcpHi+
+    inc SS_LEGACY_COARSE_PATH_COUNT + 1
+!lcpHi:
+    inc SS_FLIP_FALLBACK
+    bne !lcpHi2+
+    inc SS_FLIP_FALLBACK + 1
+!lcpHi2:
 #endif
 !waitRead:
     lda RASTER
@@ -6159,6 +6229,13 @@ bgUpperReady:
 // Colour RAM is a stage-global fixed value and is not moved.
 gameplayPresented:                         // Diagnostic presentation point, before any lower-copy work.
 finishBackgroundCoarse:
+#if OPT_SS_FLIP_COARSE
+    lda SS_FLIP_PENDING
+    beq !noFlip+
+    jmp ssPublishCoarseFlip                 // 4E: mirror ptrs + turret CHAR reconcile + $D018 + role swap (ends rts).
+                                             // The legacy shiftBackgroundLower / crossing-row is NOT run for this step.
+!noFlip:
+#endif
     lda BG_COARSE_FINISH
     beq !done+
     lda #0
@@ -6167,7 +6244,12 @@ finishBackgroundCoarse:
     jsr restoreCrossingRow
 bgLowerReady:
 !done:
+#if OPT_SS_FLIP_COARSE
+    jmp ssFlipMirrorPtrs                    // 4E Option B: keep the INACTIVE page's $3F8 pointer table current
+                                             // every frame so it is ready the instant it becomes ACTIVE (ends rts).
+#else
     rts
+#endif
 
 // --- Routine: planCoarseBulletSuppression --------------------------------
 // PRESENTATION ONLY. Called after buildBatchSpriteSchedule and before
@@ -6371,6 +6453,9 @@ noteCoarseSuppressionOutcome:
     sta SUPPRESS_PREV_ID
     lda #0
     sta SUPPRESS_CONSEC
+#if OPT_SS_INACTIVE_BUILD
+    jmp ssInactiveBuildTick               // 4D: per-frame INACTIVE-page build tick, AFTER prepareBackgroundCoarse
+#endif
     rts
 !suppressed:
     lda BG_COARSE_DEFERRED                  // Did a coarse deferral still occur this frame?
@@ -6380,6 +6465,9 @@ noteCoarseSuppressionOutcome:
     bne !done+
     inc SUPPRESS_DEFER_AFTER + 1
 !done:
+#if OPT_SS_INACTIVE_BUILD
+    jmp ssInactiveBuildTick
+#endif
     rts
 
 BG_COARSE_PENDING:     .byte 0
@@ -6725,6 +6813,697 @@ ssFlipPage:
     inc SS_FLIP_COUNT + 1
 !done:
     rts
+#endif
+
+#if OPT_SS_INACTIVE_BUILD
+// ============================================================================
+// Stage 4D: incremental INACTIVE-page construction of the next coarse state.
+// ----------------------------------------------------------------------------
+// The current single-screen coarse step (prepareBackgroundCoarse +
+// finishBackgroundCoarse) is, net over its two frames:
+//     newRow[r] = oldRow[r-1]      for r = 1..24
+//     newRow[0] = decodeTerrain((SCROLL_ROW - 2) mod SLR)  + live turret overlay
+// The two-frame split and BG_CROSSING_ROW exist ONLY because that mutation is
+// in-place on the displayed matrix and must dodge the beam. In the INACTIVE
+// page there is no beam constraint: the whole transform is just
+//     INACTIVE[r] = ACTIVE[r-1]   (r = 1..24)   +   INACTIVE[0] = BG_PREDECODED_ROW
+// spread across the ~16 physical frames between coarse steps (divider 2).
+//
+// TERRAIN ONLY. The row-0 terrain is taken from the Stage-2 predecode buffer
+// (BG_PREDECODED_ROW), whose target -- (SCROLL_ROW-2) mod SLR -- is IDENTICAL to
+// this builder's row-0 target, so the decoded row is shared, never decoded twice.
+// Turret body glyphs that are baked into the copied ACTIVE rows are carried
+// verbatim; a flip-time turret reconcile (Stage 4E, against the post-flip
+// SCROLL_ROW) is what makes a turret that changes state between build and flip
+// correct. 4D only proves the terrain builder; it never flips.
+//
+// TAG / VALIDITY. SS_BUILD_TARGET_ROW(16) = the post-coarse SCROLL_ROW the
+// finished page represents = (SCROLL_ROW - 1) mod SLR. SS_INACTIVE_VALID is set
+// only when all 24 shifted rows AND row 0 are in place for that exact tag. A
+// changed tag (a real coarse admit -- seamless across a stage wrap -- or a
+// discontinuous SCROLL_ROW change) restarts the build; ssInactiveBuildReset
+// (from bgPredecodeReset) clears everything at initBackground.
+//
+// Entry point ssInactiveBuildTick is TAIL-CALLED from predecodeNextStageRow
+// (which it shares BG_PREDECODED_ROW and the (SCROLL_ROW-2) target with), so no
+// byte is added to the near-full $080e gameLoop segment. It clobbers A/X/Y and
+// TEXT_SRC/TEXT_DST -- all provably dead here, exactly as the Stage-2 predecode
+// documents for this same call site.
+// ============================================================================
+.const SS_BUILD_DEFAULT_SLICE_ROWS = 2
+.const SS_SLICE_RASTER_CUTOFF      = 220   // stop a build slice if the beam is already this low this frame
+
+SS_BUILD_STATE:            .byte 0   // 0 idle, 1 building shifted rows, 2 complete + valid
+SS_INACTIVE_VALID:         .byte 0   // mirror of (STATE == 2); the task's named check
+SS_BUILD_NEXT_ROW:         .byte 0   // next INACTIVE matrix row to fill (1..24); reaching 25 => shifted rows done
+SS_BUILD_TARGET_ROW_LO:    .byte 0   // post-coarse SCROLL_ROW the finished INACTIVE page represents
+SS_BUILD_TARGET_ROW_HI:    .byte 0
+SS_BUILD_SLICE_ROWS:       .byte SS_BUILD_DEFAULT_SLICE_ROWS   // rows per slice; 4D.4 sweeps this via a monitor poke
+SS_BUILD_TMP_LO:           .byte 0
+SS_BUILD_TMP_HI:           .byte 0
+ssBuildStats:
+SS_BUILD_START_COUNT:      .word 0   // builds (re)started this game
+SS_BUILD_COMPLETE_COUNT:   .word 0   // builds carried to VALID this game
+SS_BUILD_ADVANCE_COUNT:    .word 0   // normal target -1 advances (coarse step; seamless across a wrap)
+SS_BUILD_INVALIDATE_COUNT: .word 0   // discontinuous invalidations (initBackground reset NOT counted)
+SS_INVAL_DISCONT:          .word 0   //   subset: SCROLL_ROW jumped by != {0,-1} (fixture poke / repaint)
+SS_BUILD_SLICE_WORK:       .word 0   // shifted rows actually copied this game (must stop rising once VALID)
+SS_BUILD_REDUNDANT_WORK:   .word 0   // shifted rows copied while SS_INACTIVE_VALID != 0  (MUST stay 0)
+SS_BUILD_ROW0_WAIT:        .word 0   // frames held at rows-done because BG_PREDECODED_ROW was not yet ready
+SS_BUILD_SKIP_COUNT:       .word 0   // frames the scheduler withheld the slice (coarse-imminent / late beam)
+SS_BUILD_SLICE_DEFER_COUNT:.word 0   // times a slice stopped early on the raster budget guard
+ssBuildStatsEnd:
+
+// Page hi-byte deltas from page A, indexed by BG_ACTIVE_PAGE (0 = A shown).
+// Page B rows are page A rows + $2400, so only the address hi byte changes.
+ssActiveHiDelta:   .byte $00, $24
+ssInactiveHiDelta: .byte $24, $00
+ssActiveD018:      .byte BG_SCREEN_A_D018, BG_SCREEN_B_D018
+ssInactiveD018:    .byte BG_SCREEN_B_D018, BG_SCREEN_A_D018
+
+// --- Routine: ssInactiveBuildReset --------------------------------------------
+// initBackground path (via bgPredecodeReset): drop any in-flight build and zero
+// the per-game 4D counters. The default slice size is restored.
+ssInactiveBuildReset:
+    lda #0
+    sta SS_BUILD_STATE
+    sta SS_INACTIVE_VALID
+    sta SS_BUILD_NEXT_ROW
+    sta SS_BUILD_TARGET_ROW_LO
+    sta SS_BUILD_TARGET_ROW_HI
+    ldx #(ssBuildStatsEnd - ssBuildStats - 1)
+!clr:
+    sta ssBuildStats,x
+    dex
+    bpl !clr-
+    lda #SS_BUILD_DEFAULT_SLICE_ROWS
+    sta SS_BUILD_SLICE_ROWS
+#if OPT_SS_FLIP_COARSE
+    jmp ssFlipCoarseReset                 // drop any pending flip + zero the 4E counters (ends rts)
+#else
+    rts
+#endif
+
+// --- Routine: ssInactiveBuildTick -------------------------------------------
+// Once per frame from predecodeNextStageRow's tail, AFTER the predecode has
+// staged BG_PREDECODED_ROW and BEFORE prepareBackgroundCoarse.
+//
+// Bounded scheduler (4D.4). The whole tick -- target refresh AND the slice -- is
+// WITHHELD on the two coarse-critical frames of each cycle:
+//   * BG_COARSE_PENDING: the fine-7 frame prepareBackgroundCoarse may admit on
+//     (measured near-full: even ~80 cy of target-refresh math here costs one
+//     RASTER_REPLAY_FRAME), and
+//   * BG_COARSE_FINISH:  the post-admit frame that still owes shiftBackground
+//     Lower (3520 cy) + restoreCrossingRow in the present chain.
+// The target cannot change on either frame (SCROLL_ROW is decremented INSIDE
+// prepareBackgroundCoarse, after this call), so deferring the refresh to the
+// next clear frame loses nothing. Also withheld once the beam has wrapped past
+// 255 (too late in this frame). The build then has ~13 clear frames per cycle
+// for ~8-12 slices, so it still completes well before the next coarse step.
+ssInactiveBuildTick:
+    lda BG_COARSE_PENDING
+    ora BG_COARSE_FINISH
+#if OPT_SS_FLIP_COARSE
+    ora SS_FLIP_PENDING                     // admit frame: the flip is armed, stay clear of it
+    ora SS_FLIP_HOLDOFF                     // the ssPublishCoarseFlip frame: one more clear frame
+    bne !withholdFlip+
+#else
+    bne !withhold+
+#endif
+    lda VIC_CONTROL_1
+    bmi !withhold+                          // $D011 bit7: beam wrapped past 255
+    jsr ssInactiveBuildRefreshTarget
+    jmp ssInactiveBuildSlice
+#if OPT_SS_FLIP_COARSE
+!withholdFlip:
+    lda SS_FLIP_HOLDOFF
+    beq !withhold+
+    dec SS_FLIP_HOLDOFF
+#endif
+!withhold:
+    inc SS_BUILD_SKIP_COUNT
+    bne !w+
+    inc SS_BUILD_SKIP_COUNT + 1
+!w:
+    rts
+// --- Routine: ssInactiveBuildSlice ----------------------------------------
+ssInactiveBuildSlice:
+    lda SS_BUILD_STATE
+    cmp #1
+    beq !building+
+    rts                                    // idle (0) or complete+valid (2): nothing to do (the held-frame no-op)
+!building:
+    ldx SS_BUILD_SLICE_ROWS
+!rowLoop:
+    lda SS_BUILD_NEXT_ROW
+    cmp #25
+    bcs !shiftedRowsDone+
+    // Raster budget guard: if the build phase is running late this frame (main a
+    // frame behind), stop before a row copy can be caught by the line-1 IRQ ->
+    // that is exactly the +1 replay-per-coarse-cycle. The unbuilt rows resume
+    // next frame; the build still has enough clear frames per cycle.
+    lda VIC_CONTROL_1
+    bmi !sliceBudgetUp+                    // beam wrapped past 255: stop now
+    lda RASTER
+    cmp #SS_SLICE_RASTER_CUTOFF
+    bcs !sliceBudgetDone+                  // beam past the cutoff: stop now
+    jmp !doRow+
+!sliceBudgetUp:
+    // fall through
+!sliceBudgetDone:
+    inc SS_BUILD_SLICE_DEFER_COUNT
+    bne !sbd1+
+    inc SS_BUILD_SLICE_DEFER_COUNT + 1
+!sbd1:
+    rts
+!doRow:
+    jsr ssCopyOneInactiveRow               // INACTIVE[NEXT_ROW] <- ACTIVE[NEXT_ROW - 1]
+    inc SS_BUILD_SLICE_WORK
+    bne !w1+
+    inc SS_BUILD_SLICE_WORK + 1
+!w1:
+    lda SS_INACTIVE_VALID                  // structural check: no copy work may happen once VALID
+    beq !notRedundant+
+    inc SS_BUILD_REDUNDANT_WORK
+    bne !notRedundant+
+    inc SS_BUILD_REDUNDANT_WORK + 1
+!notRedundant:
+    inc SS_BUILD_NEXT_ROW
+    dex
+    bne !rowLoop-
+    rts
+!shiftedRowsDone:
+    // All 24 shifted rows are placed. Complete only when the shared predecode
+    // buffer holds THIS build's row-0 terrain ((target - 1) mod SLR).
+    jsr ssRow0TargetMatchesPredecode
+    bcs !installRow0+
+    inc SS_BUILD_ROW0_WAIT                 // predecode not ready yet (e.g. just after a wrap): retry next frame
+    bne !w2+
+    inc SS_BUILD_ROW0_WAIT + 1
+!w2:
+    rts
+!installRow0:
+    jsr ssInstallInactiveRow0             // INACTIVE[0] <- BG_PREDECODED_ROW (terrain only)
+    lda #2
+    sta SS_BUILD_STATE
+    lda #1
+    sta SS_INACTIVE_VALID
+    inc SS_BUILD_COMPLETE_COUNT
+    bne !c1+
+    inc SS_BUILD_COMPLETE_COUNT + 1
+!c1:
+    rts
+
+// --- Routine: ssInactiveBuildRefreshTarget --------------------------------
+// target(16) = (SCROLL_ROW - 1) mod SLR  (the post-coarse SCROLL_ROW).
+// Same tag  -> keep the current build / valid state.
+// target == stored - 1 (mod SLR) -> normal advance: restart the build.
+// anything else -> discontinuity: restart + count.
+ssInactiveBuildRefreshTarget:
+    lda SCROLL_ROW
+    sec
+    sbc #1
+    sta SS_BUILD_TMP_LO
+    lda SCROLL_ROW_HI
+    sbc #0
+    sta SS_BUILD_TMP_HI
+    bcs !haveTarget+                        // no borrow => SCROLL_ROW >= 1
+    lda #<(STAGE_LOGICAL_ROWS - 1)          // SCROLL_ROW == 0 -> target = SLR - 1
+    sta SS_BUILD_TMP_LO
+    lda #>(STAGE_LOGICAL_ROWS - 1)
+    sta SS_BUILD_TMP_HI
+!haveTarget:
+    lda SS_BUILD_STATE
+    bne !haveState+
+    jmp !restart+                           // STATE 0 (fresh / post-reset): start a build
+!haveState:
+    lda SS_BUILD_TMP_LO
+    cmp SS_BUILD_TARGET_ROW_LO
+    bne !changed+
+    lda SS_BUILD_TMP_HI
+    cmp SS_BUILD_TARGET_ROW_HI
+    beq !done+                              // unchanged target: keep the build / stay VALID
+!changed:
+    // classify: normal -1 advance (stored - target == 1 mod SLR) vs a jump
+    lda SS_BUILD_TARGET_ROW_LO
+    sec
+    sbc SS_BUILD_TMP_LO
+    sta SS_BUILD_TMP2_LO
+    lda SS_BUILD_TARGET_ROW_HI
+    sbc SS_BUILD_TMP_HI
+    sta SS_BUILD_TMP2_HI
+    bcs !noWrapDelta+                       // stored >= target
+    lda SS_BUILD_TMP2_LO                    // stored < target (a wrap point): delta += SLR
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta SS_BUILD_TMP2_LO
+    lda SS_BUILD_TMP2_HI
+    adc #>STAGE_LOGICAL_ROWS
+    sta SS_BUILD_TMP2_HI
+!noWrapDelta:
+    lda SS_BUILD_TMP2_HI
+    bne !discont+
+    lda SS_BUILD_TMP2_LO
+    cmp #1
+    bne !discont+
+    inc SS_BUILD_ADVANCE_COUNT              // ordinary coarse step (seamless across a stage wrap)
+    bne !restart+
+    inc SS_BUILD_ADVANCE_COUNT + 1
+    jmp !restart+
+!discont:
+    inc SS_BUILD_INVALIDATE_COUNT
+    bne !d1+
+    inc SS_BUILD_INVALIDATE_COUNT + 1
+!d1:
+    inc SS_INVAL_DISCONT
+    bne !restart+
+    inc SS_INVAL_DISCONT + 1
+!restart:
+    lda SS_BUILD_TMP_LO
+    sta SS_BUILD_TARGET_ROW_LO
+    lda SS_BUILD_TMP_HI
+    sta SS_BUILD_TARGET_ROW_HI
+    lda #0
+    sta SS_INACTIVE_VALID
+    lda #1
+    sta SS_BUILD_STATE
+    sta SS_BUILD_NEXT_ROW                   // start at INACTIVE row 1
+    inc SS_BUILD_START_COUNT
+    bne !done+
+    inc SS_BUILD_START_COUNT + 1
+!done:
+    rts
+
+// --- Routine: ssRow0TargetMatchesPredecode -------------------------------
+// C=1 iff BG_PREDECODE_VALID and its tag == (SS_BUILD_TARGET_ROW - 1) mod SLR,
+// i.e. BG_PREDECODED_ROW currently holds this build's incoming terrain row.
+ssRow0TargetMatchesPredecode:
+    lda BG_PREDECODE_VALID
+    beq !no+
+    lda SS_BUILD_TARGET_ROW_LO              // row0 target = (target - 1) mod SLR
+    sec
+    sbc #1
+    sta SS_BUILD_TMP_LO
+    lda SS_BUILD_TARGET_ROW_HI
+    sbc #0
+    sta SS_BUILD_TMP_HI
+    bcs !haveR0+
+    lda SS_BUILD_TMP_LO
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta SS_BUILD_TMP_LO
+    lda SS_BUILD_TMP_HI
+    adc #>STAGE_LOGICAL_ROWS
+    sta SS_BUILD_TMP_HI
+!haveR0:
+    lda BG_PREDECODE_ROW_LO
+    cmp SS_BUILD_TMP_LO
+    bne !no+
+    lda BG_PREDECODE_ROW_HI
+    cmp SS_BUILD_TMP_HI
+    bne !no+
+    sec
+    rts
+!no:
+    clc
+    rts
+
+// --- Routine: ssCopyOneInactiveRow -------------------------------------------
+// INACTIVE[SS_BUILD_NEXT_ROW] <- ACTIVE[SS_BUILD_NEXT_ROW - 1]  (40 char bytes).
+// Page bases resolved from BG_ACTIVE_PAGE via the hi-delta tables. ~674 cy.
+ssCopyOneInactiveRow:
+    ldy BG_ACTIVE_PAGE
+    ldx SS_BUILD_NEXT_ROW
+    dex                                    // source = ACTIVE row (NEXT_ROW - 1); NEXT_ROW >= 1
+    lda starRowLo,x
+    sta TEXT_SRC
+    lda starRowHi,x
+    clc
+    adc ssActiveHiDelta,y
+    sta TEXT_SRC + 1
+    ldx SS_BUILD_NEXT_ROW
+    lda starRowLo,x
+    sta TEXT_DST
+    lda starRowHi,x
+    clc
+    adc ssInactiveHiDelta,y
+    sta TEXT_DST + 1
+    ldy #39
+!c:
+    lda (TEXT_SRC),y
+    sta (TEXT_DST),y
+    dey
+    bpl !c-
+    rts
+
+// --- Routine: ssInstallInactiveRow0 ---------------------------------------
+// INACTIVE[0] <- BG_PREDECODED_ROW (40 terrain char bytes; no turret overlay).
+ssInstallInactiveRow0:
+    ldy BG_ACTIVE_PAGE
+    lda starRowLo + 0
+    sta TEXT_DST
+    lda starRowHi + 0
+    clc
+    adc ssInactiveHiDelta,y
+    sta TEXT_DST + 1
+    ldy #39
+!c:
+    lda BG_PREDECODED_ROW,y
+    sta (TEXT_DST),y
+    dey
+    bpl !c-
+    rts
+
+#if OPT_SS_FLIP_COARSE
+// ============================================================================
+// Stage 4E: publish an admitted coarse step by $D018 page flip.
+// ----------------------------------------------------------------------------
+// prepareBackgroundCoarse (after the UNCHANGED reason-1/2/3 gate) calls
+// ssFlipPrereqOK. On success it decrements SCROLL_ROW exactly as the legacy path
+// would, sets SS_FLIP_PENDING, SCROLL_FINE=0, and RETURNS -- skipping
+// saveCrossingRow / shiftBackgroundUpper / renderStageRowToScreen. On failure it
+// falls through to the legacy in-window path (compile-time fallback).
+// finishBackgroundCoarse, the following frame top, sees SS_FLIP_PENDING and runs
+// ssPublishCoarseFlip: mirror the sprite-pointer table to the inactive page,
+// reconcile turret CHAR cells on that page against the post-coarse SCROLL_ROW,
+// write $D018, swap BG_ACTIVE_PAGE. Colour RAM ($D800) is page-independent and is
+// already reconciled to the post-coarse positions by pulseTurretColour (top of
+// this same frame's !frameLoop).
+// ============================================================================
+SS_FLIP_PENDING:          .byte 0    // 1 => a flip is armed; ssPublishCoarseFlip runs next frame top
+SS_FLIP_HOLDOFF:          .byte 0    // >0 => ssInactiveBuildTick stays clear this many more frames (post-flip)
+SS_PTR_MIRROR_READY:      .byte 0    // 1 => the inactive page's $3F8 pointer table has been mirrored this game
+SS_FLIP_TMP_LO:           .byte 0
+SS_FLIP_TMP_HI:           .byte 0
+ssFlipStats:
+SS_FLIP_ADMIT:            .word 0    // coarse admits taken as a page flip
+SS_FLIP_FALLBACK:         .word 0    // coarse admits that fell back to the legacy in-window path
+SS_FLIP_INVALID_PAGE:     .word 0    //   ... subset: SS_INACTIVE_VALID / STATE not complete
+SS_FLIP_TAG_MISMATCH:     .word 0    //   ... subset: SS_BUILD_TARGET_ROW != post-coarse row
+SS_FLIP_POINTER_NOT_READY:.word 0    //   ... subset: SS_PTR_MIRROR_READY == 0
+SS_FLIP_PATH_COUNT:       .word 0    // == SS_FLIP_ADMIT (kept for the report's flip-vs-legacy line)
+SS_LEGACY_COARSE_PATH_COUNT: .word 0 // legacy shiftBackgroundUpper admits executed with 4E on
+SS_PAGE_SWAP_COUNT:       .word 0    // BG_ACTIVE_PAGE toggles performed by ssPublishCoarseFlip
+SS_TURRET_RECONCILE_COUNT:.word 0    // turret pool slots touched by the reconcile (running total)
+SS_TURRET_RECONCILE_MAX:  .byte 0    // max slots touched in a single reconcile
+SS_D018_RASTER:           .byte 0    // raster low byte at the last $D018 flip write
+ssFlipStatsEnd:
+
+// --- Routine: ssFlipCoarseReset ------------------------------------------------
+// From ssInactiveBuildReset (initBackground): drop a pending flip + zero the
+// 4E counters. Ptr-mirror-ready is also cleared (a fresh game re-mirrors).
+ssFlipCoarseReset:
+    lda #0
+    sta SS_FLIP_PENDING
+    sta SS_FLIP_HOLDOFF
+    sta SS_PTR_MIRROR_READY
+    ldx #(ssFlipStatsEnd - ssFlipStats - 1)
+!clr:
+    sta ssFlipStats,x
+    dex
+    bpl !clr-
+    rts
+
+// --- Routine: ssFlipPrereqOK -------------------------------------------------
+// C=1  => a page-flip coarse admit is permitted this frame.
+// C=0  => not permitted; the specific fail counter has been bumped; caller must
+//         take the legacy in-window path.
+// SCROLL_ROW is NOT yet decremented here, so the post-coarse row is
+// (SCROLL_ROW - 1) mod SLR -- the exact value SS_BUILD_TARGET_ROW must hold.
+ssFlipPrereqOK:
+    lda SS_BUILD_STATE                     // must be COMPLETE (2) and VALID
+    cmp #2
+    bne !invalidPage+
+    lda SS_INACTIVE_VALID
+    beq !invalidPage+
+    lda SS_PTR_MIRROR_READY                // the inactive page's pointer table must be current
+    beq !ptrNotReady+
+    // post-coarse row = (SCROLL_ROW - 1) mod SLR
+    lda SCROLL_ROW
+    sec
+    sbc #1
+    sta SS_FLIP_TMP_LO
+    lda SCROLL_ROW_HI
+    sbc #0
+    sta SS_FLIP_TMP_HI
+    bcs !havePost+
+    lda #<(STAGE_LOGICAL_ROWS - 1)
+    sta SS_FLIP_TMP_LO
+    lda #>(STAGE_LOGICAL_ROWS - 1)
+    sta SS_FLIP_TMP_HI
+!havePost:
+    lda SS_BUILD_TARGET_ROW_LO
+    cmp SS_FLIP_TMP_LO
+    bne !tagMismatch+
+    lda SS_BUILD_TARGET_ROW_HI
+    cmp SS_FLIP_TMP_HI
+    bne !tagMismatch+
+    sec
+    rts
+!invalidPage:
+    inc SS_FLIP_INVALID_PAGE
+    bne !fail+
+    inc SS_FLIP_INVALID_PAGE + 1
+    jmp !fail+
+!tagMismatch:
+    inc SS_FLIP_TAG_MISMATCH
+    bne !fail+
+    inc SS_FLIP_TAG_MISMATCH + 1
+    jmp !fail+
+!ptrNotReady:
+    inc SS_FLIP_POINTER_NOT_READY
+    bne !fail+
+    inc SS_FLIP_POINTER_NOT_READY + 1
+!fail:
+    clc
+    rts
+
+// --- Routine: ssFlipNoteAdmit ----------------------------------------------
+// prepareBackgroundCoarse calls this immediately after decrementing SCROLL_ROW
+// on the flip path (so it is charged to the same admit the legacy counters see).
+ssFlipNoteAdmit:
+    lda #1
+    sta SS_FLIP_PENDING
+    inc SS_FLIP_ADMIT
+    bne !a+
+    inc SS_FLIP_ADMIT + 1
+!a:
+    inc SS_FLIP_PATH_COUNT
+    bne !b+
+    inc SS_FLIP_PATH_COUNT + 1
+!b:
+    rts
+
+// --- Routine: ssFlipMirrorPtrs -------------------------------------------------
+// Copy the live hardware sprite-pointer table $07F8..$07FF to the INACTIVE page's
+// own table (page base + $3F8). ~50 cy. Sets SS_PTR_MIRROR_READY.
+ssFlipMirrorPtrs:
+    ldy BG_ACTIVE_PAGE
+    lda #$07
+    clc
+    adc ssInactiveHiDelta,y                // $07 -> $07 (A inactive) or $2B (B inactive)
+    sta SS_FLIP_TMP_HI
+    lda #$f8
+    sta SS_FLIP_TMP_LO
+    ldy #7
+!m:
+    lda $07f8,y
+    sta (SS_FLIP_TMP_LO),y
+    dey
+    bpl !m-
+    lda #1
+    sta SS_PTR_MIRROR_READY
+    rts
+
+// --- Routine: ssReconcileTurretsOnNewPage -----------------------------------
+// For every TURRET_POOL slot, put the CHARACTER cells of its 2x2 body on the
+// page ABOUT TO BECOME ACTIVE (the current INACTIVE page) into agreement with
+// CURRENT turret state, against the post-coarse SCROLL_ROW:
+//   alive          -> shared body glyphs TURRET_GLYPH_BASE..+3
+//   dead / absent  -> the cached terrain codes turretGroundCodes+slot*4..+3
+// Colour RAM is NOT touched here (page-independent; pulseTurretColour already
+// reconciled it this frame). Clobbers A/X/Y + TEXT_SRC/DST + TURRET_* scratch
+// (all dead at finishBackgroundCoarse time).
+ssReconcileTurretsOnNewPage:
+    lda #0
+    sta SS_FLIP_TMP_LO                    // slots touched this reconcile
+    ldx #TURRET_POOL - 1
+!loop:
+    stx TURRET_INDEX
+    jsr ssReconcileTurretSlot
+    ldx TURRET_INDEX
+    dex
+    bpl !loop-
+    lda SS_FLIP_TMP_LO                    // running totals
+    clc
+    adc SS_TURRET_RECONCILE_COUNT
+    sta SS_TURRET_RECONCILE_COUNT
+    bcc !rc1+
+    inc SS_TURRET_RECONCILE_COUNT + 1
+!rc1:
+    lda SS_FLIP_TMP_LO
+    cmp SS_TURRET_RECONCILE_MAX
+    bcc !rc2+
+    sta SS_TURRET_RECONCILE_MAX
+!rc2:
+    rts
+
+// X == TURRET_INDEX = pool slot. Reconcile that slot's 2x2 body CHAR cells on
+// the INACTIVE page vs SCROLL_ROW (post-coarse). Every early exit is a LOCAL rts
+// so no long branch is needed.
+ssReconcileTurretSlot:
+    lda TURRET_SLOT_AUTH,x
+    bpl !occupied+
+    rts
+!occupied:
+    // rel(16) = (TURRET_SLOT_ROW - SCROLL_ROW) mod SLR
+    lda TURRET_SLOT_ROW_LO,x
+    sec
+    sbc SCROLL_ROW
+    sta TURRET_REL_LO
+    lda TURRET_SLOT_ROW_HI,x
+    sbc SCROLL_ROW_HI
+    sta TURRET_REL_HI
+    bcs !haveRel+
+    lda TURRET_REL_LO
+    clc
+    adc #<STAGE_LOGICAL_ROWS
+    sta TURRET_REL_LO
+    lda TURRET_REL_HI
+    adc #>STAGE_LOGICAL_ROWS
+    sta TURRET_REL_HI
+!haveRel:
+    lda TURRET_REL_HI
+    bne !relHi+
+    lda TURRET_REL_LO
+    cmp #24                               // rel 0..23 -> top matrix row 1..24
+    bcc !inPage+
+    rts                                  // rel 24..SLR-2: body fully below the aperture
+!inPage:
+    clc
+    adc #1
+    sta TURRET_CELL_ROW
+    jmp !haveTop+
+!relHi:
+    lda TURRET_REL_LO                     // only rel == SLR-1 lands a body row on the new page
+    cmp #<(STAGE_LOGICAL_ROWS - 1)
+    beq !relHiLo+
+    rts
+!relHiLo:
+    lda TURRET_REL_HI
+    cmp #>(STAGE_LOGICAL_ROWS - 1)
+    beq !aboveTop+
+    rts
+!aboveTop:
+    lda #$ff                              // top matrix row = -1 (above aperture); bottom = 0
+    sta TURRET_CELL_ROW
+!haveTop:
+    lda TURRET_INDEX
+    asl
+    asl
+    sta TURRET_GROUND_OFFSET             // slot * 4
+    ldx TURRET_INDEX
+    lda TURRET_HEALTH,x
+    sta SS_FLIP_TMP_HI                    // 0 => dead
+    lda TURRET_CELL_ROW                   // top body row
+    cmp #$ff
+    beq !botRow+
+    cmp #25
+    bcs !botRow+
+    ldx TURRET_CELL_ROW
+    lda SS_FLIP_TMP_HI
+    ldy #0
+    jsr ssReconcileTurretRow
+!botRow:
+    lda TURRET_CELL_ROW
+    cmp #$ff
+    bne !botInc+
+    lda #$ff                              // $ff + 1 = 0 (matrix row 0)
+!botInc:
+    clc
+    adc #1
+    sta TURRET_CELL_ROW
+    cmp #25
+    bcs !touched+
+    ldx TURRET_CELL_ROW
+    lda SS_FLIP_TMP_HI
+    ldy #2
+    jsr ssReconcileTurretRow
+!touched:
+    inc SS_FLIP_TMP_LO
+    rts
+
+// A = health (0 = dead), X = matrix row (0..24), Y = pair index (0 = top glyphs
+// +0/+1 & ground [slot*4+0/1]; 2 = bottom glyphs +2/+3 & ground [slot*4+2/3]).
+// Writes the 2 body cells at (TURRET_SLOT_COL[slot], TURRET_SLOT_COL+1) on the
+// INACTIVE page's matrix row X. TURRET_INDEX = slot, TURRET_GROUND_OFFSET = slot*4.
+ssReconcileTurretRow:
+    sty SS_BUILD_TMP2_LO                  // pair index 0 / 2 (borrow 4D scratch, dead here)
+    pha                                  // health (0 => dead)
+    lda starRowLo,x
+    sta TEXT_DST
+    lda starRowHi,x
+    ldx BG_ACTIVE_PAGE
+    clc
+    adc ssInactiveHiDelta,x               // -> INACTIVE page hi byte
+    sta TEXT_DST + 1
+    pla                                  // health
+    beq !dead+
+    lda #226                             // TURRET_GLYPH_BASE; +0/+1 (top) or +2/+3 (bottom)
+    clc
+    adc SS_BUILD_TMP2_LO
+    sta TURRET_REL_LO                    // code 0 (scratch, dead after the rel math above)
+    adc #1
+    sta TURRET_REL_HI                   // code 1
+    jmp !paint+
+!dead:
+    lda SS_BUILD_TMP2_LO                 // turretGroundCodes index = slot*4 + pair
+    clc
+    adc TURRET_GROUND_OFFSET
+    tax
+    lda turretGroundCodes,x
+    sta TURRET_REL_LO
+    inx
+    lda turretGroundCodes,x
+    sta TURRET_REL_HI
+!paint:
+    ldx TURRET_INDEX
+    ldy TURRET_SLOT_COL,x
+    lda TURRET_REL_LO
+    sta (TEXT_DST),y
+    iny
+    lda TURRET_REL_HI
+    sta (TEXT_DST),y
+    ldx TURRET_INDEX
+    rts
+
+// --- Routine: ssPublishCoarseFlip -----------------------------------------
+// finishBackgroundCoarse tail-calls this when SS_FLIP_PENDING. Frame top,
+// present chain, beam past the top border but before the first badline.
+ssPublishCoarseFlip:
+    jsr ssFlipMirrorPtrs                  // inactive page's $3F8 table = current live table
+    jsr ssReconcileTurretsOnNewPage      // inactive page's turret CHAR cells vs current state
+    lda $d012
+    sta SS_D018_RASTER
+    ldy BG_ACTIVE_PAGE
+    lda ssInactiveD018,y
+    sta VIC_MEMORY_SETUP                  // <-- the publication
+    lda BG_ACTIVE_PAGE
+    eor #1
+    sta BG_ACTIVE_PAGE
+    inc SS_PAGE_SWAP_COUNT
+    bne !s+
+    inc SS_PAGE_SWAP_COUNT + 1
+!s:
+    lda #0
+    sta SS_FLIP_PENDING
+    lda #1
+    sta SS_FLIP_HOLDOFF                   // keep the 4D build tick clear for this frame's build phase too
+    rts
+#endif
+
+SS_BUILD_TMP2_LO:         .byte 0
+SS_BUILD_TMP2_HI:         .byte 0
 #endif
 
 ssStage4End:
@@ -7187,7 +7966,9 @@ predecodeNextStageRow:
     sta BG_PREDECODE_VALID
     bgIncWord(BG_PREDECODE_PREPARED)
 !done:
-    rts
+    rts                                   // (4D's per-frame tick is tail-called from noteCoarseSuppressionOutcome,
+                                           //  which runs AFTER prepareBackgroundCoarse, so its cost never precedes
+                                           //  shiftBackgroundUpper / bgUpperReady on the near-full admit frame.)
 
 // --- Routine: bgConsumePredecodedRow --------------------------------------
 // Called by renderStageRowToScreen AFTER wrapBgLogicalRow (so BG_LOGICAL_ROW(16)
@@ -7258,7 +8039,11 @@ bgPredecodeReset:
     dex
     bpl !clr3-
 #endif
+#if OPT_SS_INACTIVE_BUILD
+    jmp ssInactiveBuildReset              // 4D: drop any in-flight INACTIVE build + zero its counters (ends in rts)
+#else
     rts
+#endif
 
 BG_PREDECODED_ROW:     .fill 40, 0      // 40 terrain character codes for the next coarse reveal (row 0).
                                          // Terrain only -- installTurretRow overlays live turret bodies at
