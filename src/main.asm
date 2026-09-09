@@ -118,6 +118,42 @@
 #define OPT_BG_ROW_PREDECODE
 #define OPT_BG_COARSE_EXTENDED_DEADLINE
 
+// ============================================================================
+// SCROLL-HITCH STAGE 4 (experimental): second VIC character-screen matrix.
+// See /reports/stage4-second-screen-scroller-architecture.md.
+//
+//   OPT_SECOND_SCREEN  -- Introduce a second 1 KB screen page in VIC bank 0 so
+//                         the next coarse-scroll state can be prepared in an
+//                         INACTIVE matrix, breaking the visible-matrix / LIVE-
+//                         sprite dependency behind the structural reason-1
+//                         (COARSE_DEFER_LIVE) stall.
+//
+//   Sub-stage gating (all under OPT_SECOND_SCREEN):
+//     OPT_SS_RELOCATE       4A: move the CPU-only attack tables ($2700..$290E)
+//                               and background-control code/state ($2920..$2EEE)
+//                               out of VIC bank 0 to $9000+, freeing $2700..$2EFF.
+//                               Display stays at $0400. No behaviour change.
+//     OPT_SS_PAGE_B         4B: allocate + deterministically init screen B at
+//                               $2800; never displayed. Symbolic active/inactive
+//                               page + sprite-pointer-table + $D018 constants.
+//     OPT_SS_FLIP_PROOF     4C: switch $D018 A<->B at a safe frame boundary with
+//                               A and B logically identical -- display-page proof
+//                               only; the coarse-scroll path is unchanged.
+//
+//   Stages 4D+ (inactive-page coarse construction, flip-on-coarse, reason-1
+//   removal) are NOT implemented in this pass.
+//
+//   With OPT_SECOND_SCREEN commented the build is byte-identical to the Stage 3
+//   default f2abc225159e81bfc6f911bea28558dbe55821eb9546bb8cab45b0893f027991.
+//#define OPT_SECOND_SCREEN
+
+#if OPT_SECOND_SCREEN
+    // Sub-stage toggles. Each implies the previous.
+    #define OPT_SS_RELOCATE
+    #define OPT_SS_PAGE_B
+    #define OPT_SS_FLIP_PROOF
+#endif
+
 #if OPT_BG_COARSE_EXTENDED_DEADLINE
 #if !SCROLL_HITCH_DIAG
     .error "OPT_BG_COARSE_EXTENDED_DEADLINE needs SCROLL_HITCH_DIAG (its deadline-class counters)"
@@ -313,6 +349,33 @@
 // See docs/fixed-hud-codex-worklog.md for measured timing and acceptance status.
 // ============================================================================
 .const BG_SCREEN_A = $0400
+
+// --- Stage 4: second character-screen matrix geometry ----------------------
+// VIC bank 0 is $0000-$3FFF; the charset stays at $3800 for both pages.
+// $D018 bits 7-4 select the screen base (n * $400 within the bank); bits 3-1
+// select the char base (7 * $800 = $3800). Current init writes $D018 = $1E
+// (screen $0400, char $3800). Screen B at $2800 => screen bits $0A => $D018 = $AE.
+// Each page owns its own 8-byte sprite-pointer table at page_base + $3F8.
+.const BG_SCREEN_B          = $2800
+.const BG_SCREEN_A_D018     = $1E                  // screen $0400, char $3800
+.const BG_SCREEN_B_D018     = $AE                  // screen $2800, char $3800
+.const BG_SPRITE_PTRS_A     = BG_SCREEN_A + $3F8   // $07F8 (= HW_SPRITE_POINTER)
+.const BG_SPRITE_PTRS_B     = BG_SCREEN_B + $3F8   // $2BF8
+.if (mod(BG_SCREEN_B, $400) != 0) {
+    .error "BG_SCREEN_B must be 1 KB aligned"
+}
+.if (BG_SCREEN_B < $0400 || (BG_SCREEN_B + $400) > $4000) {
+    .error "BG_SCREEN_B must lie inside VIC bank 0"
+}
+#if OPT_SS_RELOCATE
+// 4A: the CPU-only occupants of $2700..$2EFF move here (outside VIC bank 0,
+// always-RAM $8000-$9FFF region; the VIC in bank 0 never fetches from here).
+.const ATTACK_DATA_SEGMENT        = $9000          // was $2700..$290E (curated attack + fragment tables)
+.const BACKGROUND_CONTROL_SEGMENT = $9280          // was $2920..$2EEE (bg scroll code + coarse state)
+#else
+.const ATTACK_DATA_SEGMENT        = $2700
+.const BACKGROUND_CONTROL_SEGMENT = $2920
+#endif
 // Fixed HUD row0 private glyphs: 18 codes = space, S, C, O, R, E, 0..9, then F
 // and R (for the development FREE-cycle counter). Bitmaps are copied into the
 // RAM charset by initFixedHud; the ten digit glyphs live at HUD_DIGIT_GLYPH..+9.
@@ -737,6 +800,9 @@ startGame:
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
     jsr initBackground                      // Paint the diagnostic background in the single $0400 matrix.
+#if OPT_SS_PAGE_B
+    jsr ssInitPageB                         // Stage 4B: seed page B with a full copy of the painted page A.
+#endif
 
     lda #GAME_STATE_PLAYING                 // Hand the router the running-game state.
     sta GAME_STATE
@@ -4977,6 +5043,17 @@ enemyBulletSprite:
     .fill 39,$00
     .byte $00                              // 64th padding byte
 
+enemySpriteBitmapsEnd:                     // $2700: end of the VIC-visible sprite bitmaps in this segment.
+
+#if OPT_SS_RELOCATE
+// Stage 4A: the CPU-only curated-attack + movement-fragment tables that followed
+// here at $2700..$290E move outside VIC bank 0 so screen B can use $2800..$2BFF.
+// No routine reads these via the VIC; every reference is a symbolic absolute/
+// indexed load, so relocation is address-transparent.
+* = ATTACK_DATA_SEGMENT
+attackDataRelocBase:
+#endif
+
 // --- Curated attack definitions --------------------------------------------
 // Parallel tables indexed by ATTACK_* ID.  These are deliberately kept as
 // plain bytes so balancing remains as easy as the old formation system.
@@ -5445,6 +5522,20 @@ egressFragmentsEnd:
     }
 }
 
+#if OPT_SS_RELOCATE
+attackDataRelocEnd:
+.if (attackDataRelocEnd > BACKGROUND_CONTROL_SEGMENT) {
+    .error "Stage 4A: relocated attack data overruns the relocated background-control segment"
+}
+.if (attackDataRelocEnd > $A000) {
+    .error "Stage 4A: relocated attack data overruns RAM (BASIC ROM at $A000)"
+}
+#else
+.if (* > $2920) {
+    .error "Curated attack + fragment data overruns the background-control segment ($2920)"
+}
+#endif
+
 // --- Private per-object health-bar sprite RAM -------------------------------
 // Object 0 is the player and does not use its slot, but reserving all 16 keeps
 // pointer calculation trivial: private pointer = HEALTH_SPRITE_BASE_PTR + objectID.
@@ -5470,14 +5561,37 @@ CLIP_SPRITE_POOL_END:
     .error "Clipped sprite pool overlaps the charset"
 }
 
+#if OPT_SS_PAGE_B
+// --- Stage 4B: second character-screen matrix (page B) --------------------
+// 1 KB VIC-visible page, freed by the Stage 4A relocation. Displayed only when
+// $D018 is switched to BG_SCREEN_B_D018. Its last 8 bytes ($2BF8..$2BFF) are the
+// page-B hardware sprite-pointer table (mirrored from $07F8 by ssMirrorSpritePtrs).
+* = BG_SCREEN_B
+bgScreenB:
+    .fill $400, 0
+bgScreenBEnd:
+.if (bgScreenBEnd != BG_SCREEN_B + $400) {
+    .error "page B is not exactly 1 KB"
+}
+.if (BG_SCREEN_B >= $2700 && BG_SCREEN_B < $2F00) {
+    // ok: this is the region the Stage 4A relocation frees
+} else {
+    .error "page B must sit in the $2700..$2EFF region freed by OPT_SS_RELOCATE"
+}
+#endif
+
 // ============================================================================
 // Single-screen beam-raced scrolling. Main copies straddle VIC fetches; the
 // shared display event fixes the aperture. No screen flip or terrain shadow.
 // Two in-place portions straddle presentation; see docs/background-engine.md.
 // Control fits in the existing gap below health sprites; unrolled copies
 // live outside VIC bank 0, where there is room to keep the cycle count simple.
+//
+// Stage 4A (OPT_SS_RELOCATE): this whole CPU-only code/state block relocates to
+// $9000+ so screen B can occupy $2800..$2BFF. It contains no VIC-visible data
+// (bitmaps / screen / charset) and every entry point is called symbolically.
 // ============================================================================
-* = $2920
+* = BACKGROUND_CONTROL_SEGMENT
 
 // --- Routine: applyFineScroll -----------------------------------------------
 // Publish the presented phase at frame0. The shared physical-frame dispatcher
@@ -6523,9 +6637,101 @@ BACKGROUND_CONTROL_END:
 // segment, and the initBackground terrain-glyph copy is now a fixed-size
 // runtime loop, so NOTHING in this segment's length depends on the generated
 // glyph count. This guard is a permanent belt-and-braces boundary check.
+#if OPT_SS_RELOCATE
+.if (BACKGROUND_CONTROL_END > $A000) {
+    .error "Relocated background control code overruns RAM (BASIC ROM at $A000)"
+}
+.if (BACKGROUND_CONTROL_SEGMENT < attackDataRelocEnd) {
+    .error "Stage 4A: background-control segment base is below the relocated attack data"
+}
+#else
 .if (BACKGROUND_CONTROL_END > HEALTH_SPRITE_BASE) {
     .error "Background control code overlaps health sprite RAM"
 }
+#endif
+
+#if OPT_SECOND_SCREEN
+// ============================================================================
+// Stage 4 second-screen support (CPU-only, outside VIC bank 0).
+// ============================================================================
+* = $9900
+ssStage4Base:
+
+BG_ACTIVE_PAGE:        .byte 0             // 0 = displaying page A ($0400), 1 = page B ($2800)
+SS_FLIP_COUNT:         .word 0             // 4C diag: $D018 page flips performed
+SS_PTR_MIRROR_COUNT:   .word 0             // 4C diag: sprite-pointer table mirrors performed
+SS_PAGE_B_INITED:      .byte 0             // 1 once page B holds a full copy of page A
+
+// --- Routine: ssInitPageB -------------------------------------------------
+// One-time: copy the whole displayed page A ($0400..$07FF, sprite-pointer
+// table included) into page B, and mark it inited. Called from startGame after
+// initBackground has painted A. Not timing critical.
+ssInitPageB:
+    ldx #0
+!copy:
+    lda BG_SCREEN_A + $000,x
+    sta BG_SCREEN_B + $000,x
+    lda BG_SCREEN_A + $100,x
+    sta BG_SCREEN_B + $100,x
+    lda BG_SCREEN_A + $200,x
+    sta BG_SCREEN_B + $200,x
+    lda BG_SCREEN_A + $300,x
+    sta BG_SCREEN_B + $300,x
+    inx
+    bne !copy-
+    lda #1
+    sta SS_PAGE_B_INITED
+    lda #0
+    sta BG_ACTIVE_PAGE                      // boot displaying page A
+    rts
+
+// --- Routine: ssMirrorSpritePtrs ----------------------------------------
+// Copy the 8-byte hardware sprite-pointer table $07F8..$07FF -> $2BF8..$2BFF so
+// whichever page $D018 selects has current pointers. Called once per frame,
+// LATE (after every main + IRR sprite-pointer write for the frame). ~50 cy.
+ssMirrorSpritePtrs:
+    ldx #7
+!m:
+    lda BG_SPRITE_PTRS_A,x
+    sta BG_SPRITE_PTRS_B,x
+    dex
+    bpl !m-
+    inc SS_PTR_MIRROR_COUNT
+    bne !done+
+    inc SS_PTR_MIRROR_COUNT + 1
+!done:
+    rts
+
+#if OPT_SS_FLIP_PROOF
+// --- Routine: ssFlipPage ----------------------------------------------------
+// 4C display-page proof: at frame top (just after waitForGameFrame, beam ~0,
+// before this frame's first badline) toggle $D018 between page A and page B.
+// A and B are kept logically identical (ssInitPageB + a frozen fixture, or a
+// caller that syncs them), so the VIC always fetches the same content -- this
+// isolates whether flipping the screen base destabilises the raster chain.
+ssFlipPage:
+    lda BG_ACTIVE_PAGE
+    eor #1
+    sta BG_ACTIVE_PAGE
+    beq !selA+
+    lda #BG_SCREEN_B_D018
+    bne !write+
+!selA:
+    lda #BG_SCREEN_A_D018
+!write:
+    sta VIC_MEMORY_SETUP
+    inc SS_FLIP_COUNT
+    bne !done+
+    inc SS_FLIP_COUNT + 1
+!done:
+    rts
+#endif
+
+ssStage4End:
+.if (ssStage4End > $A000) {
+    .error "Stage 4 second-screen code overruns RAM (BASIC ROM at $A000)"
+}
+#endif
 
 // Code only, outside VIC bank 0. Plenty of RAM: absolute LDA/STA pairs make
 // each copied byte exactly 8 CPU cycles, with no indexed page penalties.
