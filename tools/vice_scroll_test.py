@@ -174,6 +174,11 @@ def main():
             mon.cmd(f'bsave "{out / f"{frame:05d}.charset"}" 0 3800 3fff')
         if 'RASTER_STATE_BEGIN' in sym:
             mon.cmd(f'bsave "{out / f"{frame:05d}.raster"}" 0 {sym["RASTER_STATE_BEGIN"]:04x} {sym["RASTER_STATE_END"]-1:04x}')
+        if 'BG_ACTIVE_PAGE' in sym:
+            # Stage 4G: which screen page $D018 currently selects. The page-B
+            # sprite-pointer table ($2BF8-$2BFF) is already inside the .bg dump
+            # (2920-2fff covers it); this is just the one selector byte.
+            mon.cmd(f'bsave "{out / f"{frame:05d}.actpage"}" 0 {sym["BG_ACTIVE_PAGE"]:04x} {sym["BG_ACTIVE_PAGE"]:04x}')
         record = {'frame': frame, 'registers': regs}
         if args.physical:
             io = mon.cmd('m d010 d011')

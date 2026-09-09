@@ -51,6 +51,19 @@ def main():
         compare_writes.append((line, value))
         if value and (line >= 256 or value <= line):
             failures.append(['compare written behind beam', line, int(cycle), value, int(clock)])
+    # Stage 4G: page-aware final-pointer validation. With a live $D018 flip
+    # (OPT_SS_FLIP_COARSE / stage4-second-screen-scroller-architecture.md) the
+    # hardware sprite-pointer table the VIC actually reads alternates between
+    # page A ($07F8, inside the .ram dump at matrix offset 1016) and page B
+    # ($2BF8-$2BFF, inside the .bg dump -- captured 2920-2fff -- at offset
+    # 2BF8-2920). BG_ACTIVE_PAGE (captured as .actpage when the symbol exists)
+    # says which one is live for that physical frame. Older captures /
+    # single-screen builds have neither file: the check falls back to the
+    # page-A-only behaviour it always had.
+    page_aware = 'BG_ACTIVE_PAGE' in symbols
+    PAGE_B_BG_OFFSET = 0x2bf8 - 0x2920
+    page_b_seen = page_a_seen = 0
+
     frames, total, previous_epoch = 0, 0, None
     max_batches = max_objects = max_catchups = max_replays = 0
     clocks = []
@@ -59,6 +72,20 @@ def main():
         state = (root / f'{frame:05d}.state').read_bytes()
         raster = (root / f'{frame:05d}.raster').read_bytes()
         matrix = (root / f'{frame:05d}.ram').read_bytes()
+        active_page = 0
+        page_b_table = None
+        if page_aware:
+            actpage_path = root / f'{frame:05d}.actpage'
+            bg_path = root / f'{frame:05d}.bg'
+            if actpage_path.exists():
+                active_page = actpage_path.read_bytes()[0]
+            if bg_path.exists():
+                bg = bg_path.read_bytes()
+                page_b_table = bg[PAGE_B_BG_OFFSET:PAGE_B_BG_OFFSET + 8]
+            if active_page:
+                page_b_seen += 1
+            else:
+                page_a_seen += 1
 
         def get(name, index=0):
             addr = symbols[name] + index
@@ -101,8 +128,14 @@ def main():
             failures.append([frame, 'player hardware ownership', get('PLAYER_HW_MASK'), player_mask])
         if 'physical_x_msb' in record and record['physical_x_msb'] != x_mask:
             failures.append([frame, 'X high hardware mask', record['physical_x_msb'], x_mask])
-        if matrix[1016:1016+count] != bytes(pointers):
-            failures.append([frame, 'final sprite pointers'])
+        if page_aware and active_page and page_b_table is not None:
+            live_table = page_b_table
+            table_name = 'page B $2BF8'
+        else:
+            live_table = matrix[1016:1024]
+            table_name = 'page A $07F8'
+        if live_table[:count] != bytes(pointers):
+            failures.append([frame, 'final sprite pointers', table_name, list(live_table[:count]), pointers])
         events = [event for event in assignments if start <= event[0] < start+19656]
         if frame:  # Initial capture can start partway through an already running frame.
             for label, all_events in masks.items():
@@ -153,7 +186,8 @@ def main():
                   frame_cycle_deltas=deltas, compare_writes_checked=len(compare_writes),
                   service_failure_count=len(failures),
                   service_failures=failures[:20], sprite_start_miss_count=len(deadlines),
-                  sprite_start_misses=deadlines[:20])
+                  sprite_start_misses=deadlines[:20],
+                  page_aware=page_aware, page_a_frames=page_a_seen, page_b_frames=page_b_seen)
     (root / 'raster-verification.json').write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
     raise SystemExit(bool(failures or deadlines))

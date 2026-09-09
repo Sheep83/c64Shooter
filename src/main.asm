@@ -6909,6 +6909,17 @@ ssFlipPage:
 // ============================================================================
 .const SS_BUILD_DEFAULT_SLICE_ROWS = 2
 .const SS_SLICE_RASTER_CUTOFF      = 220   // stop a build slice if the beam is already this low this frame
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+// Stage 4G Objective B: bound the builder's load on scenes where 4F's reason-1
+// bypass now lets coarse cycles chain back-to-back (a pending LIVE batch every
+// frame). Scheduling-only, Mode C exclusive -- Mode A/B keep the Stage 4D/4E
+// values above untouched (byte-identical builds). Smallest-change order tried:
+// 1) one extra post-flip holdoff frame, 2) halve the per-frame slice-row cost,
+// 3) tighten the raster budget guard.
+.const SS_PLF_BUILD_SLICE_ROWS     = 1
+.const SS_PLF_SLICE_RASTER_CUTOFF  = 180
+.const SS_PLF_FLIP_HOLDOFF_FRAMES  = 3
+#endif
 
 SS_BUILD_STATE:            .byte 0   // 0 idle, 1 building shifted rows, 2 complete + valid
 SS_INACTIVE_VALID:         .byte 0   // mirror of (STATE == 2); the task's named check
@@ -6955,6 +6966,10 @@ ssInactiveBuildReset:
     bpl !clr-
     lda #SS_BUILD_DEFAULT_SLICE_ROWS
     sta SS_BUILD_SLICE_ROWS
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    lda #SS_PLF_BUILD_SLICE_ROWS           // Stage 4G Objective B: lighter per-frame slice under PLF
+    sta SS_BUILD_SLICE_ROWS
+#endif
 #if OPT_SS_FLIP_COARSE
     jmp ssFlipCoarseReset                 // drop any pending flip + zero the 4E counters (ends rts)
 #else
@@ -7022,7 +7037,11 @@ ssInactiveBuildSlice:
     lda VIC_CONTROL_1
     bmi !sliceBudgetUp+                    // beam wrapped past 255: stop now
     lda RASTER
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    cmp #SS_PLF_SLICE_RASTER_CUTOFF        // Stage 4G Objective B: tighter guard under PLF
+#else
     cmp #SS_SLICE_RASTER_CUTOFF
+#endif
     bcs !sliceBudgetDone+                  // beam past the cutoff: stop now
     jmp !doRow+
 !sliceBudgetUp:
@@ -7412,13 +7431,37 @@ ssFlipNoteAdmit:
 // Keep page B's hardware sprite-pointer table ($2BF8) equal to the live table
 // ($07F8). Called every frame (finishBackgroundCoarse) AFTER renderSprites, so
 // whichever page $D018 then selects has this frame's initial pointers.
-//   4E: mirrored $07F8 -> the INACTIVE page's +$3F8 (self-copy when B is active).
-//   4F: ALWAYS $07F8 -> $2BF8, so page B stays current for the whole time it is
-//   the displayed page (renderSprites still writes only $07F8). The raster-IRQ
-//   batch dual-writes $2BF8 for its own mid-frame reassignments.
+//   4E (ORIGINAL, BROKEN): mirrored $07F8 -> the INACTIVE page's +$3F8 via
+//   `sta (SS_FLIP_TMP_LO),y` -- indirect-indexed addressing. SS_FLIP_TMP_LO/HI
+//   are NOT zero page (they live at $9B6A/$9B6B in the Stage-4 runtime block),
+//   so NMOS 6502 (zp),Y can only use their LOW BYTE as the zero-page pointer:
+//   KickAssembler silently assembled `STA ($6A),Y`, which dereferences
+//   zero-page $006A/$006B (unrelated memory) instead of the intended address.
+//   $2BF8-$2BFF was therefore never actually written at runtime -- it stayed
+//   at its Stage-4B boot-time init pattern for the whole game, so every
+//   page-B-active frame displayed WRONG sprite graphics. Found by the Stage 4G
+//   page-aware raster oracle (100% failure rate on page-B frames); root-caused
+//   live via VICE monitor disassembly + memory peek; see
+//   /reports/stage4g-pending-live-scroller-cleanup.md and
+//   /reports/stage4h-mode-b-pointer-repair-and-rebaseline.md.
+//   4H (REPAIR): both modes now use the same proven absolute,X copy the 4F
+//   branch already used and already proved correct (200/200 live match,
+//   Stage 4F report SS7) -- ALWAYS $07F8 -> $2BF8, unconditionally, every
+//   frame. This is provably still correct for Mode B specifically: Mode B's
+//   renderSprites / applyLiveRasterBatch write ONLY $07F8, unconditionally,
+//   regardless of which page is displayed (Mode B has no self-modified
+//   active-page batch store -- that is a 4F-only mechanism), so $07F8 always
+//   holds this frame's fresh render-plan pointers and a plain copy to $2BF8
+//   is exact whichever page is active. (Mode B's reason-1 gate is UNCHANGED --
+//   a coarse admission, and so a flip, still cannot happen while a LIVE batch
+//   is outstanding -- so this mirror is not required to race a mid-frame
+//   batch at the flip instant the way 4F's mechanism was; a batch that fires
+//   on a LATER frame while B is already displayed leaves $2BF8 correct again
+//   by the very next frame's mirror, exactly the bounded "one frame behind"
+//   tradeoff the original Stage 4 architecture doc's option 2 documented and
+//   accepted for this simpler design.)
 // ~50 cy. Sets SS_PTR_MIRROR_READY.
 ssFlipMirrorPtrs:
-#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
     ldx #7
 !m:
     lda $07f8,x
@@ -7428,24 +7471,6 @@ ssFlipMirrorPtrs:
     lda #1
     sta SS_PTR_MIRROR_READY
     rts
-#else
-    ldy BG_ACTIVE_PAGE
-    lda #$07
-    clc
-    adc ssInactiveHiDelta,y                // $07 -> $07 (A inactive) or $2B (B inactive)
-    sta SS_FLIP_TMP_HI
-    lda #$f8
-    sta SS_FLIP_TMP_LO
-    ldy #7
-!m:
-    lda $07f8,y
-    sta (SS_FLIP_TMP_LO),y
-    dey
-    bpl !m-
-    lda #1
-    sta SS_PTR_MIRROR_READY
-    rts
-#endif
 
 // --- Routine: ssReconcileTurretsOnNewPage -----------------------------------
 // For every TURRET_POOL slot, put the CHARACTER cells of its 2x2 body on the
@@ -7640,7 +7665,11 @@ ssPublishCoarseFlip:
 !s:
     lda #0
     sta SS_FLIP_PENDING
+#if OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    lda #SS_PLF_FLIP_HOLDOFF_FRAMES        // Stage 4G Objective B: extra post-flip settle frame under PLF
+#else
     lda #1
+#endif
     sta SS_FLIP_HOLDOFF                   // keep the 4D build tick clear for this frame's build phase too
 #if OPT_SS_ALLOW_PENDING_LIVE_FLIP
     lda SS_PLF_PUBLISH_PENDING            // 4F: this flip was published over an outstanding LIVE batch
@@ -7834,6 +7863,21 @@ hudBorderSetup:
     sta $2bf8 + HUD_SLOT_FIRST,x
 !hbsNoB:
 #endif
+#if OPT_SS_FLIP_COARSE && !OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // 4H: Mode B has no SS_PAGEB_ACTIVE (that flag is 4F-only), but needs the
+    // same dual-write -- hudBorderHandoff reclaims this slot for gameplay via
+    // a LATER raster IRQ event (HUD_HANDOFF_RASTER), after ssFlipMirrorPtrs's
+    // once-per-frame mirror has already run, so a HUD-owned slot's value can
+    // go stale in $2BF8 for as long as B stays displayed otherwise. BG_ACTIVE_PAGE
+    // (0/1, available in every OPT_SECOND_SCREEN build) stands in for the 4F
+    // flag; loaded into Y (unused in this loop -- only X indexes the slots)
+    // rather than A, since A still holds the pointer byte just stored and
+    // must not be clobbered before the STA below.
+    ldy BG_ACTIVE_PAGE
+    beq !hbsNoB2+
+    sta $2bf8 + HUD_SLOT_FIRST,x
+!hbsNoB2:
+#endif
     lda hudProofColour,x
     sta HW_SPRITE_COLOUR + HUD_SLOT_FIRST,x
     txa
@@ -7900,6 +7944,21 @@ hudBorderHandoff:
     bpl !hbhNoB+
     sta $2bf8,x
 !hbhNoB:
+#endif
+#if OPT_SS_FLIP_COARSE && !OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // 4H: same reasoning as hudBorderSetup above. Y is already live here
+    // (LIVE_PLAN + x, needed again for INITIAL_COLOUR,y right below), so use
+    // the stack to keep A (the pointer byte) across the BG_ACTIVE_PAGE test
+    // instead.
+    pha
+    lda BG_ACTIVE_PAGE
+    beq !hbhNoB2+
+    pla
+    sta $2bf8,x
+    jmp !hbhCont2+
+!hbhNoB2:
+    pla
+!hbhCont2:
 #endif
     lda INITIAL_COLOUR,y
     sta HW_SPRITE_COLOUR,x
