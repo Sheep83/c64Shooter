@@ -5,6 +5,54 @@ Experimental follow-up to Stages 0–3 (`stable-single-screen-scroller`). Branch
 
 ---
 
+## STAGE 4J UPDATE — ARCHITECTURE PROMOTED TO DEFAULT, STAGE 4 CLOSED
+
+Everything below this notice is the original Stage 4A-4C investigation
+report, kept as-is for historical/archaeological accuracy — including its
+"experimental" framing and its (superseded) description of 4D-4F as "not
+implemented". **It no longer describes the current state of the codebase.**
+
+The work this report proposed was carried out and proved across Stages
+4D-4I, and the resulting architecture was promoted to the **normal default
+build** in Stage 4J:
+
+- Stage 4D built the incremental inactive-page terrain construction this
+  report designed in §9 — `/reports/stage4d-incremental-inactive-screen-build.md`
+- Stage 4E published coarse steps as a `$D018` flip instead of the legacy
+  in-window matrix mutation — `/reports/stage4e-d018-coarse-publication.md`
+- Stage 4F relaxed reason 1 (pending-LIVE defer) for the proven flip path —
+  `/reports/stage4f-pending-live-scroll-proof.md`
+- Stage 4G made the raster test oracle page-aware and bounded the builder's
+  load — `/reports/stage4g-pending-live-scroller-cleanup.md`
+- Stage 4H found and repaired a real pointer-mirror defect discovered by that
+  oracle in the reason-1-intact fallback configuration —
+  `/reports/stage4h-mode-b-pointer-repair-and-rebaseline.md`
+- Stage 4I gave a full causal, cycle-level account of the remaining
+  synthetic-stress (`--dense`) sprite-start misses and accepted them as a
+  pre-existing VIC badline/deadline-line coincidence, not a scroller defect
+  — `/reports/stage4i-dense-per-flip-investigation.md`
+- Stage 4J made the proven configuration (`OPT_SECOND_SCREEN` +
+  `OPT_SS_INACTIVE_BUILD` + `OPT_SS_FLIP_COARSE` +
+  `OPT_SS_ALLOW_PENDING_LIVE_FLIP`, all on) the source default, confirmed the
+  ordinary build reproduces the accepted binary
+  (`80d5b0461c070fe23d6e5dbcb2124eb9e4093dbbc4034464d9afe0596f08ce66`)
+  byte-for-byte, and re-ran the full regression suite against it.
+
+**Stage 4 double-buffered scrolling is CLOSED.** The double-buffered,
+page-flip-published, pending-LIVE-tolerant, page-aware-pointer scroller is
+now the normal production architecture — see `AGENTS.md`'s "Current
+scrolling architecture" section for the current, maintained summary. The old
+single-screen architecture this report's §2 baseline describes (and the
+Stage 4D+4E-only, reason-1-intact configuration) remain available as
+regression/reference/diagnostic fallbacks, not the normal build. Checkpoint
+tags: `stable-single-screen-scroller` (pre-Stage-4),
+`stable-double-buffered-scroller` (original Stage 4D+4E checkpoint —
+archaeological, includes a since-repaired pointer defect),
+`stable-double-buffered-scroller-v2` (the accepted, corrected architecture
+this closure describes).
+
+---
+
 ## 1. Executive verdict
 
 **GREEN for sub-stages 4A, 4B and 4C. Sub-stages 4D–4F are designed but NOT

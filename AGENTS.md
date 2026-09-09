@@ -43,27 +43,56 @@ Do not make the IRQ consume partially built/main-thread render state.
 
 ### Current scrolling architecture
 
-The production scrolling engine is a proven single-screen beam-raced vertical
-scroller.
+The production scrolling engine is a proven **double-buffered** vertical
+scroller (promoted to the default build in Stage 4J, `src/main.asm`'s
+`OPT_SECOND_SCREEN` block; see
+`/reports/stage4-second-screen-scroller-architecture.md` and the Stage
+4D-4I reports/worklogs under `/reports` and `/docs` for the full derivation).
 
 Important characteristics:
 
-- screen matrix at $0400
-- charset at $3800
-- VIC bank 0
+- two 1 KB screen matrices in VIC bank 0: page A at $0400, page B at $2800
+- charset at $3800, shared by both pages
 - RSEL=0 / 24-row display mode
-- no second screen matrix
-- no terrain shadow matrix
-- no $D018 screen flipping
-- no background raster IRQ
-- coarse scrolling is split around VIC fetch timing
-- a physical crossing-row buffer preserves the row spanning the split
-- fine7 may be safely held/deferred when coarse work cannot begin in time
+- the next coarse-scroll state is built incrementally into the currently
+  INACTIVE page across the fine-scroll frames leading up to the next coarse
+  step, then published by flipping `$D018` -- no legacy in-window
+  visible-matrix mutation on that path
+- coarse admission may proceed while a LIVE sprite-reuse batch is still
+  outstanding (the flip touches no sprite hardware/batch state); reasons 2
+  and 3 (badline defer / beam-position deadline) are unchanged
+- page-aware sprite-pointer handling keeps the ACTIVE page's hardware
+  pointer table ($07F8 or $2BF8) correct every frame, including mid-frame
+  LIVE batch reassignments (a self-modified store target) and HUD
+  slot-reclaim writes
+- a fixed, understood VIC badline/deadline-line coincidence remains, visible
+  only under deliberately pathological synthetic sprite-reuse stress
+  (`--dense`); it is present (at an equal-or-worse per-exposure rate) in the
+  old single-screen baseline too, is not a double-buffering cost, and is not
+  an open task (Stage 4I)
+
+Two older/reference configurations remain reachable by commenting toggles in
+`src/main.asm`, kept for regression, archaeology and diagnosis -- **not** the
+normal build:
+- **Mode A** (`OPT_SECOND_SCREEN` commented): the old single-screen Stage-3
+  regression baseline (beam-raced, `$0400` only, no second screen, no
+  `$D018` flipping, coarse scrolling split around VIC fetch timing with a
+  physical crossing-row buffer -- this used to be the default; it is not
+  anymore).
+- **Mode B** (`OPT_SS_ALLOW_PENDING_LIVE_FLIP` commented): the double-buffered
+  architecture with reason 1 (pending-LIVE defer) still intact, so it cannot
+  advance the coarse scroll while a LIVE batch is outstanding.
+
+Checkpoint tags: `stable-single-screen-scroller` (pre-Stage-4), `stable-
+double-buffered-scroller` (original Stage 4D+4E checkpoint -- archaeological,
+includes a since-repaired pointer defect), `stable-double-buffered-
+scroller-v2` (this accepted, corrected architecture).
 
 Do not replace this architecture casually.
 
-Any change to its raster timing, row-copy boundaries, crossing-row handling,
-badline assumptions or D011 behaviour must be derived and tested.
+Any change to its raster timing, page-flip publication, inactive-page build
+scheduling, sprite-pointer mirroring, crossing-row handling, badline
+assumptions or D011/D018 behaviour must be derived and tested.
 
 ### Memory
 

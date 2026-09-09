@@ -119,8 +119,20 @@
 #define OPT_BG_COARSE_EXTENDED_DEADLINE
 
 // ============================================================================
-// SCROLL-HITCH STAGE 4 (experimental): second VIC character-screen matrix.
-// See /reports/stage4-second-screen-scroller-architecture.md.
+// SCROLL-HITCH STAGE 4: double-buffered second VIC character-screen matrix.
+// This is now the NORMAL production scrolling architecture (promoted to
+// default in Stage 4J, after the causal investigation in Stage 4I accepted
+// the remaining synthetic-stress behaviour as a pre-existing multiplexer/
+// badline exposure, not a scroller defect). History: Stage 4A-4H built and
+// proved it in stages behind opt-in toggles; see
+// /reports/stage4-second-screen-scroller-architecture.md and the Stage
+// 4D/4E/4F/4G/4H/4I reports and worklogs under /reports and /docs for the
+// full derivation and evidence. Checkpoint tags: `stable-single-screen-
+// scroller` (pre-Stage-4 baseline), `stable-double-buffered-scroller`
+// (original Stage 4D+4E checkpoint -- archaeological, includes a
+// since-repaired pointer defect, do not build from expecting current
+// behaviour), `stable-double-buffered-scroller-v2` (this accepted,
+// corrected architecture).
 //
 //   OPT_SECOND_SCREEN  -- Introduce a second 1 KB screen page in VIC bank 0 so
 //                         the next coarse-scroll state can be prepared in an
@@ -140,11 +152,11 @@
 //                               A and B logically identical -- display-page proof
 //                               only; the coarse-scroll path is unchanged.
 //
-//   Stage 4E+ (flip-on-coarse, reason-1 removal) is NOT implemented in this pass.
-//
-//   With OPT_SECOND_SCREEN commented the build is byte-identical to the Stage 3
-//   default f2abc225159e81bfc6f911bea28558dbe55821eb9546bb8cab45b0893f027991.
-//#define OPT_SECOND_SCREEN
+//   Commenting OPT_SECOND_SCREEN alone drops to Mode A: the old single-screen
+//   Stage 3 regression baseline, byte-identical to
+//   f2abc225159e81bfc6f911bea28558dbe55821eb9546bb8cab45b0893f027991. Kept as
+//   a regression/reference/diagnostic fallback -- not the normal build.
+#define OPT_SECOND_SCREEN
 
 #if OPT_SECOND_SCREEN
     // Sub-stage toggles. Each implies the previous.
@@ -154,23 +166,36 @@
     // 4D: incrementally build the exact next coarse screen state in the INACTIVE
     // page (terrain only; turret overlay stays a flip-time / Stage-4E concern).
     // The real coarse-admission path (prepareBackgroundCoarse) is unchanged.
-    // Commented -> the OPT_SECOND_SCREEN build stays byte-identical to the
-    // 4A+4B+4C baseline (326f1686f3cf3d05...).
-    //#define OPT_SS_INACTIVE_BUILD
+    // Commenting this (with OPT_SECOND_SCREEN still on) drops to the 4A+4B+4C
+    // display-proof-only baseline (326f1686f3cf3d05...) -- diagnostic only.
+    #define OPT_SS_INACTIVE_BUILD
     // 4E: publish an admitted coarse step as a $D018 page flip to the already-
     // prepared INACTIVE page, SKIPPING the legacy visible-matrix mutation
     // (shiftBackgroundUpper/Lower + crossing-row). Turret CHAR reconcile + Option-B
     // sprite-pointer mirror happen at the flip. The reason-1 gate is UNCHANGED
-    // (Stage 4F removes it). Commented -> Mode-3 (4D-only) behaviour + hash.
-    //#define OPT_SS_FLIP_COARSE
+    // (Stage 4F removes it). Commenting this drops to Mode-3 (4D-only) behaviour.
+    #define OPT_SS_FLIP_COARSE
     // 4F: relax ONLY reason 1 (COARSE_DEFER_LIVE) for the proven prepared-page
     // flip path -- an admitted coarse step may flip while a LIVE reuse batch is
     // still outstanding, because the flip touches no sprite hardware and no batch
     // state. Reasons 2 and 3 are still enforced; the legacy in-window fallback
     // keeps the original reason-1 protection. The raster-IRQ batch also writes
     // the page-B pointer table so a mid-frame reassignment survives the flip.
-    // Commented -> Stage 4E behaviour + hash (98eb5bbb...) unchanged.
-    //#define OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // Commenting this drops to Mode B: the corrected (Stage 4H) reason-1-intact
+    // double-buffered fallback/reference configuration
+    // (e0c3141a7ee88f8f6216e94a0ee8f1a0f48c047f9de02f5c89da42106a74a6e4) -- kept
+    // for regression/reference, not the normal build.
+    #define OPT_SS_ALLOW_PENDING_LIVE_FLIP
+    // With all four of the above on (the default), this is Mode C: the
+    // accepted normal scrolling architecture
+    // (80d5b0461c070fe23d6e5dbcb2124eb9e4093dbbc4034464d9afe0596f08ce66),
+    // using the Stage 4G builder-scheduling values below and the Stage 4H
+    // page-aware sprite-pointer mechanism. Stage 4I investigated the
+    // remaining `--dense` synthetic-stress sprite-start misses and accepted
+    // them as exposure of a pre-existing VIC badline/deadline coincidence
+    // (present, at an equal-or-worse per-exposure rate, even in Mode A) --
+    // not extra Mode-C cost, and not an open scroller task. See
+    // /reports/stage4i-dense-per-flip-investigation.md.
 #endif
 
 #if (OPT_SS_INACTIVE_BUILD && !SCROLL_HITCH_DIAG)
