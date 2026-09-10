@@ -440,6 +440,64 @@
 .if (HUD_SCORE_TOP_ROW + HUD_SCORE_GLYPH_H > 21) {
     .error "score digit rows run past the 21-row sprite"
 }
+// --- Weapon heat gauge: HUD sprite indices 2 and 3 --------------------------
+// The score owns HUD indices 0/1 (hardware 4/5). Indices 2/3 (hardware 6/7) are
+// already enabled and handed off every frame by hudBorderSetup/hudBorderHandoff
+// but have only ever pointed at blankSprite -- proven free display capacity, so
+// the gauge costs NO new sprite reservation and no change to the mux, the
+// handoff geometry or gameplay sprite capacity.
+//
+// Their 64-byte blocks inside HUD_SPRITE_BASE are NOT free (the score's back
+// buffers live there), so the gauge bitmaps take their own space in the VIC
+// bank-0 gap at $2cc0..$2dbf, below the HUD sprite block at $2f00.
+//
+// Two hires sprites side by side = 48 px of gauge. Double buffered exactly like
+// the score, on the same proven publication path: compose into the pair the VIC
+// is NOT fetching, then publish by rewriting hudProofPtr, which hudBorderSetup
+// republishes to BOTH pointer pages ($07F8 and $2BF8) at the line-1 IRQ.
+.const HUD_HEAT_SLOT_L     = 2          // HUD index 2 -> hardware sprite 6
+.const HUD_HEAT_SLOT_R     = 3          // HUD index 3 -> hardware sprite 7
+.const HUD_HEAT_BITMAP_L   = $2cc0      // pointer $b3
+.const HUD_HEAT_BITMAP_R   = $2d00      // pointer $b4
+.const HUD_HEAT_BITMAP_B   = $80        // front -> back offset, as the score uses
+.const HUD_HEAT_BITMAP_L2  = HUD_HEAT_BITMAP_L + HUD_HEAT_BITMAP_B   // $2d40
+.const HUD_HEAT_BITMAP_R2  = HUD_HEAT_BITMAP_R + HUD_HEAT_BITMAP_B   // $2d80
+// Placed to the RIGHT of the six-digit score, which is left exactly where it is
+// (161..208, centred) -- the 16 px font and its double buffering are accepted
+// production behaviour and are not touched. Both X values stay < 256 so
+// HUD_D010_KEEP remains $00 and no $D010 MSB bit is needed.
+.const HUD_HEAT_X_L        = 216
+.const HUD_HEAT_X_R        = HUD_HEAT_X_L + 24    // 240; adjacent, no overlap
+.const HUD_HEAT_COLOUR     = 13         // light green, matching the score
+.const HUD_HEAT_COLOUR_ALARM = 2        // red   } alternated while the weapon is
+.const HUD_HEAT_COLOUR_BLANK = 0        // black } locked, giving a visible flash
+// Sprite rows. Two hairline rules bracket a 4-row fill, vertically inside the
+// score's 16-row band so the HUD reads as one row of instrumentation. The rules
+// are assembled into the bitmaps and never rewritten; only the fill rows are
+// composed at runtime.
+.const HUD_HEAT_RULE_TOP_ROW = 8
+.const HUD_HEAT_FILL_TOP_ROW = 9
+.const HUD_HEAT_FILL_ROWS    = 4
+.const HUD_HEAT_RULE_BOT_ROW = 13
+.const HUD_HEAT_GAUGE_W      = 48       // total gauge pixels (2 hires sprites)
+// Note this tests the sprite X COORDINATE, not its right edge: only the
+// coordinate goes into SPR_X / the $D010 MSB bit. The gauge's right sprite sits
+// at 240 and paints out to screen X 263, comfortably inside the visible area
+// (the 40-column display runs 24..343). The score's guard above uses the
+// stricter "+24" form only because the score happens to fit it.
+.if (HUD_HEAT_X_L > 255 || HUD_HEAT_X_R > 255) {
+    .error "heat gauge sprite X must stay below 256 so HUD_D010_KEEP stays $00"
+}
+.if (HUD_HEAT_X_L < HUD_SCORE_X_R + 24) {
+    .error "heat gauge overlaps the six-digit score"
+}
+.if ((HUD_HEAT_BITMAP_L & 63) != 0 || (HUD_HEAT_BITMAP_R & 63) != 0) {
+    .error "heat gauge bitmaps must be 64-byte aligned"
+}
+.if (HUD_HEAT_BITMAP_R2 + 64 > HUD_SPRITE_BASE) {
+    .error "heat gauge bitmaps run into the HUD sprite block"
+}
+
 .const HUD_D010_KEEP       = $00        // Score sprites are at X<256 and the blank slots are parked at X=0.
 // The score font/conversion/composition module is CPU-only, so it lives outside
 // VIC bank 0 in the free hole between the metatile stage data and the legacy
@@ -871,6 +929,20 @@
 .const PLAYER_EXPLOSION_HOLD   = 5              // Frames each explosion bitmap remains visible.
 .const PLAYER_RESPAWN_TIME     = 100            // Invulnerable blinking frames after repositioning.
 
+// --- Weapon overheat --------------------------------------------------------
+// A single deterministic heat accumulator, no separate cooldown timers. At PAL
+// 50 Hz the constants below give:
+//    0 -> HEAT_MAX      at +2/frame  = 150 frames = 3.0 s of continuous fire
+//    HEAT_MAX -> 150    at -3/frame  =  50 frames = 1.0 s to re-enable firing
+//    HEAT_MAX -> 0      at -3/frame  = 100 frames = 2.0 s to fully cool
+// Kept named and centralised here so a later upgrade screen can change capacity,
+// cooling rate or sustained-fire duration without touching the fire code. No
+// upgrade machinery is built now.
+.const HEAT_MAX             = 300       // overheat threshold (16-bit: > 255)
+.const HEAT_REENABLE        = 150       // firing permitted again at/below this
+.const HEAT_RISE_PER_FRAME  = 2
+.const HEAT_FALL_PER_FRAME  = 3
+.const HEAT_FLASH_PERIOD    = 8         // frames per flash half-cycle while locked
 .const PLAYER_FIRE_COOLDOWN    = 8              // Frames between held-fire volleys.
 .const PLAYER_MUZZLE_TIME      = 3              // Frames the muzzle-flash sprite remains visible.
 // Player colour. The hull pixels index the PER-SPRITE colour register
@@ -1016,6 +1088,11 @@ startGame:
     jsr setupDebugDisplay                   // Draw the FREE-cycle display and initialise its rolling minimum.
     jsr setupScoreDisplay                   // Draw "SCORE 00000" and clear the 16-bit score.
     jsr setupLivesDisplay                   // Draw "LIVES 3" and initialise the player's stock.
+#if HUD_PROOF_ENABLE
+    jsr resetWeaponHeat                     // Every new game begins cold, unlocked and with an empty
+                                            // gauge in both buffers -- no stale heat or gauge pixels
+                                            // can survive GAME OVER -> initials -> menu -> new game.
+#endif
     jsr setupSprites                        // Reapply sprite VIC config and seed placeholder positions.
     jsr initWaveTriggers                    // Arm the authored wave-trigger cursor (no-op when none).
 .if (WAVE_TRIGGER_COUNT == 0) {
@@ -1171,6 +1248,11 @@ gameLoop:
     jsr prepareBackgroundCoarse             // Update upper rows behind the beam, only on a pending wrap.
     jsr noteCoarseSuppressionOutcome        // Diagnostic: record whether a suppression avoided / failed to
                                             // avoid a deferral, and whether an omitted projectile returned.
+#if HUD_PROOF_ENABLE
+    jsr refreshHeatGaugeIfDirty             // Weapon-heat gauge: same HUD-side phase as the score
+                                            // below -- after coarse admission, so it can never delay
+                                            // the scroll. ~19 cycles when the width has not changed.
+#endif
     jsr refreshScoreIfDirty                 // Deferred HUD score-digit rebuild: AFTER the coarse-prepare
                                             // admission test (so a kill cannot delay it) and before the
                                             // frame-end wait (so screen RAM is current well before the
@@ -2340,6 +2422,12 @@ updatePlayerFire:
     rts
 
 !stateOkay:
+#if HUD_PROOF_ENABLE
+    lda WEAPON_OVERHEATED                   // Locked: holding FIRE neither fires nor arms the cadence,
+    beq !notLocked+                         // so it generates no heat either. Fire is LEVEL-triggered
+    rts                                     // here, so firing simply resumes when the lock clears.
+!notLocked:
+#endif
     lda PLAYER_FIRE_COOLDOWN_TIMER          // A previous volley still owns the fire cadence.
     beq !checkButton+
     rts
@@ -4565,6 +4653,12 @@ updatePlayerState:
     lda #0                                  // Consume the latched collision event.
     sta PLAYER_HIT
 
+#if HUD_PROOF_ENABLE
+    jsr resetWeaponHeat                     // Death clears heat and the overheat latch, so the ship
+                                            // respawns with a fully cooled weapon and the gauge does
+                                            // not sit hot (or flashing) through the explosion.
+#endif
+
     lda #PLAYER_STATE_EXPLODING             // Freeze controls and begin the explosion animation.
     sta PLAYER_STATE
     lda #0
@@ -4997,10 +5091,13 @@ hudProofColour: .byte 1, 7, 13, 3                      // white / yellow / lt-gr
 // X=0 (behind the unopened LEFT border) so they are doubly invisible. The four
 // slots, their $D015 enable, their hires mode and the handoff that returns them
 // to gameplay are all completely unchanged -- no sprite capacity is lost.
-hudProofPtr:    .byte HUD_SCORE_BITMAP_L / 64, HUD_SCORE_BITMAP_R / 64, blankSprite / 64, blankSprite / 64
-hudProofX:      .byte HUD_SCORE_X_L, HUD_SCORE_X_R, 0, 0
+// Indices 0/1 = six-digit score, 2/3 = horizontal weapon-heat gauge. Slots 2/3
+// previously pointed at blankSprite; they were always enabled and handed off, so
+// the gauge costs no new sprite reservation.
+hudProofPtr:    .byte HUD_SCORE_BITMAP_L / 64, HUD_SCORE_BITMAP_R / 64, HUD_HEAT_BITMAP_L / 64, HUD_HEAT_BITMAP_R / 64
+hudProofX:      .byte HUD_SCORE_X_L, HUD_SCORE_X_R, HUD_HEAT_X_L, HUD_HEAT_X_R
 hudProofXMsb:   .byte 0, 0, 0, 0                       // all HUD X values < 256 (see HUD_D010_KEEP = $00)
-hudProofColour: .byte HUD_SCORE_COLOUR, HUD_SCORE_COLOUR, 0, 0
+hudProofColour: .byte HUD_SCORE_COLOUR, HUD_SCORE_COLOUR, HUD_HEAT_COLOUR, HUD_HEAT_COLOUR
 #endif
 #endif
 
@@ -9762,5 +9859,358 @@ playerLayersEnd:
 }
 .if (playerLayersEnd > HUD_SPRITE_BASE) {
     .error "player layer bitmaps run into the HUD sprite block"
+}
+#endif
+
+#if HUD_PROOF_ENABLE
+// ===========================================================================
+// Weapon heat + horizontal HUD gauge. CPU-only code and tables, in their own
+// fixed segment so their size can never displace timing-critical code.
+// ===========================================================================
+.const HEAT_CODE_SEGMENT = $7400
+.const HEAT_CODE_LIMIT   = $7800
+* = HEAT_CODE_SEGMENT
+
+WEAPON_HEAT_LO:      .byte 0     // 16-bit heat accumulator, 0..HEAT_MAX
+WEAPON_HEAT_HI:      .byte 0
+WEAPON_OVERHEATED:   .byte 0     // 1 => locked: firing suppressed until HEAT_REENABLE
+HEAT_GAUGE_WIDTH:    .byte 0     // pixels currently REQUESTED, 0..HUD_HEAT_GAUGE_W
+HEAT_GAUGE_SHOWN:    .byte $ff   // pixels currently COMPOSED ($ff = force first compose)
+HEAT_BACKBUF:        .byte HUD_HEAT_BITMAP_B   // offset of the pair safe to draw into
+HEAT_FLASH_TIMER:    .byte 0
+HEAT_FLASH_ON:       .byte 0
+HEAT_W_L:            .byte 0     // per-sprite fill widths, 0..24
+HEAT_W_R:            .byte 0
+
+// heat >> 2 (0..75) -> gauge pixels (0..48). A table rather than a divide: the
+// mapping is width = heat * 48 / 300, which is not a shift. 76 bytes.
+heatGaugeWidth:   .fill 76, min(HUD_HEAT_GAUGE_W, (i * HUD_HEAT_GAUGE_W) / 75)
+
+// per-sprite fill width (0..24) -> the three bitmap bytes of one fill row.
+// Filling left -> right, so byte 0 fills first and each byte fills from its MSB.
+.function heatFillByte(w, seg) {
+    .var bits = w - seg * 8
+    .if (bits <= 0) { .return 0 }
+    .if (bits >= 8) { .return $ff }
+    .return ($ff << (8 - bits)) & $ff
+}
+heatFillB0:       .fill 25, heatFillByte(i, 0)
+heatFillB1:       .fill 25, heatFillByte(i, 1)
+heatFillB2:       .fill 25, heatFillByte(i, 2)
+
+// --- Routine: resetWeaponHeat ----------------------------------------------
+// Fully cold, unlocked, gauge empty in BOTH buffers and the front pair
+// published. Called for a new game and on player death, so nothing stale can
+// survive a life or a GAME OVER -> initials -> menu -> new game cycle.
+resetWeaponHeat:
+    lda #0
+    sta WEAPON_HEAT_LO
+    sta WEAPON_HEAT_HI
+    sta WEAPON_OVERHEATED
+    sta HEAT_GAUGE_WIDTH
+    sta HEAT_FLASH_TIMER
+    sta HEAT_FLASH_ON
+    lda #$ff
+    sta HEAT_GAUGE_SHOWN                    // force the first compose
+    lda #HUD_HEAT_COLOUR                    // clear any alarm colour left over
+    sta hudProofColour + HUD_HEAT_SLOT_L
+    sta hudProofColour + HUD_HEAT_SLOT_R
+    // Draw the cold gauge into BOTH pairs, so whichever is published first is
+    // valid -- the same guarantee renderScoreHudBothBuffers gives the score.
+    lda #0
+    sta HEAT_BACKBUF
+    jsr composeHeatGauge
+    lda #HUD_HEAT_BITMAP_B
+    sta HEAT_BACKBUF
+    jsr composeHeatGauge
+    lda #HUD_HEAT_BITMAP_L / 64             // publish the FRONT pair
+    sta hudProofPtr + HUD_HEAT_SLOT_L
+    lda #HUD_HEAT_BITMAP_R / 64
+    sta hudProofPtr + HUD_HEAT_SLOT_R
+    lda #HUD_HEAT_BITMAP_B
+    sta HEAT_BACKBUF
+    lda #0
+    sta HEAT_GAUGE_SHOWN
+    rts
+
+// --- Routine: updateWeaponHeat ---------------------------------------------
+// One deterministic accumulator step per frame, run from the HUD phase AFTER
+// prepareBackgroundCoarse -- so the mechanic adds NOTHING to the pre-coarse
+// budget the two-layer player work was spent recovering.
+//
+// That placement is safe, and still cannot leak a ghost shot, because of the
+// order across the frame boundary:
+//    frame N  pre-coarse : updatePlayerFire fires and arms the cadence
+//    frame N  post-coarse: this routine adds the heat and, at the ceiling,
+//                          sets WEAPON_OVERHEATED
+//    frame N+1 pre-coarse: updatePlayerFire sees the latch and refuses
+// The only thing that must be pre-coarse is READING the latch, which is a load
+// and a branch already inside updatePlayerFire.
+//
+// "The weapon is firing" is defined as PLAYER_FIRE_COOLDOWN_TIMER != 0. That
+// timer is only ever armed by a SUCCESSFUL volley in updatePlayerFire, so heat
+// tracks actual firing rather than the button: a suppressed shot (dead player,
+// locked weapon) never arms it and therefore never generates heat.
+//
+// While the lock is latched the cadence branch is skipped entirely, so heat
+// falls from the very first locked frame. That is what makes the 1.0 s
+// re-enable and 2.0 s full-cool timings exact rather than trailing the last
+// volley's cadence.
+//
+// updatePlayerCombatEffects decrements the cadence timer pre-coarse, so by the
+// time this runs the timer already holds this frame's value: 8 on any frame a
+// volley launched, non-zero throughout sustained fire, and 0 once the player
+// releases. The predicate is therefore unchanged by the move.
+updateWeaponHeat:
+    // Cheapest possible exit for the commonest state. This routine is the only
+    // part of the mechanic that MUST run before prepareBackgroundCoarse (the
+    // lock has to be set before updatePlayerFire, or one ghost volley escapes),
+    // so every cycle here is pre-coarse budget. Fully cold and not firing means
+    // there is nothing any branch below could change.
+    lda WEAPON_HEAT_LO
+    ora WEAPON_HEAT_HI
+    bne !active+
+    lda PLAYER_FIRE_COOLDOWN_TIMER
+    beq !nothingToDo+
+!active:
+    lda WEAPON_OVERHEATED
+    bne !cooling+                           // locked: always cooling
+    lda PLAYER_FIRE_COOLDOWN_TIMER
+    beq !cooling+                           // not firing: cooling
+
+    lda WEAPON_HEAT_LO                      // heat += HEAT_RISE_PER_FRAME, clamped at HEAT_MAX
+    clc
+    adc #HEAT_RISE_PER_FRAME
+    sta WEAPON_HEAT_LO
+    lda WEAPON_HEAT_HI
+    adc #0
+    sta WEAPON_HEAT_HI
+    lda WEAPON_HEAT_HI                      // Ceiling test. HEAT_MAX is 300, so the high byte is 1:
+    beq !done+                              // heat < 256 cannot have reached it -- and that is most of
+    lda WEAPON_HEAT_LO                      // a three-second burst, so take the cheap exit first.
+    cmp #<HEAT_MAX
+    bcc !done+
+    lda #<HEAT_MAX                          // saturate and latch the overheat
+    sta WEAPON_HEAT_LO
+    lda #>HEAT_MAX
+    sta WEAPON_HEAT_HI
+    lda #1
+    sta WEAPON_OVERHEATED                   // the HUD phase starts the flash
+    rts
+
+!cooling:
+    lda WEAPON_HEAT_LO                      // heat -= HEAT_FALL_PER_FRAME, clamped at 0
+    ora WEAPON_HEAT_HI
+    beq !heatClamped+                       // already fully cold
+    lda WEAPON_HEAT_LO
+    sec
+    sbc #HEAT_FALL_PER_FRAME
+    sta WEAPON_HEAT_LO
+    lda WEAPON_HEAT_HI
+    sbc #0
+    sta WEAPON_HEAT_HI
+    bpl !checkReenable+                     // underflowed past zero -> clamp cold
+    lda #0
+    sta WEAPON_HEAT_LO
+    sta WEAPON_HEAT_HI
+
+!checkReenable:
+    lda WEAPON_OVERHEATED
+    beq !heatClamped+
+    lda WEAPON_HEAT_LO                      // still locked: unlock at/below HEAT_REENABLE.
+    cmp #<(HEAT_REENABLE + 1)               // Compared against REENABLE+1 so the unlock happens ON the
+    lda WEAPON_HEAT_HI                      // frame heat REACHES 150, not the frame after -- that is
+    sbc #>(HEAT_REENABLE + 1)               // what makes the cooldown exactly 50 frames / 1.0 s.
+    bcs !heatClamped+
+    lda #0
+    sta WEAPON_OVERHEATED                   // firing available again, gauge still ~half full.
+                                            // The HUD phase notices the cleared latch and stops the
+                                            // flash; nothing about presentation happens here.
+!heatClamped:
+!done:
+!nothingToDo:
+    rts
+
+// --- Routine: refreshHeatGaugeIfDirty ---------------------------------------
+// HUD-side phase: called from the main loop AFTER prepareBackgroundCoarse, in
+// the same place and for the same reason as refreshScoreIfDirty, so a gauge
+// update can never delay coarse-scroll admission. Costs ~19 cycles on a frame
+// where the drawn width has not changed, which is most of them.
+refreshHeatGaugeIfDirty:
+    jsr updateWeaponHeat                    // see the note on updateWeaponHeat: the accumulator runs
+                                            // HERE, after coarse admission, not on the pre-coarse path
+    lda WEAPON_HEAT_HI                      // width = table[heat >> 2], 0..48. A lookup, not a
+    lsr                                     // divide: the mapping is heat * 48 / 300.
+    lda WEAPON_HEAT_LO
+    ror
+    lsr
+    tax
+    lda heatGaugeWidth,x
+    sta HEAT_GAUGE_WIDTH
+
+    // ---- flash while the weapon is locked ----------------------------------
+    // HEAT_FLASH_ON is a three-state phase: 0 = not flashing, 1 = bright half,
+    // 2 = dark half. Three states rather than a bare toggle so the "is the flash
+    // running at all?" test cannot be confused with "which half are we in" --
+    // that confusion is what would let `dec` run on a zero timer and wrap it to
+    // 255, stalling the flash for five seconds.
+    lda WEAPON_OVERHEATED
+    beq !solid+
+    lda HEAT_FLASH_ON
+    bne !flashRunning+
+    lda #1                                  // first locked frame: start on the bright half
+    sta HEAT_FLASH_ON
+    lda #HEAT_FLASH_PERIOD
+    sta HEAT_FLASH_TIMER
+    lda #HUD_HEAT_COLOUR_ALARM
+    jmp !setColour+
+!flashRunning:
+    dec HEAT_FLASH_TIMER
+    bne !checkCompose+
+    lda #HEAT_FLASH_PERIOD
+    sta HEAT_FLASH_TIMER
+    lda HEAT_FLASH_ON
+    eor #3                                  // 1 <-> 2
+    sta HEAT_FLASH_ON
+    cmp #1
+    beq !flashBright+
+    lda #HUD_HEAT_COLOUR_BLANK
+    jmp !setColour+
+!flashBright:
+    lda #HUD_HEAT_COLOUR_ALARM
+    jmp !setColour+
+
+!solid:                                     // not locked: restore the normal colour ONCE, on the
+    lda HEAT_FLASH_ON                       // frame the flash stops, not every frame.
+    beq !checkCompose+
+    lda #0
+    sta HEAT_FLASH_ON
+    sta HEAT_FLASH_TIMER
+    lda #HUD_HEAT_COLOUR
+!setColour:
+    sei                                     // hudBorderSetup must not read a half-updated pair
+    sta hudProofColour + HUD_HEAT_SLOT_L
+    sta hudProofColour + HUD_HEAT_SLOT_R
+    cli
+
+!checkCompose:
+    lda HEAT_GAUGE_WIDTH
+    cmp HEAT_GAUGE_SHOWN
+    beq !done+                              // drawn width unchanged: nothing to do
+    sta HEAT_GAUGE_SHOWN
+    jsr composeHeatGauge
+    jmp publishHeatBuffer
+!done:
+    rts
+
+// --- Routine: composeHeatGauge ----------------------------------------------
+// Draw HEAT_GAUGE_WIDTH pixels of fill into the pair at HEAT_BACKBUF. Only the
+// HUD_HEAT_FILL_ROWS fill rows are written; the two track rules are assembled
+// into the bitmaps and never change. Every byte the fill owns is rewritten, so
+// a narrowing gauge can never leave stale pixels and no clear pass is needed.
+// Bounded, no data-dependent path: 3 table reads + 24 stores.
+composeHeatGauge:
+    lda HEAT_GAUGE_WIDTH
+    cmp #25
+    bcc !leftOnly+
+    sec                                     // > 24 px: left sprite full, remainder to the right
+    sbc #24
+    sta HEAT_W_R
+    lda #24
+    sta HEAT_W_L
+    jmp !haveWidths+
+!leftOnly:
+    sta HEAT_W_L
+    lda #0
+    sta HEAT_W_R
+!haveWidths:
+    ldx HEAT_BACKBUF                        // 0 = front pair, $80 = back pair
+    ldy HEAT_W_L
+    lda heatFillB0,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_L + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 0, x
+    }
+    lda heatFillB1,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_L + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 1, x
+    }
+    lda heatFillB2,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_L + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 2, x
+    }
+    ldy HEAT_W_R
+    lda heatFillB0,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_R + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 0, x
+    }
+    lda heatFillB1,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_R + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 1, x
+    }
+    lda heatFillB2,y
+    .for (var r = 0; r < HUD_HEAT_FILL_ROWS; r++) {
+        sta HUD_HEAT_BITMAP_R + (HUD_HEAT_FILL_TOP_ROW + r) * 3 + 2, x
+    }
+    rts
+
+// --- Routine: publishHeatBuffer ---------------------------------------------
+// Swap the drawn pair in, exactly as publishScoreBuffer does for the score:
+// two bytes into hudProofPtr under SEI, so hudBorderSetup cannot observe a
+// half-updated pair, and it republishes them to BOTH pointer pages.
+publishHeatBuffer:
+    lda HEAT_BACKBUF
+    eor #HUD_HEAT_BITMAP_B
+    sta HEAT_BACKBUF                        // the retired pair becomes the next back buffer
+    bne !publishFront+
+    lda #HUD_HEAT_BITMAP_L2 / 64            // we just drew the BACK pair
+    sei
+    sta hudProofPtr + HUD_HEAT_SLOT_L
+    lda #HUD_HEAT_BITMAP_R2 / 64
+    sta hudProofPtr + HUD_HEAT_SLOT_R
+    cli
+    rts
+!publishFront:
+    lda #HUD_HEAT_BITMAP_L / 64
+    sei
+    sta hudProofPtr + HUD_HEAT_SLOT_L
+    lda #HUD_HEAT_BITMAP_R / 64
+    sta hudProofPtr + HUD_HEAT_SLOT_R
+    cli
+    rts
+
+heatCodeEnd:
+.if (heatCodeEnd > HEAT_CODE_LIMIT) {
+    .error "weapon heat module overflowed its segment"
+}
+#endif
+
+#if HUD_PROOF_ENABLE
+// ===========================================================================
+// Weapon heat gauge: bitmaps (VIC bank 0) + state + composition module.
+// ===========================================================================
+// Four 64-byte hires sprite blocks: front pair then back pair, $80 apart so one
+// index register selects a pair (the same trick the score compositor uses).
+//
+// Only the FILL rows are ever written at runtime. The two hairline rules that
+// bracket them are assembled here and never touched again, so a compose is a
+// short run of stores with no read-modify-write and no clear pass.
+* = HUD_HEAT_BITMAP_L
+.var heatRuleRow  = List().add($ff,$ff,$ff)
+.var heatBlankRow = List().add($00,$00,$00)
+.for (var buf = 0; buf < 2; buf++) {
+    .for (var half = 0; half < 2; half++) {
+        .for (var row = 0; row < 21; row++) {
+            .if (row == HUD_HEAT_RULE_TOP_ROW || row == HUD_HEAT_RULE_BOT_ROW) {
+                .byte $ff, $ff, $ff             // track rule, full 24 px
+            } else {
+                .byte $00, $00, $00             // fill rows start cold; rest transparent
+            }
+        }
+        .byte $00                                // 64th padding byte
+    }
+}
+heatGaugeBitmapsEnd:
+.if (heatGaugeBitmapsEnd != HUD_HEAT_BITMAP_L + 4 * 64) {
+    .error "heat gauge bitmaps must be exactly 4 x 64 bytes"
 }
 #endif
