@@ -428,8 +428,12 @@
 .const HUD_SCORE_X_L       = 161        // left sprite: digits 1..3 (6 px glyph + 2 px gap = 46 px span)
 .const HUD_SCORE_X_R       = HUD_SCORE_X_L + 24   // 186; adjacent, no overlap
 .const HUD_SCORE_COLOUR    = 13         // VIC-II light green (5 = green is one constant away)
-.const HUD_SCORE_TOP_ROW   = 0          // digits start at sprite row 0 (raster HUD_Y)
-.const HUD_SCORE_GLYPH_H   = 21         // full sprite height; all 21 rows measured visible
+// Phase 1.2: 21 px was functionally correct but read as too tall and narrow.
+// 16 rows, centred in the SAME 21-row sprite body -- HUD_Y, the DMA window and
+// both handoff rasters are untouched, so no raster geometry changes. (21-16)/2
+// rounds to 2 rows of headroom above and 3 below.
+.const HUD_SCORE_TOP_ROW   = 2          // digits start at sprite row 2 (raster HUD_Y + 2)
+.const HUD_SCORE_GLYPH_H   = 16         // 16 of the 21 measured-visible sprite rows
 .if (HUD_SCORE_X_R + 24 > 255) {
     .error "score sprites must stay below X=256 so no $D010 MSB bit is needed"
 }
@@ -1026,6 +1030,13 @@ startGame:
     jsr buildBatchSpriteSchedule            // Call buildBatchSpriteSchedule; return here when it executes RTS.
     jsr swapRenderPlans                     // Call swapRenderPlans; return here when it executes RTS.
 
+#if OPT_SS_PAGE_B
+    jsr ssSelectPageA                       // Own the display page BEFORE painting: initBackground's row
+                                            // loop is page-aware (copyIncomingRowToScreen reads
+                                            // BG_ACTIVE_PAGE), so a stale page-B value would paint the
+                                            // fresh terrain into $2800 only for ssInitPageB's A -> B copy
+                                            // to overwrite it again a moment later.
+#endif
     jsr initBackground                      // Paint the diagnostic background in the single $0400 matrix.
 #if OPT_SS_PAGE_B
     jsr ssInitPageB                         // Stage 4B: seed page B with a full copy of the painted page A.
@@ -1172,6 +1183,13 @@ endGame:
     lda VIC_CONTROL_2                       // Leave global multicolour text mode; the menu / GAME OVER
     and #%11101111                          // / hi-score screens are plain hires text and were never
     sta VIC_CONTROL_2                       // authored for MC. initBackground re-enables it per game.
+#if OPT_SS_PAGE_B
+    jsr ssSelectPageA                       // Restore the DISPLAYED screen page to A. The gameplay coarse
+                                            // scroll may have left $D018 selecting page B ($2800); every
+                                            // GAME OVER / initials / high-score / menu routine draws into
+                                            // $0400, so without this the whole non-gameplay lifecycle is
+                                            // rendered onto a page the VIC is not fetching.
+#endif
 #if SOFT_EDGE_MASK
     lda #TERRAIN_MC_COLOUR_1                // Restore $D022/$D023 in case the game ended mid-ECM-band with
     sta EXTRA_COLOUR_1                      // them forced to the backdrop colour. Harmless for the hires
@@ -3728,18 +3746,17 @@ buildBatchSpriteSchedule:
 
 // --- Routine: setupLivesDisplay --------------------------------------------
 // Initialise the stock and draw the compact top-row lives HUD.
+// Phase 1.5 retired the character HUD row, exactly as it did for
+// setupScoreDisplay's "SCORE 00000". Matrix row 0 now carries incoming overflow
+// TERRAIN, so stamping "LIVES 3" at LIVES_SCREEN ($0400 + 17) only scribbled
+// seven stale cells into the scrolling playfield. It survived because
+// initBackground repaints all 25 rows immediately afterwards -- but only on the
+// page BG_ACTIVE_PAGE names, so whenever page ownership was wrong those seven
+// cells were the visible "LIVES 3 in the terrain" artifact, carried down the
+// screen by successive coarse steps. The stock reset is the real work here.
 setupLivesDisplay:
     lda #PLAYER_START_LIVES
     sta PLAYER_LIVES
-    ldx #0
-!labelLoop:
-    lda livesLabel,x
-    sta LIVES_SCREEN,x
-    lda #1
-    sta LIVES_COLOUR,x
-    inx
-    cpx #7                                  // "LIVES " plus one digit.
-    bne !labelLoop-
     rts
 
 // --- Routine: displayLives --------------------------------------------------
@@ -7161,6 +7178,35 @@ ssInitPageB:
     sta BG_ACTIVE_PAGE                      // boot displaying page A
     rts
 
+// --- Routine: ssSelectPageA -----------------------------------------------
+// Force screen-page ownership to page A in BOTH hardware and software.
+//
+// $D018 is written in exactly two live places: the one-time boot init, and
+// ssPublishCoarseFlip's coarse page flip. Nothing on the GAME OVER / initials /
+// menu / new-game path ever moved it back, yet ssFlipCoarseReset ("a fresh game
+// boots on page A") and ssInitPageB ("boot displaying page A") both already
+// ASSERT page A in software. A game whose last life ended while page B was
+// displayed therefore left the VIC fetching $2800 while every non-gameplay
+// screen routine (KERNAL chrout #147, drawTextRow, drawHiscorePage,
+// drawInitialsScreen) drew into the now-invisible $0400. This routine is what
+// makes the existing software assertion true of the hardware.
+//
+// Called from endGame -- so GAME OVER / initials / high-score / menu are drawn
+// on the page the VIC is actually showing -- and from startGame ahead of
+// initBackground, whose terrain paint is page-aware through
+// copyIncomingRowToScreen (ldy BG_ACTIVE_PAGE) and must target that same page.
+//
+// Not timing critical and touches no IRQ state: endGame has already torn the
+// raster chain down, and startGame has not yet built a render plan.
+ssSelectPageA:
+    lda VIC_MEMORY_SETUP
+    and #%00001111                          // Preserve the char base ($3800) + unused bits.
+    ora #(BG_SCREEN_A_D018 & %11110000)     // Screen base -> page A ($0400).
+    sta VIC_MEMORY_SETUP
+    lda #0
+    sta BG_ACTIVE_PAGE
+    rts
+
 // --- Routine: ssMirrorSpritePtrs ----------------------------------------
 // Copy the 8-byte hardware sprite-pointer table $07F8..$07FF -> $2BF8..$2BFF so
 // whichever page $D018 selects has current pointers. Called once per frame,
@@ -8923,49 +8969,48 @@ HISCORE_MID:           .fill HISCORE_COUNT, 0    // Per-entry high score, middle
 HISCORE_PAGE_BUF:      .fill HISCORE_COUNT * HISCORE_ROW_WIDTH, 32  // Pre-rendered attract-page rows.
 hudScoreStateEnd:
 
-// --- 5x7 slim digit font --------------------------------------------------
-// One byte per glyph row, pattern left-aligned in the top 5 bits. Row-major,
-// seven rows per digit, digits 0..9. Kept as readable bit literals so the font
-// stays maintainable; the sprite composer indexes it as scoreFont[digit*7 + row].
+// --- 6x16 slim digit font -------------------------------------------------
+// One byte per glyph row, glyph pixels left-aligned in the top 6 bits. Row-major,
+// HUD_SCORE_GLYPH_H rows per digit, digits 0..9. Kept as readable bit literals so
+// the font stays maintainable; the sprite composer indexes it as
+// scoreFont[digit * HUD_SCORE_GLYPH_H + row].
+//
+// GENERATED FROM tools/score_font_design.py (--emit). That file holds the glyphs
+// as ASCII art and is the design source of truth; it also verifies the assembled
+// table back out of the PRG, so the oracle stays independent of this table.
 scoreFont:
-// Original tall condensed numerals, drawn on the grid for this HUD -- not
-// traced from any commercial face. Character brief: Berthold City / the MU-TH-UR
-// terminal typography in Alien. Squared rather than rounded, flat terminals,
-// chamfered bowl corners, a single consistent 1px stroke, no modulation, and a
-// very tall/narrow proportion (6 px wide x 21 px tall = the FULL sprite height,
-// measured presentable in the opened top border).
+// Original condensed numerals, drawn on the grid for this HUD -- not traced from
+// any commercial face. Character brief: Berthold City / the MU-TH-UR terminal
+// typography in Alien. Squared rather than rounded, flat terminals, chamfered
+// bowl corners, a single consistent 1px stroke, no modulation.
+//
+// Phase 1.2 proportion: 6 px wide x 16 px tall (was 21). Horizontal geometry is
+// unchanged -- same 8 px byte-aligned cell, same 46 px six-digit span, same X.
+// Structural grid: bar rows 0 / 7 / 15, stems at columns 0 and 5; row 7 is the
+// shared middle (3's waist, 4's crossbar, 5's and 6's shoulder, 8's bar), the
+// role rows 0/10/20 played at 21 rows. 6 and 9 remain exact 180 rotations.
 // Glyph occupies the top 6 bits of each byte; the low 2 bits are the gap that
 // separates this digit from the next in the same 8 px byte-aligned cell.
-    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 0
-    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100
-    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
-    .byte %00011000, %00101000, %01001000, %00001000, %00001000, %00001000, %00001000   // 1
-    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000
-    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %01111100
-    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00000100   // 2
-    .byte %00000100, %00000100, %00000100, %00001000, %00001000, %00010000, %00010000
-    .byte %00100000, %00100000, %01000000, %01000000, %10000000, %10000000, %11111100
-    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00000100   // 3
-    .byte %00000100, %00000100, %00001000, %00111000, %00001000, %00000100, %00000100
-    .byte %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
-    .byte %00001000, %00001000, %00011000, %00011000, %00101000, %00101000, %01001000   // 4
-    .byte %01001000, %10001000, %10001000, %11111100, %00001000, %00001000, %00001000
-    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000
-    .byte %11111100, %10000000, %10000000, %10000000, %10000000, %10000000, %10000000   // 5
-    .byte %10000000, %11111000, %00000100, %00000100, %00000100, %00000100, %00000100
-    .byte %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
-    .byte %00111100, %01000000, %10000000, %10000000, %10000000, %10000000, %10000000   // 6
-    .byte %10000000, %11111000, %10000100, %10000100, %10000100, %10000100, %10000100
-    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
-    .byte %11111100, %00000100, %00000100, %00001000, %00001000, %00001000, %00010000   // 7
-    .byte %00010000, %00010000, %00100000, %00100000, %00100000, %00100000, %01000000
-    .byte %01000000, %01000000, %01000000, %10000000, %10000000, %10000000, %10000000
-    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 8
-    .byte %10000100, %10000100, %10000100, %01111000, %10000100, %10000100, %10000100
-    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
-    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 9
-    .byte %10000100, %10000100, %10000100, %10000100, %01111100, %00000100, %00000100
-    .byte %00000100, %00000100, %00000100, %00000100, %00000100, %00001000, %11110000
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 0
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %00011000, %00101000, %01001000, %00001000, %00001000, %00001000, %00001000, %00001000   // 1
+    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %01111100
+    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00000100, %00001000   // 2
+    .byte %00001000, %00010000, %00100000, %00100000, %01000000, %10000000, %10000000, %11111100
+    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00001000, %00111000   // 3
+    .byte %00001000, %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
+    .byte %00001000, %00011000, %00011000, %00101000, %00101000, %01001000, %10001000, %11111100   // 4
+    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000
+    .byte %11111100, %10000000, %10000000, %10000000, %10000000, %10000000, %10000000, %11111000   // 5
+    .byte %00000100, %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
+    .byte %00111100, %01000000, %10000000, %10000000, %10000000, %10000000, %10000000, %11111000   // 6
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %11111100, %00000100, %00000100, %00001000, %00001000, %00010000, %00010000, %00100000   // 7
+    .byte %00100000, %00100000, %01000000, %01000000, %01000000, %10000000, %10000000, %10000000
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000   // 8
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 9
+    .byte %01111100, %00000100, %00000100, %00000100, %00000100, %00000100, %00001000, %11110000
 scoreFontEnd:
 .if (scoreFontEnd - scoreFont != 10 * HUD_SCORE_GLYPH_H) {
     .error "scoreFont must be exactly 10 digits x HUD_SCORE_GLYPH_H rows"
