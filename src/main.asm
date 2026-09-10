@@ -15,6 +15,11 @@
 // every added block is `#if HUD_PROOF_ENABLE`-guarded. See the HUD_* consts
 // below and /reports/top-border-sprite-hud-proof-report.md.
 #define HUD_PROOF_ENABLE
+// HUD Phase 1: the four top-border HUD slots now carry the six-digit score
+// (indices 0,1) plus two blank slots. Uncomment to restore the original four
+// distinct diagnostic proof sprites instead, for eyeballing per-slot ownership
+// and the HUD -> gameplay handoff without the score in the way.
+//#define HUD_PROOF_PATTERN
 
 // Lightweight raster-scheduler forensic ring buffer (see src/raster_scheduler.asm
 // rasterIRQ / FORENSIC_RING). ~24 cycles per raster event; a 64K dump then shows
@@ -390,7 +395,55 @@
 .const HUD_HANDOFF_COMPLETE_RASTER = 56
 .const HUD_SPRITE_BASE     = $2f00      // 4 x 64B hires bitmaps, VIC bank 0 gap $2e6a..$2fff.
 .const HUD_SPRITE_BASE_PTR = HUD_SPRITE_BASE / 64        // $bc; slot ptrs $bc..$bf.
-.const HUD_D010_KEEP       = $80        // HUD sprite index 3 (hw slot 7) sits at X=280 -> keep its $D010 bit.
+
+// --- HUD Phase 1: six-digit score across HUD sprite indices 0 and 1 ---------
+// The score occupies the first TWO of the four HUD slots (hardware 4 and 5);
+// indices 2 and 3 (hardware 6, 7) are pointed at the all-zero blankSprite so the
+// proven 4-slot setup/handoff geometry -- and therefore gameplay sprite capacity
+// -- is completely unchanged.
+//
+// Digit cell pitch is 8 px, so each digit is BYTE ALIGNED inside its sprite
+// (columns 0/1/2) and the glyph gap is identical inside a sprite and across the
+// sprite join. A 5 px glyph in an 8 px cell leaves a uniform 3 px gap.
+//   number width = 6*8 - 3 = 45 px, spanning X 162..206
+//   display centre = 24 + 320/2 = 184 = (162+206)/2  -> exactly centred
+// Both sprite X values are < 256, so neither needs a $D010 MSB bit.
+.const HUD_SCORE_SLOT_L    = 0          // HUD index 0 -> hardware sprite HUD_SLOT_FIRST + 0 = 4
+.const HUD_SCORE_SLOT_R    = 1          // HUD index 1 -> hardware sprite HUD_SLOT_FIRST + 1 = 5
+.const HUD_SCORE_BITMAP_L  = HUD_SPRITE_BASE + HUD_SCORE_SLOT_L * 64   // $2f00, pointer $bc
+.const HUD_SCORE_BITMAP_R  = HUD_SPRITE_BASE + HUD_SCORE_SLOT_R * 64   // $2f40, pointer $bd
+// DOUBLE BUFFERED. The 21-row font makes the compose ~1,200-2,150 cycles (up to
+// ~34 raster lines under dense DMA), far too long to prove safe against the HUD
+// sprites' own DMA from an arbitrary entry raster. So the compose never writes a
+// bitmap the VIC is currently fetching: it draws into the OTHER pair and then
+// publishes it by rewriting hudProofPtr, which the existing hudBorderSetup
+// republishes to BOTH pointer pages ($07F8 and $2BF8) at the line-1 IRQ.
+// The back pair reuses HUD slots 2/3, which are allocated in the 4 x 64 B HUD
+// block but pointed at blankSprite and never displayed -- so this costs no new
+// memory. The buffers are exactly $80 apart, which is why the compositor can
+// select one with a single index register.
+.const HUD_SCORE_BITMAP_B  = $80        // byte offset from the front pair to the back pair
+.const HUD_SCORE_BITMAP_L2 = HUD_SCORE_BITMAP_L + HUD_SCORE_BITMAP_B   // $2f80, pointer $be
+.const HUD_SCORE_BITMAP_R2 = HUD_SCORE_BITMAP_R + HUD_SCORE_BITMAP_B   // $2fc0, pointer $bf
+.const HUD_SCORE_X_L       = 161        // left sprite: digits 1..3 (6 px glyph + 2 px gap = 46 px span)
+.const HUD_SCORE_X_R       = HUD_SCORE_X_L + 24   // 186; adjacent, no overlap
+.const HUD_SCORE_COLOUR    = 13         // VIC-II light green (5 = green is one constant away)
+.const HUD_SCORE_TOP_ROW   = 0          // digits start at sprite row 0 (raster HUD_Y)
+.const HUD_SCORE_GLYPH_H   = 21         // full sprite height; all 21 rows measured visible
+.if (HUD_SCORE_X_R + 24 > 255) {
+    .error "score sprites must stay below X=256 so no $D010 MSB bit is needed"
+}
+.if (HUD_SCORE_TOP_ROW + HUD_SCORE_GLYPH_H > 21) {
+    .error "score digit rows run past the 21-row sprite"
+}
+.const HUD_D010_KEEP       = $00        // Score sprites are at X<256 and the blank slots are parked at X=0.
+// The score font/conversion/composition module is CPU-only, so it lives outside
+// VIC bank 0 in the free hole between the metatile stage data and the legacy
+// page-B coarse routines. Only the two 24x21 bitmaps it writes are VIC-visible.
+.const HUD_SCORE_CODE_SEGMENT = $8000
+.const HUD_SCORE_CODE_LIMIT   = $8600
+// Decimal places for the six-digit conversion, most significant first.
+.var scoreDivisorValue = List().add(100000, 10000, 1000, 100, 10, 1)
 
 #import "variables.asm"
 
@@ -485,14 +538,20 @@
 .const DEBUG_SCREEN = $0400
 .const DEBUG_COLOUR = $d800
 .const DEBUG_FRAMES = 50
-.const DEBUG_PLAYER_INVULNERABLE = 1          // 0 = normal: collisions can kill the player.
+.const DEBUG_PLAYER_INVULNERABLE = 0          // 0 = normal: collisions can kill the player.
                                                // 1 = development: capturePlayerCollision still reads/clears
                                                // $D01E and runs every overlap test, but never sets PLAYER_HIT,
                                                // so unattended scrolling tests can run indefinitely. Compile-
                                                // time only - see the !hit branch in capturePlayerCollision.
-.const SCORE_SCREEN = $0400 + 29              // Top row, right-aligned: "SCORE 00000".
-.const SCORE_COLOUR = $d800 + 29
 .const SCORE_PER_KILL = 100                   // First-pass fixed reward for every destroyed enemy.
+// HUD Phase 1: the score is a 24-bit binary value displayed as six decimal
+// digits with leading zeroes. It SATURATES at the six-digit ceiling rather than
+// wrapping, so a long session can never roll 999999 back to 000000.
+.const SCORE_MAX = 999999                     // $0F423F
+.const SCORE_MAX_LO  = <SCORE_MAX
+.const SCORE_MAX_MID = >SCORE_MAX
+.const SCORE_MAX_HI  = SCORE_MAX >> 16
+.const SCORE_DIGITS_N = 6
 .const LIVES_SCREEN = $0400 + 17               // Top row between FREE and SCORE: "LIVES 3".
 .const LIVES_COLOUR = $d800 + 17
 .const PLAYER_START_LIVES = 3                  // Three ships total, including the one currently in play.
@@ -541,7 +600,7 @@
 // Fixed HUD row0 private glyphs: 18 codes = space, S, C, O, R, E, 0..9, then F
 // and R (for the development FREE-cycle counter). Bitmaps are copied into the
 // RAM charset by initFixedHud; the ten digit glyphs live at HUD_DIGIT_GLYPH..+9.
-// displayScore / displayCycleMinimum write these codes (never screen codes
+// displayCycleMinimum writes these codes (never screen codes
 // 48-57) into their assigned fixed HUD cells only.
 //
 // Relocated 128 -> 64: the terrain glyph namespace grew from 64 to 128 codes
@@ -550,7 +609,6 @@
 // only codes 1..26, 32, 48..57), so codes 64..81 are dead ROM-copy space here.
 .const HUD_GLYPH_BASE = 64
 .const HUD_DIGIT_GLYPH = HUD_GLYPH_BASE + 6      // 134..143: private decimal digits 0..9.
-.const HUD_SCORE_CELL = BG_SCREEN_A + 8          // Row 0 cols 8..12: five live score digits.
 .const HUD_FREE_GLYPH_F = HUD_GLYPH_BASE + 16    // 144: private 'F'.
 .const HUD_FREE_GLYPH_R = HUD_GLYPH_BASE + 17    // 145: private 'R'.
 .const HUD_FREE_LABEL_CELL = BG_SCREEN_A + 28    // Row 0 cols 28..37: "FREE " + five digits.
@@ -790,7 +848,8 @@
 .const HISCORE_COUNT          = 8                    // High-score table entries.
 .const HISCORE_START_SCORE    = 100                  // Every seeded entry starts here.
 .const HISCORE_HEADING_SCREEN = $0400 + (4 * 40) + 14 // Row 4, centred for "HIGH SCORES" (11).
-.const HISCORE_ROW_WIDTH      = 10                   // "III  DDDDD": 3 initials, 2 spaces, 5 digits.
+.const HISCORE_ROW_WIDTH      = 11                   // "III  DDDDDD": 3 initials, 2 spaces, 6 digits.
+.const HISCORE_DIGIT_OFFSET   = 5                    // Digits start 5 chars into a row.
 
 .const ATTRACT_PAGE_TITLE  = 0
 .const ATTRACT_PAGE_SCORES = 1
@@ -810,6 +869,12 @@
 
 .const PLAYER_FIRE_COOLDOWN    = 8              // Frames between held-fire volleys.
 .const PLAYER_MUZZLE_TIME      = 3              // Frames the muzzle-flash sprite remains visible.
+// Player colour. The hull pixels index the PER-SPRITE colour register
+// ($D027 + slot, driven by OBJECT_COLOUR), not the shared $D025/$D026 pair that
+// every other sprite also uses -- so the player can be recoloured without
+// touching enemy or turret colours at all. See the note above playerSprite.
+.const PLAYER_COLOUR_NORMAL    = 14             // VIC-II light blue: reads clearly over the grey terrain.
+.const PLAYER_COLOUR_MUZZLE    = 2              // VIC-II red: the hull flashes on each volley.
 .const PLAYER_LEFT_CANNON_X    = 4              // Horizontal ray offset from player sprite X.
 .const PLAYER_RIGHT_CANNON_X   = 19             // Horizontal ray offset from player sprite X.
 .const ENEMY_START_HEALTH      = 6              // Three centred dual-cannon volleys before future death handling.
@@ -952,7 +1017,7 @@ startGame:
     sta OBJECT_TYPE                         // Store A in OBJECT_TYPE.
     lda #playerSprite / 64                  // Load A from #playerSprite / 64.
     sta OBJECT_SPRITE                       // Store A in OBJECT_SPRITE.
-    lda #2                                  // Load A from #2.
+    lda #PLAYER_COLOUR_NORMAL               // Player hull colour (per-sprite register).
     sta OBJECT_COLOUR                       // Store A in OBJECT_COLOUR.
 
     jsr buildSortedObjectList               // Call buildSortedObjectList; return here when it executes RTS.
@@ -1171,11 +1236,15 @@ gameOverScreen:
 scoreQualifies:
     ldx #0
 !scan:
-    lda SCORE_HI
+    lda SCORE_HI                            // 24-bit unsigned compare, most significant byte first.
     cmp HISCORE_HI,x
     bcc !next+                              // SCORE high byte smaller -> SCORE < entry here.
     bne !here+                              // SCORE high byte larger  -> SCORE > entry here.
-    lda SCORE_LO                            // High bytes equal: decide on the low byte.
+    lda SCORE_MID
+    cmp HISCORE_MID,x
+    bcc !next+
+    bne !here+
+    lda SCORE_LO                            // High and middle bytes equal: decide on the low byte.
     cmp HISCORE_LO,x
     bcc !next+
     beq !next+                             // Equal score does not displace an existing entry.
@@ -1364,6 +1433,8 @@ insertHiscore:
     beq !scoreShifted+
     lda HISCORE_LO - 1,x
     sta HISCORE_LO,x
+    lda HISCORE_MID - 1,x
+    sta HISCORE_MID,x
     lda HISCORE_HI - 1,x
     sta HISCORE_HI,x
     dex
@@ -1372,6 +1443,8 @@ insertHiscore:
     ldx NEW_SCORE_RANK
     lda SCORE_LO
     sta HISCORE_LO,x
+    lda SCORE_MID
+    sta HISCORE_MID,x
     lda SCORE_HI
     sta HISCORE_HI,x
 
@@ -1572,6 +1645,8 @@ seedHiscoreTable:
     lda #<HISCORE_START_SCORE
     sta HISCORE_LO,y
     lda #>HISCORE_START_SCORE
+    sta HISCORE_MID,y
+    lda #HISCORE_START_SCORE >> 16
     sta HISCORE_HI,y
 
     iny
@@ -1604,20 +1679,25 @@ nextRandomLetter:
 
 // --- Routine: formatHiscorePage ---------------------------------------
 // Rebuild HISCORE_PAGE_BUF: one HISCORE_ROW_WIDTH-char row per entry, laid
-// out "III  DDDDD" (3 initials, 2 spaces, 5 decimal digits). Call whenever
+// out "III  DDDDDD" (3 initials, 2 spaces, 6 decimal digits). Call whenever
 // the table changes.
 formatHiscorePage:
     ldx #0                                  // X = entry index.
 !rowLoop:
     stx HS_ENTRY
 
-    txa                                     // Buffer offset for this row = entry * HISCORE_ROW_WIDTH (10).
+    txa                                     // Buffer offset for this row = entry * HISCORE_ROW_WIDTH (11).
+    sta HS_TMP                              // *1
     asl                                     // *2
-    sta HS_TMP
+    clc
+    adc HS_TMP                              // *3
+    sta HS_TMP                              // hold *3
+    txa
+    asl                                     // *2
     asl                                     // *4
     asl                                     // *8
     clc
-    adc HS_TMP                              // *8 + *2 = *10
+    adc HS_TMP                              // *8 + *3 = *11
     sta HS_BUF_OFF
 
     txa                                     // Name offset = entry * 3.
@@ -1637,17 +1717,19 @@ formatHiscorePage:
     sta HISCORE_PAGE_BUF + 3,x
     sta HISCORE_PAGE_BUF + 4,x
 
-    ldy HS_ENTRY                            // Copy this entry's score into the conversion scratch.
+    ldy HS_ENTRY                            // Copy this entry's 24-bit score into the shared scratch.
     lda HISCORE_LO,y
-    sta HS_VAL_LO
+    sta CONV_LO
+    lda HISCORE_MID,y
+    sta CONV_MID
     lda HISCORE_HI,y
-    sta HS_VAL_HI
+    sta CONV_HI
 
-    lda HS_BUF_OFF                          // Digits start five characters into the row.
+    lda HS_BUF_OFF
     clc
-    adc #5
+    adc #HISCORE_DIGIT_OFFSET
     tay
-    jsr formatScore5                       // Writes 5 screen codes at HISCORE_PAGE_BUF + Y.
+    jsr formatScore6                       // Writes 6 screen codes at HISCORE_PAGE_BUF + Y.
 
     ldx HS_ENTRY
     inx
@@ -1655,35 +1737,18 @@ formatHiscorePage:
     bne !rowLoop-
     rts
 
-// --- Routine: formatScore5 ------------------------------------------
-// Convert HS_VAL_LO/HI (destroyed) to exactly five decimal screen codes,
-// written to HISCORE_PAGE_BUF + Y .. +Y+4. Shares the decimal divisor table
-// with the FREE-cycle / score HUD converters.
-formatScore5:
+// --- Routine: formatScore6 ------------------------------------------
+// Convert CONV_LO/MID/HI (destroyed) to exactly six decimal screen codes with
+// leading zeroes, written to HISCORE_PAGE_BUF + Y .. +Y+5.
+// Uses the same convert24to6 the HUD score sprites use, so the attract page and
+// the in-game HUD can never disagree about a value.
+// Entry: Y = destination index into HISCORE_PAGE_BUF.
+formatScore6:
     sty HS_DIGIT_BASE
-    ldx #0                                  // X = decimal place: 0=10000s .. 4=1s.
-!placeLoop:
-    ldy #0                                  // Y counts how many times this divisor fits.
-!subLoop:
-    lda HS_VAL_HI
-    cmp debugDivisorHi,x
-    bcc !emit+
-    bne !doSub+
-    lda HS_VAL_LO
-    cmp debugDivisorLo,x
-    bcc !emit+
-!doSub:
-    lda HS_VAL_LO
-    sec
-    sbc debugDivisorLo,x
-    sta HS_VAL_LO
-    lda HS_VAL_HI
-    sbc debugDivisorHi,x
-    sta HS_VAL_HI
-    iny
-    bne !subLoop-
+    jsr convert24to6
+    ldx #0                                  // X = decimal place, 0 = 100000s .. 5 = 1s
 !emit:
-    tya
+    lda CONV_DIGITS,x
     clc
     adc #48                                 // Screen codes 48-57 are digits 0-9.
     pha
@@ -1694,8 +1759,8 @@ formatScore5:
     pla
     sta HISCORE_PAGE_BUF,y
     inx
-    cpx #5
-    bne !placeLoop-
+    cpx #SCORE_DIGITS_N
+    bne !emit-
     rts
 
 // --- Routine: drawHiscorePage ---------------------------------------
@@ -1719,12 +1784,17 @@ drawHiscorePage:
     stx HS_ENTRY
 
     txa                                     // Row source = HISCORE_PAGE_BUF + entry * HISCORE_ROW_WIDTH.
-    asl
-    sta HS_TMP
-    asl
-    asl
+    sta HS_TMP                              // *1
+    asl                                     // *2
     clc
-    adc HS_TMP                              // entry * 10
+    adc HS_TMP                              // *3
+    sta HS_TMP
+    txa
+    asl
+    asl
+    asl                                     // *8
+    clc
+    adc HS_TMP                              // entry * 11
     clc
     adc #<HISCORE_PAGE_BUF
     sta TEXT_SRC
@@ -2230,6 +2300,8 @@ updatePlayerFire:
     sta PLAYER_MUZZLE_TIMER
     lda #playerFireSprite / 64
     sta OBJECT_SPRITE                       // Object 0 remains the player; only its presentation changes.
+    lda #PLAYER_COLOUR_MUZZLE               // Hull flashes red for the muzzle window; restored by
+    sta OBJECT_COLOUR                       // updatePlayerCombatEffects when PLAYER_MUZZLE_TIMER expires.
 
     lda OBJECT_X                            // Build the left-cannon 9-bit world X coordinate.
     clc
@@ -2486,6 +2558,8 @@ updatePlayerCombatEffects:
     bne !done+
     lda #playerSprite / 64
     sta OBJECT_SPRITE
+    lda #PLAYER_COLOUR_NORMAL               // Back to blue after the volley.
+    sta OBJECT_COLOUR
 
 !done:
     rts
@@ -3691,109 +3765,107 @@ gameOverLabel:
     .byte 7,1,13,5,32,15,22,5,18
 
 // --- Routine: setupScoreDisplay --------------------------------------------
-// Clear the 16-bit score and draw "SCORE 00000" at the top-right of screen RAM.
+// Zero the 24-bit score and force the initial "000000" HUD render.
+//
+// Phase 1.5 retired the character HUD row; this routine used to also stamp
+// "SCORE 00000" into SCORE_SCREEN ($0400 + 29). Matrix row 0 now carries
+// incoming overflow TERRAIN, so that write only scribbled 11 stale cells into
+// the scrolling playfield until the next coarse step overwrote them. Removed.
 setupScoreDisplay:
     lda #0
-    sta SCORE_LO                            // Score begins at zero, low byte.
-    sta SCORE_HI                            // Score begins at zero, high byte.
-    sta SCORE_DIRTY                         // No deferred HUD rebuild pending at game start.
+    sta SCORE_LO                            // Score begins at zero ...
+    sta SCORE_MID
+    sta SCORE_HI
+    jsr renderScoreHudBothBuffers           // Force the initial 000000 render into BOTH sprite pairs.
+    lda #0
+    sta SCORE_DIRTY                         // Nothing deferred: the sprites already show 000000.
+    sta SCORE_PHASE
+    rts
 
-    ldx #0                                  // Copy the fixed label plus five decimal digits.
-!labelLoop:
-    lda scoreLabel,x
-    sta SCORE_SCREEN,x
-    lda #1                                  // C64 colour 1 = white.
-    sta SCORE_COLOUR,x
-    inx
-    cpx #11                                 // "SCORE " plus five digits.
-    bne !labelLoop-
+// --- Routine: addScore -----------------------------------------------------
+// THE central score-award mechanism. Adds the 24-bit amount in
+// SCORE_ADD_LO/MID/HI to the 24-bit score with full carry propagation and
+// SATURATES at SCORE_MAX (999999) rather than wrapping, then marks the HUD
+// stale. Gameplay code must not do bespoke score arithmetic.
+//
+// Uses A and absolute addressing only, so X and Y are preserved for callers
+// (awardKillScore is called with X = the dying object's slot).
+addScore:
+    // Already at the ceiling? Every further award is a no-op on the value, so
+    // return WITHOUT marking dirty. Without this, a player parked at 999999
+    // makes the HUD re-run the most expensive conversion there is (54 subtract
+    // iterations) on every single kill, for digits that cannot change.
+    lda SCORE_HI
+    cmp #SCORE_MAX_HI
+    bne !add+
+    lda SCORE_MID
+    cmp #SCORE_MAX_MID
+    bne !add+
+    lda SCORE_LO
+    cmp #SCORE_MAX_LO
+    beq !atCeiling+
+!add:
+    lda SCORE_LO
+    clc
+    adc SCORE_ADD_LO
+    sta SCORE_LO
+    lda SCORE_MID
+    adc SCORE_ADD_MID
+    sta SCORE_MID
+    lda SCORE_HI
+    adc SCORE_ADD_HI
+    sta SCORE_HI
+    bcs !saturate+                          // 24-bit overflow -> definitely past the ceiling.
+
+    lda SCORE_HI                            // score > SCORE_MAX ? (unsigned 24-bit compare)
+    cmp #SCORE_MAX_HI
+    bcc !clamped+                           // high byte smaller -> below the ceiling.
+    bne !saturate+                          // high byte larger  -> above it.
+    lda SCORE_MID
+    cmp #SCORE_MAX_MID
+    bcc !clamped+
+    bne !saturate+
+    lda SCORE_LO
+    cmp #SCORE_MAX_LO
+    bcc !clamped+
+    beq !clamped+                           // exactly 999999 is legal.
+!saturate:
+    lda #SCORE_MAX_LO
+    sta SCORE_LO
+    lda #SCORE_MAX_MID
+    sta SCORE_MID
+    lda #SCORE_MAX_HI
+    sta SCORE_HI
+!clamped:
+    lda #1
+    sta SCORE_DIRTY                         // Deferred HUD rebuild; X/Y untouched by the code above.
+!atCeiling:
     rts
 
 // --- Routine: awardKillScore -----------------------------------------------
-// Add the fixed kill reward to the 16-bit binary score and mark the HUD digits
-// stale. The visible-digit rebuild (displayScore, a repeated-subtraction
-// decimal conversion costing up to ~900 cycles) is NOT done here: on a coarse-
-// transition frame that synchronous cost could push prepareBackgroundCoarse
-// past its raster-184 admission cutoff and force a safe one-frame coarse hold
-// (see docs/multicolour-terrain-worklog.md, turret-kill hitch). Instead
-// refreshScoreIfDirty rebuilds the digits once at frame start, off that path.
-// The 16-bit score value is updated immediately; only the on-screen digits
-// lag by one frame.
+// Fixed kill reward. Thin wrapper over addScore so every award goes through one
+// carrying/saturating implementation.
+//
+// The visible rebuild (convert + sprite compose) is NOT done here: on a coarse-
+// transition frame that synchronous cost could push prepareBackgroundCoarse past
+// its raster admission cutoff and force a safe one-frame coarse hold (see
+// docs/multicolour-terrain-worklog.md, turret-kill hitch). refreshScoreIfDirty
+// rebuilds in small bounded chunks, off that path. The score VALUE is exact
+// immediately; only the drawn digits lag, by at most seven frames.
 awardKillScore:
-    lda SCORE_LO
-    clc
-    adc #<SCORE_PER_KILL
-    sta SCORE_LO
-    lda SCORE_HI
-    adc #>SCORE_PER_KILL
-    sta SCORE_HI
+    lda #<SCORE_PER_KILL
+    sta SCORE_ADD_LO
+    lda #>SCORE_PER_KILL
+    sta SCORE_ADD_MID
+    lda #SCORE_PER_KILL >> 16
+    sta SCORE_ADD_HI
+    jmp addScore
 
-    lda #1
-    sta SCORE_DIRTY                         // Deferred HUD-digit rebuild; X is untouched by the code above.
-    rts
-
-// --- Routine: refreshScoreIfDirty ---------------------------------------
-// Called once per frame at a frame-start point that is not on the gameplay ->
-// prepareBackgroundCoarse critical path. Rebuilds the five fixed-HUD score
-// digits only on the frame after a kill; otherwise ~10 cycles.
-refreshScoreIfDirty:
-    // Phase 1.5: the on-screen score digits lived in the retired fixed HUD row.
-    // The 16-bit score value (SCORE_LO/HI) is still maintained by awardKillScore;
-    // this routine now only consumes the dirty flag so awardKillScore's contract
-    // (and any future HUD that re-reads SCORE_DIRTY) is unchanged. displayScore is
-    // retained but no longer called.
-    lda #0
-    sta SCORE_DIRTY
-    rts
-
-// --- Routine: displayScore --------------------------------------------------
-// Convert the 16-bit binary score to five decimal digits and write the private
-// fixed-HUD digit glyphs into HUD_SCORE_CELL..+4. Called once per score change
-// (awardKillScore) and once at game start (initFixedHud), never per frame, so
-// no separate change guard is needed. The decimal divisor table is shared with
-// the FREE-cycle display. The scrolling matrix outside the fixed HUD row is
-// never touched.
-displayScore:
-    lda SCORE_LO
-    sta SCORE_VALUE_LO                      // Conversion works on a disposable copy.
-    lda SCORE_HI
-    sta SCORE_VALUE_HI
-
-    ldx #0                                  // Start at the 10000s decimal place.
-!digitLoop:
-    ldy #0                                  // Y counts how many times this divisor fits.
-!subtractLoop:
-    lda SCORE_VALUE_HI
-    cmp debugDivisorHi,x
-    bcc !emitDigit+
-    bne !subtract+
-    lda SCORE_VALUE_LO
-    cmp debugDivisorLo,x
-    bcc !emitDigit+
-
-!subtract:
-    lda SCORE_VALUE_LO
-    sec
-    sbc debugDivisorLo,x
-    sta SCORE_VALUE_LO
-    lda SCORE_VALUE_HI
-    sbc debugDivisorHi,x
-    sta SCORE_VALUE_HI
-    iny
-    bne !subtractLoop-
-
-!emitDigit:
-    tya
-    clc
-    adc #HUD_DIGIT_GLYPH                    // Private HUD digit glyph 0..9 - never screen codes 48-57.
-    sta HUD_SCORE_CELL,x
-    inx
-    cpx #5
-    bne !digitLoop-
-    rts
-
-scoreLabel:
-    .byte 19,3,15,18,5,32,48,48,48,48,48  // Screen codes for "SCORE 00000".
+// Phase 1.5 retired the character-cell HUD; HUD Phase 1 replaces it with the
+// six-digit sprite score (renderScoreHud). The old 16-bit -> five-glyph
+// displayScore converter and its "SCORE 00000" label are gone with it: nothing
+// called them, and their 16-bit arithmetic could not represent the new range.
+// The shared decimal divisor table it used lives on for displayCycleMinimum.
 
 // --- Routine: setupDebugDisplay --------------------------------------------
 // Initialise the rolling cycle minimum. The FREE label/digits now live in the
@@ -4340,7 +4412,7 @@ updatePlayerState:
 
     lda #playerSprite / 64                  // Restore the normal player ship bitmap.
     sta OBJECT_SPRITE
-    lda #2                                  // Restore the normal player individual colour.
+    lda #PLAYER_COLOUR_NORMAL               // Restore the normal player individual colour.
     sta OBJECT_COLOUR
 
     lda #PLAYER_RESPAWN_TIME                // Start the invulnerable blinking period.
@@ -4676,10 +4748,25 @@ starRowHi:
 #if HUD_PROOF_ENABLE
 // Per-HUD-slot fixed geometry (slot index 0..3 -> hardware slot HUD_SLOT_FIRST+i).
 // In the lookup-table segment tail; the bitmaps live separately at HUD_SPRITE_BASE.
+#if HUD_PROOF_PATTERN
+// Diagnostic fallback: the original four distinct proof sprites (checkerboard /
+// bars / ramp / frame). Retained so the top-border slot ownership + handoff can
+// still be eyeballed per-slot without the score obscuring it.
 hudProofPtr:    .byte HUD_SPRITE_BASE_PTR, HUD_SPRITE_BASE_PTR+1, HUD_SPRITE_BASE_PTR+2, HUD_SPRITE_BASE_PTR+3
 hudProofX:      .byte 40, 120, 200, 280 - 256          // sprite 3 X = 280 -> its $D010 bit is set
 hudProofXMsb:   .byte 0, 0, 0, 1
 hudProofColour: .byte 1, 7, 13, 3                      // white / yellow / lt-green / cyan
+#else
+// HUD Phase 1: indices 0,1 (hardware slots 4,5) are the six-digit score; indices
+// 2,3 (hardware slots 6,7) point at the all-zero blankSprite and are parked at
+// X=0 (behind the unopened LEFT border) so they are doubly invisible. The four
+// slots, their $D015 enable, their hires mode and the handoff that returns them
+// to gameplay are all completely unchanged -- no sprite capacity is lost.
+hudProofPtr:    .byte HUD_SCORE_BITMAP_L / 64, HUD_SCORE_BITMAP_R / 64, blankSprite / 64, blankSprite / 64
+hudProofX:      .byte HUD_SCORE_X_L, HUD_SCORE_X_R, 0, 0
+hudProofXMsb:   .byte 0, 0, 0, 0                       // all HUD X values < 256 (see HUD_D010_KEEP = $00)
+hudProofColour: .byte HUD_SCORE_COLOUR, HUD_SCORE_COLOUR, 0, 0
+#endif
 #endif
 
 LOOKUP_TABLES_END:
@@ -4714,6 +4801,14 @@ BORDER_MARKER_SPRITE:
 //   2 ($be) diagonal ramp  3 ($bf) solid frame + a crude "4"
 * = HUD_SPRITE_BASE
 hudProofSprites:
+#if !HUD_PROOF_PATTERN
+    // HUD Phase 1: bitmaps 0 and 1 are the six-digit score, composed at runtime
+    // by renderScoreHud. They ship zeroed (fully transparent) and only the seven
+    // digit rows are ever written, so every pixel outside the number stays clear.
+    // Bitmaps 2 and 3 are unused -- indices 2,3 point at blankSprite instead --
+    // and are kept zeroed so the 4 x 64 B block shape and its guards are intact.
+    .fill HUD_SPRITE_COUNT * 64, $00
+#else
     // 0 ($bc): checkerboard
     .byte $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6
     .byte $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db, $db,$6d,$b6, $6d,$b6,$db
@@ -4734,6 +4829,7 @@ hudProofSprites:
     .byte $80,$66,$01, $80,$7f,$01, $80,$7f,$01, $80,$06,$01, $80,$06,$01, $80,$06,$01, $80,$00,$01
     .byte $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $80,$00,$01, $ff,$ff,$ff
     .byte $00
+#endif
 hudProofSpritesEnd:
 .if (hudProofSprites != HUD_SPRITE_BASE || hudProofSpritesEnd != HUD_SPRITE_BASE + HUD_SPRITE_COUNT * 64) {
     .error "HUD proof sprite bitmaps must be exactly 4 x 64 bytes at HUD_SPRITE_BASE"
@@ -4876,14 +4972,16 @@ INITIALS_EDGE:         .byte 0         // Bits that went released -> pressed thi
 HISCORE_SEED:          .byte 0         // Running seed for placeholder-initial generation.
 HS_ENTRY:              .byte 0         // Scratch: current entry index during table formatting.
 HS_BUF_OFF:            .byte 0         // Scratch: current row's byte offset into HISCORE_PAGE_BUF.
-HS_TMP:                .byte 0         // Scratch: multiply-by-10 partial.
-HS_VAL_LO:             .byte 0         // Scratch: score being converted to decimal.
-HS_VAL_HI:             .byte 0
+HS_TMP:                .byte 0         // Scratch: row-offset multiply partial.
 HS_DIGIT_BASE:         .byte 0         // Scratch: buffer index of a score's first digit.
+// HUD Phase 1: the high score is 24-bit too -- a six-digit live score with a
+// 16-bit table would cap every entry at 65535 and make 100000+ unrecordable.
 HISCORE_LO:            .fill HISCORE_COUNT, 0            // Per-entry score, low byte (kept descending).
 HISCORE_HI:            .fill HISCORE_COUNT, 0            // Per-entry score, high byte.
+                                                         // HISCORE_MID lives in hudScoreState (no room here).
 HISCORE_NAME:          .fill HISCORE_COUNT * 3, 0        // Three initials (screen codes) per entry.
-HISCORE_PAGE_BUF:      .fill HISCORE_COUNT * HISCORE_ROW_WIDTH, 32  // Pre-rendered attract-page rows.
+                                                         // HISCORE_PAGE_BUF lives in hudScoreState: widening
+                                                         // the rows to six digits no longer fits this block.
 
 PLAYER_HW_MASK:        .byte 0         // Current VIC hardware bit occupied by logical object 0.
 PLAYER_HIT:            .byte 0         // Latched vulnerable-player collision event.
@@ -4918,14 +5016,22 @@ IRQ_ASSIGN_INDEX:      .byte 0
 IRQ_ASSIGN_END:        .byte 0
 IRQ_SELECTED_SLOT:     .byte $ff
 
-SCORE_LO:              .byte 0            // 16-bit binary score, low byte.
-SCORE_HI:              .byte 0            // 16-bit binary score, high byte.
-SCORE_VALUE_LO:        .byte 0            // Scratch copy used by decimal HUD conversion.
-SCORE_VALUE_HI:        .byte 0            // Scratch copy used by decimal HUD conversion.
-SCORE_DIRTY:           .byte 0            // Set by awardKillScore; the deferred HUD-digit rebuild
-                                          // (displayScore) then runs once at a frame-start point that
-                                          // is off the gameplay -> prepareBackgroundCoarse critical
-                                          // path, so a kill can no longer delay a coarse transition.
+// --- HUD Phase 1: 24-bit binary score, 000000..999999 (saturating) ---------
+// Only the live score + its dirty flag stay in this tight $2000..$23FF block;
+// the award input, the conversion scratch and the digit output live with the
+// score module (hudScoreState) outside VIC bank 0, where there is room.
+SCORE_LO:              .byte 0            // 24-bit binary score, low byte.
+SCORE_MID:             .byte 0            //  ... middle byte.
+SCORE_HI:              .byte 0            //  ... high byte. Ceiling SCORE_MAX (999999 = $0F423F).
+SCORE_DIRTY:           .byte 0            // Set by addScore; refreshScoreIfDirty consumes it once per
+                                          // frame, off the gameplay -> prepareBackgroundCoarse critical
+                                          // path, so a kill can never delay a coarse transition.
+SCORE_BACKBUF:         .byte 0            // Byte offset of the score sprite pair the compositor may
+                                          // write (0 = front pair, $80 = back pair). The VIC is never
+                                          // fetching this pair. See composeScoreSprites.
+SCORE_PHASE:           .byte 0            // Deferred-rebuild state machine: 0 = idle, 2..6 = converting
+                                          // decimal place (phase - 1), 7 = compose. See
+                                          // refreshScoreIfDirty.
 
 DEBUG_FRAME_COUNT:     .byte 0
 DEBUG_RASTER_LO:       .byte 0
@@ -4960,53 +5066,59 @@ ENGINE_STATE_END:
 // --- Sprite bitmap data -----------------------------------------------------
 * = $2400
 
+// Player ship. Multicolour bit pairs: 00 transparent, 01 = $D025 (shared dark
+// grey), 10 = the PER-SPRITE colour register (OBJECT_COLOUR), 11 = $D026 (shared
+// light grey). The hull deliberately uses 10, so the ship's colour is owned by
+// the player object alone -- $D025/$D026 are shared with every enemy and turret
+// and must not be repurposed for the player. The old spine pixels became 11,
+// which now reads as a light-grey highlight down the fuselage.
 playerSprite:
 
-    .byte $00,$3c,$00
-    .byte $00,$3c,$00
-    .byte $00,$ff,$00
-    .byte $00,$eb,$00
-    .byte $03,$eb,$c0
-    .byte $03,$eb,$c0
-    .byte $0f,$eb,$f0
-    .byte $0f,$d7,$f0
-    .byte $3f,$d7,$fc
-    .byte $3f,$d7,$fc
-    .byte $ff,$d7,$ff
-    .byte $ff,$d7,$ff
-    .byte $3f,$d7,$fc
-    .byte $3f,$ff,$fc
-    .byte $0f,$d7,$f0
-    .byte $0f,$d7,$f0
-    .byte $0f,$c3,$f0
-    .byte $03,$c3,$c0
-    .byte $03,$c3,$c0
+    .byte $00,$28,$00
+    .byte $00,$28,$00
+    .byte $00,$aa,$00
+    .byte $00,$be,$00
+    .byte $02,$be,$80
+    .byte $02,$be,$80
+    .byte $0a,$be,$a0
+    .byte $0a,$96,$a0
+    .byte $2a,$96,$a8
+    .byte $2a,$96,$a8
+    .byte $aa,$96,$aa
+    .byte $aa,$96,$aa
+    .byte $2a,$96,$a8
+    .byte $2a,$aa,$a8
+    .byte $0a,$96,$a0
+    .byte $0a,$96,$a0
+    .byte $0a,$82,$a0
     .byte $02,$82,$80
     .byte $02,$82,$80
+    .byte $03,$c3,$c0
+    .byte $03,$c3,$c0
     .byte $00            // 64th padding byte
 
 playerFireSprite:
-    .byte $0c,$3c,$30
-    .byte $03,$3c,$c0
-    .byte $0c,$ff,$30
-    .byte $00,$eb,$00
-    .byte $03,$eb,$c0
-    .byte $03,$eb,$c0
-    .byte $0f,$eb,$f0
-    .byte $0f,$d7,$f0
-    .byte $3f,$d7,$fc
-    .byte $3f,$d7,$fc
-    .byte $ff,$d7,$ff
-    .byte $ff,$d7,$ff
-    .byte $3f,$d7,$fc
-    .byte $3f,$ff,$fc
-    .byte $0f,$d7,$f0
-    .byte $0f,$d7,$f0
-    .byte $0f,$c3,$f0
-    .byte $03,$c3,$c0
-    .byte $03,$c3,$c0
+    .byte $08,$28,$20
+    .byte $02,$28,$80
+    .byte $08,$aa,$20
+    .byte $00,$be,$00
+    .byte $02,$be,$80
+    .byte $02,$be,$80
+    .byte $0a,$be,$a0
+    .byte $0a,$96,$a0
+    .byte $2a,$96,$a8
+    .byte $2a,$96,$a8
+    .byte $aa,$96,$aa
+    .byte $aa,$96,$aa
+    .byte $2a,$96,$a8
+    .byte $2a,$aa,$a8
+    .byte $0a,$96,$a0
+    .byte $0a,$96,$a0
+    .byte $0a,$82,$a0
     .byte $02,$82,$80
     .byte $02,$82,$80
+    .byte $03,$c3,$c0
+    .byte $03,$c3,$c0
     .byte $00                              // 64th padding byte
 
 blankSprite:
@@ -8262,8 +8374,10 @@ hudSlotReclaimed:                          // Diagnostic trace: X is the hardwar
 // solid $D021 for ANY palette. The scroller never writes row 0 or row 24, so
 // this one-time fill is permanent. Score/lives *bookkeeping* is unchanged
 // (SCORE_LO/HI, awardKillScore, PLAYER_LIVES); only the on-screen presentation
-// is gone. hudStockCodes / fixedHudText / fixedHudFreeLabel / displayScore /
+// is gone. hudStockCodes / fixedHudText / fixedHudFreeLabel /
 // displayCycleMinimum are retained but no longer reachable during gameplay.
+// HUD Phase 1 replaces the score presentation with two hires sprites; see
+// renderScoreHud.
 .var hudStockCodes = List().add(32, 19,3,15,18,5, 48,49,50,51,52,53,54,55,56,57, 6,18)
 initFixedHud:
     // RSEL=1 overflow-row experiment: matrix rows 0 and 24 are no longer blank
@@ -8280,7 +8394,7 @@ initFixedHud:
 .const HUD_G_R     = HUD_GLYPH_BASE + 4
 .const HUD_G_E     = HUD_GLYPH_BASE + 5
 fixedHudText:
-    .byte HUD_G_S, HUD_G_C, HUD_G_O, HUD_G_R, HUD_G_E, HUD_G_SPACE, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH  // "SCORE " + private 00000; digits overwritten by displayScore.
+    .byte HUD_G_S, HUD_G_C, HUD_G_O, HUD_G_R, HUD_G_E, HUD_G_SPACE, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH  // "SCORE " + private 00000 (retired label data, not drawn).
 fixedHudFreeLabel:
     .byte HUD_FREE_GLYPH_F, HUD_FREE_GLYPH_R, HUD_G_E, HUD_G_E, HUD_G_SPACE, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH, HUD_DIGIT_GLYPH // "FREE 00000" (private glyphs).
 .if (HUD_GLYPH_BASE + hudStockCodes.size() > 224) {
@@ -8780,3 +8894,332 @@ bgCoarseStage3StateEnd:
 // Turret BEHAVIOUR + guards; PLACEMENT (TURRET_COUNT/turretCols/turretRows) is
 // generated (stage_turrets.asm, imported near the top).
 #import "background_turrets.asm"
+
+// ============================================================================
+// HUD Phase 1 -- six-digit sprite score
+// ----------------------------------------------------------------------------
+// CPU-only code + font tables (outside VIC bank 0); the two 24x21 hires bitmaps
+// it composes live in VIC bank 0 at HUD_SCORE_BITMAP_L/R inside the existing
+// HUD_SPRITE_BASE block, so no new VIC-visible allocation is needed.
+// ============================================================================
+* = HUD_SCORE_CODE_SEGMENT
+hudScoreCodeBase:
+
+// --- HUD Phase 1 state that does not fit the $2000..$23FF engine block ------
+// All CPU-only: award input, shared conversion scratch/output, and the high
+// score's middle byte. Absolute (indexed) addressing, so location is free.
+hudScoreState:
+SCORE_ADD_LO:          .byte 0            // addScore input: 24-bit amount to award.
+SCORE_ADD_MID:         .byte 0
+SCORE_ADD_HI:          .byte 0
+// Shared 24-bit -> six-decimal-digit conversion (convert24to6). Used by the HUD
+// score sprites AND the attract high-score page, so there is exactly one
+// conversion implementation that has to be correct.
+CONV_LO:               .byte 0            // conversion input / running remainder (destroyed)
+CONV_MID:              .byte 0
+CONV_HI:               .byte 0
+CONV_DIGITS:           .fill SCORE_DIGITS_N, 0   // output: 6 digit VALUES 0..9, most significant first
+HISCORE_MID:           .fill HISCORE_COUNT, 0    // Per-entry high score, middle byte.
+HISCORE_PAGE_BUF:      .fill HISCORE_COUNT * HISCORE_ROW_WIDTH, 32  // Pre-rendered attract-page rows.
+hudScoreStateEnd:
+
+// --- 5x7 slim digit font --------------------------------------------------
+// One byte per glyph row, pattern left-aligned in the top 5 bits. Row-major,
+// seven rows per digit, digits 0..9. Kept as readable bit literals so the font
+// stays maintainable; the sprite composer indexes it as scoreFont[digit*7 + row].
+scoreFont:
+// Original tall condensed numerals, drawn on the grid for this HUD -- not
+// traced from any commercial face. Character brief: Berthold City / the MU-TH-UR
+// terminal typography in Alien. Squared rather than rounded, flat terminals,
+// chamfered bowl corners, a single consistent 1px stroke, no modulation, and a
+// very tall/narrow proportion (6 px wide x 21 px tall = the FULL sprite height,
+// measured presentable in the opened top border).
+// Glyph occupies the top 6 bits of each byte; the low 2 bits are the gap that
+// separates this digit from the next in the same 8 px byte-aligned cell.
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 0
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %00011000, %00101000, %01001000, %00001000, %00001000, %00001000, %00001000   // 1
+    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000
+    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %01111100
+    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00000100   // 2
+    .byte %00000100, %00000100, %00000100, %00001000, %00001000, %00010000, %00010000
+    .byte %00100000, %00100000, %01000000, %01000000, %10000000, %10000000, %11111100
+    .byte %01111000, %10000100, %10000100, %00000100, %00000100, %00000100, %00000100   // 3
+    .byte %00000100, %00000100, %00001000, %00111000, %00001000, %00000100, %00000100
+    .byte %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
+    .byte %00001000, %00001000, %00011000, %00011000, %00101000, %00101000, %01001000   // 4
+    .byte %01001000, %10001000, %10001000, %11111100, %00001000, %00001000, %00001000
+    .byte %00001000, %00001000, %00001000, %00001000, %00001000, %00001000, %00001000
+    .byte %11111100, %10000000, %10000000, %10000000, %10000000, %10000000, %10000000   // 5
+    .byte %10000000, %11111000, %00000100, %00000100, %00000100, %00000100, %00000100
+    .byte %00000100, %00000100, %00000100, %00000100, %10000100, %10000100, %01111000
+    .byte %00111100, %01000000, %10000000, %10000000, %10000000, %10000000, %10000000   // 6
+    .byte %10000000, %11111000, %10000100, %10000100, %10000100, %10000100, %10000100
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %11111100, %00000100, %00000100, %00001000, %00001000, %00001000, %00010000   // 7
+    .byte %00010000, %00010000, %00100000, %00100000, %00100000, %00100000, %01000000
+    .byte %01000000, %01000000, %01000000, %10000000, %10000000, %10000000, %10000000
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 8
+    .byte %10000100, %10000100, %10000100, %01111000, %10000100, %10000100, %10000100
+    .byte %10000100, %10000100, %10000100, %10000100, %10000100, %10000100, %01111000
+    .byte %01111000, %10000100, %10000100, %10000100, %10000100, %10000100, %10000100   // 9
+    .byte %10000100, %10000100, %10000100, %10000100, %01111100, %00000100, %00000100
+    .byte %00000100, %00000100, %00000100, %00000100, %00000100, %00001000, %11110000
+scoreFontEnd:
+.if (scoreFontEnd - scoreFont != 10 * HUD_SCORE_GLYPH_H) {
+    .error "scoreFont must be exactly 10 digits x HUD_SCORE_GLYPH_H rows"
+}
+
+// digit -> byte offset of its first font row. Saves a multiply in the composer.
+scoreFontOffset:
+    .fill 10, i * HUD_SCORE_GLYPH_H
+
+// --- 24-bit decimal divisors, most significant place first ------------------
+scoreDivisorLo:  .fill SCORE_DIGITS_N, <(scoreDivisorValue.get(i))
+scoreDivisorMid: .fill SCORE_DIGITS_N, >(scoreDivisorValue.get(i))
+scoreDivisorHi:  .fill SCORE_DIGITS_N, (scoreDivisorValue.get(i) >> 16)
+
+// --- Routine: convert24to6 -------------------------------------------------
+// Convert CONV_LO/MID/HI (destroyed) into six digit VALUES 0..9 in
+// CONV_DIGITS[0..5], most significant first, leading zeroes included.
+// Plain repeated subtraction against the 24-bit divisor table: obviously
+// correct, no illegal opcodes, and only ever run on a score change.
+// Plain repeated subtraction via convertScorePlace, six places in a row.
+// Worst case (999999) is 54 subtract iterations. This whole-value form is used
+// only where a spike does not matter: initial setup (nothing on screen yet) and
+// the high-score page (title screen, no scroller running). The GAMEPLAY path
+// converts one place per frame instead -- see refreshScoreIfDirty.
+// Clobbers A, X, Y.
+convert24to6:
+    ldx #0                                  // X = decimal place, 0 = 100000s .. 5 = 1s
+!place:
+    jsr convertScorePlace
+    inx
+    cpx #SCORE_DIGITS_N
+    bne !place-
+    rts
+
+// --- Routine: convertScorePlace --------------------------------------------
+// Convert ONE decimal place: X = place index (0 = 100000s .. 5 = 1s). Counts
+// how many times scoreDivisor[X] fits in CONV_LO/MID/HI, stores that digit in
+// CONV_DIGITS[X] and leaves the remainder in CONV_*. Preserves X.
+//
+// This is the per-frame unit of work for the deferred rebuild. A place is at
+// most 9 subtract iterations, so the routine is bounded at ~700 cycles (~11
+// raster lines) for ANY score -- the same order as composeScoreSprites. That
+// bound is the reason refreshScoreIfDirty converts one place per frame rather
+// than all six at once: six places back to back costs ~7,000 cycles in situ
+// (111 raster lines), which on a frame whose main loop is already nearly full
+// overruns waitForGameFrame and drops a presented frame.
+// Clobbers A, Y.
+convertScorePlace:
+    ldy #0                                  // Y counts how many times this divisor fits
+!sub:
+    lda CONV_HI                             // 24-bit unsigned compare: CONV >= divisor[X] ?
+    cmp scoreDivisorHi,x
+    bcc !emit+
+    bne !doSub+
+    lda CONV_MID
+    cmp scoreDivisorMid,x
+    bcc !emit+
+    bne !doSub+
+    lda CONV_LO
+    cmp scoreDivisorLo,x
+    bcc !emit+
+!doSub:
+    lda CONV_LO
+    sec
+    sbc scoreDivisorLo,x
+    sta CONV_LO
+    lda CONV_MID
+    sbc scoreDivisorMid,x
+    sta CONV_MID
+    lda CONV_HI
+    sbc scoreDivisorHi,x
+    sta CONV_HI
+    iny
+    bne !sub-                               // Y can never reach 256: the score is <= 999999
+!emit:
+    tya
+    sta CONV_DIGITS,x
+    rts
+
+// --- Routine: convertScoreDigits -------------------------------------------
+// Expand the live 24-bit score into CONV_DIGITS. Touches CPU RAM ONLY -- it
+// never writes a sprite bitmap -- so however long it takes and wherever in the
+// frame it lands, it can never race the VIC. Measured worst case (999999) is
+// ~4,100 cycles. Clobbers A, X, Y.
+convertScoreDigits:
+    lda SCORE_LO
+    sta CONV_LO
+    lda SCORE_MID
+    sta CONV_MID
+    lda SCORE_HI
+    sta CONV_HI
+    jmp convert24to6
+
+// --- Routine: composeScoreSprites ------------------------------------------
+// Draw the six digits already in CONV_DIGITS into the two hires HUD sprite
+// bitmaps: digits 1..3 to the left sprite, 4..6 to the right.
+//
+// The 8 px digit pitch makes every digit byte-aligned inside its sprite, so each
+// glyph owns one whole bitmap byte per row and is written with a plain STA. A
+// rebuild therefore fully overwrites every byte it owns -- a wide digit can
+// never leave stale pixels behind a narrow one -- and no clear pass is needed.
+// Bitmap bytes outside the seven digit rows are zeroed at assembly time and
+// never written, so the rest of each sprite stays permanently transparent.
+//
+// Fully unrolled: per digit one table lookup for its font base offset, then
+// seven absolute,Y loads into fixed absolute stores. Bounded at ~390 cycles
+// (~6 raster lines) with NO data-dependent path -- that bound is what makes the
+// bitmap write provably safe against the HUD sprites' DMA (see
+// refreshScoreIfDirty). Clobbers A, X, Y.
+composeScoreSprites:
+    ldx SCORE_BACKBUF                       // 0 = draw into the front pair, $80 = into the back pair.
+    .for (var col = 0; col < 3; col++) {
+        ldy CONV_DIGITS + col
+        lda scoreFontOffset,y
+        tay
+        .for (var row = 0; row < HUD_SCORE_GLYPH_H; row++) {
+            lda scoreFont + row,y
+            sta HUD_SCORE_BITMAP_L + (HUD_SCORE_TOP_ROW + row) * 3 + col,x
+        }
+    }
+    .for (var col = 0; col < 3; col++) {
+        ldy CONV_DIGITS + 3 + col
+        lda scoreFontOffset,y
+        tay
+        .for (var row = 0; row < HUD_SCORE_GLYPH_H; row++) {
+            lda scoreFont + row,y
+            sta HUD_SCORE_BITMAP_R + (HUD_SCORE_TOP_ROW + row) * 3 + col,x
+        }
+    }
+
+// --- publish the freshly drawn pair ----------------------------------------
+// Two bytes into hudProofPtr; hudBorderSetup copies them to $07F8 AND $2BF8 at
+// the line-1 IRQ of the next frame, so the swap uses the repaired publication
+// path rather than bypassing it. Held under SEI because hudBorderSetup must not
+// observe a half-updated pair -- that would show digits 1-3 from one buffer and
+// 4-6 from the other for a frame. ~12 cycles of added IRQ latency, and only on
+// a compose frame.
+publishScoreBuffer:
+    lda SCORE_BACKBUF                       // Offset of the pair we have just drawn.
+    eor #HUD_SCORE_BITMAP_B
+    sta SCORE_BACKBUF                       // The retired pair becomes the next back buffer.
+    bne !publishFront+                      // New back = $80 => we just drew the FRONT pair.
+    lda #HUD_SCORE_BITMAP_L2 / 64           // We just drew the BACK pair: publish it.
+    sei
+    sta hudProofPtr + HUD_SCORE_SLOT_L
+    lda #HUD_SCORE_BITMAP_R2 / 64
+    sta hudProofPtr + HUD_SCORE_SLOT_R
+    cli
+    rts
+!publishFront:
+    lda #HUD_SCORE_BITMAP_L / 64
+    sei
+    sta hudProofPtr + HUD_SCORE_SLOT_L
+    lda #HUD_SCORE_BITMAP_R / 64
+    sta hudProofPtr + HUD_SCORE_SLOT_R
+    cli
+    rts
+
+// --- Routine: refreshScoreIfDirty ---------------------------------------
+// Called once per frame from the main loop, after the coarse-scroll admission
+// test and before the frame-end wait. Costs ~19 cycles on a frame with nothing
+// to do.
+//
+// A rebuild is spread over SEVEN frames as a small state machine, and the split
+// is a SAFETY property rather than a convenience. The main loop can reach this
+// call site as late as raster ~299, so on a busy frame there is very little of
+// the frame left; any chunk big enough to overrun waitForGameFrame costs a
+// PRESENTED frame, which is exactly the scroll hitch the earlier stages went to
+// some trouble to remove. Measured: all six places converted in one go costs up
+// to ~7,000 cycles (111 raster lines) in situ and does drop a frame. So:
+//
+//   SCORE_PHASE 0      idle.
+//   0 -> 2             snapshot the live score into CONV_* and convert place 0.
+//   2..6               convert one further decimal place (place = phase - 1).
+//                      Each place is at most 9 subtractions, ~800 cycles.
+//   7                  composeScoreSprites, then back to idle.
+//
+// Phase 7 is the only phase that touches a sprite bitmap, and since Phase 1.1 it
+// writes the DOUBLE-BUFFERED back pair, which the VIC is never fetching -- so
+// its duration no longer has to be proven against the HUD sprites' DMA window
+// at all. It publishes the finished pair through hudProofPtr / hudBorderSetup.
+//
+// The snapshot at phase 0 -> 2 is what makes the spread safe: the six places
+// are converted from a frozen copy, so a kill landing mid-rebuild cannot
+// produce a half-old, half-new number on screen. It just re-dirties the score
+// and is picked up by the next rebuild.
+//
+// Worst-case visible latency is therefore seven frames (~140 ms) after a kill.
+// The score VALUE is always exact immediately; only the digits trail.
+refreshScoreIfDirty:
+    lda SCORE_PHASE
+    bne !running+
+    lda SCORE_DIRTY
+    beq !done+
+    lda #0
+    sta SCORE_DIRTY
+    lda SCORE_LO                            // Snapshot: the rebuild converts a frozen value.
+    sta CONV_LO
+    lda SCORE_MID
+    sta CONV_MID
+    lda SCORE_HI
+    sta CONV_HI
+    ldx #0                                  // Place 0 (100000s) on this same frame.
+    jsr convertScorePlace
+    lda #2
+    sta SCORE_PHASE
+    rts
+!running:
+    cmp #SCORE_DIGITS_N + 1
+    beq !compose+
+    tax
+    dex                                     // X = decimal place = phase - 1
+    jsr convertScorePlace
+    inc SCORE_PHASE
+    rts
+!compose:
+    lda #0
+    sta SCORE_PHASE
+    jmp composeScoreSprites
+!done:
+    rts
+
+// --- Routine: renderScoreHud ----------------------------------------------
+// Synchronous convert + compose. Used at game start (setupScoreDisplay, where
+// nothing is on screen yet) and by the test harness. The per-frame path uses
+// the two halves separately -- see refreshScoreIfDirty. Clobbers A, X, Y.
+renderScoreHud:
+    jsr convertScoreDigits
+    jmp composeScoreSprites
+
+// --- Routine: renderScoreHudBothBuffers ------------------------------------
+// Game-start render. Draws the current score into BOTH double-buffered sprite
+// pairs, so the first in-game publish can never swap in a pair that was never
+// written. Leaves SCORE_BACKBUF back where it started. Clobbers A, X, Y.
+renderScoreHudBothBuffers:
+    lda #0
+    sta SCORE_BACKBUF
+    jsr convertScoreDigits
+    jsr composeScoreSprites                 // draws + publishes the front pair
+    jmp composeScoreSprites                 // draws + publishes the back pair; SCORE_BACKBUF returns to 0
+
+hudScoreCodeEnd:
+.if (hudScoreCodeEnd > HUD_SCORE_CODE_LIMIT) {
+    .error "HUD score module overruns its segment"
+}
+
+#if HUD_PROOF_ENABLE
+#if !HUD_PROOF_PATTERN
+// Deferred to end-of-source: these labels are not resolvable in the first parse.
+.if ((blankSprite & 63) != 0) {
+    .error "blankSprite must stay 64-byte aligned to be usable as a HUD sprite pointer"
+}
+.if ((HUD_SCORE_BITMAP_L & 63) != 0 || (HUD_SCORE_BITMAP_R & 63) != 0) {
+    .error "score sprite bitmaps must be 64-byte aligned"
+}
+#endif
+#endif
