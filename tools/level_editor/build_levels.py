@@ -10,7 +10,6 @@ its includes are generated and committed but never #import-ed by main.asm.
 
 Run from anywhere:  python3 tools/level_editor/build_levels.py
 """
-import subprocess
 import sys
 from pathlib import Path
 
@@ -18,120 +17,45 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
-from engine_data import TERRAIN_GLYPH_BASE, load_engine_data     # noqa: E402
+from engine_data import load_engine_data                        # noqa: E402
 from ka_export import export_level                             # noqa: E402
-from project import LevelProject, save_project                 # noqa: E402
+from project import LevelProject, load_project, save_project   # noqa: E402
 import level2_tileset                                          # noqa: E402
 
 LEVELS_DIR = HERE / "levels"
 GENERATED = REPO / "src" / "generated"
 
-M0, M1_RFILL, M13_GRILLE, M14_MACH = 0, 1, 13, 14
-
-
-def _parse_byte_rows(text, start_label, end_label):
-    rows, inside = [], False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped == f"{start_label}:":
-            inside = True
-            continue
-        if inside and stripped == f"{end_label}:":
-            break
-        if not inside:
-            continue
-        payload = stripped.split("//", 1)[0]
-        if ".byte" not in payload:
-            continue
-        rows.append([int(t) for t in payload.split(".byte", 1)[1].split(",") if t.strip()])
-    if not inside:
-        raise SystemExit(f"could not find {start_label}: in source")
-    return rows
-
-
 # ---------------------------------------------------------------------------
-# Level 1 - the level gameplay consumes. Current riveted-hull tileset & style,
-# bottom-origin, 100 metatile rows. Uses the committed inspection map as its
-# basis; spreads 9 turrets through the level - including a cluster of FIVE that
-# are all simultaneously on one gameplay screen, well past the old 3-visible cap
-# and proving the shared-body-glyph rendering - plus authored wave triggers.
+# Level 1 - the level gameplay consumes.
+#
+# OWNERSHIP: levels/level1/level.json is the CANONICAL, EDITABLE source and this
+# script only exports it. It used to be the other way round: build_level1()
+# reconstructed the level from hard-coded Python constants plus the git-committed
+# stage_test.asm, and re-running this script would have silently replaced the
+# live level with that stale reconstruction. By the time it was noticed the two
+# had diverged badly -- the reconstruction described a 100-row, 9-turret,
+# 5-trigger level with a different palette, while the generated ASM the game
+# actually builds carried 105 rows, 34 metatile defs, 72 glyphs, 10 turrets and
+# 16 wave triggers.
+#
+# The live level was recovered into level.json by
+# tools/level_editor/import_generated_level.py (which inverts ka_export exactly
+# and verifies the round-trip), then re-authored by
+# tools/level_editor/author_level1_five_enemy.py. Nothing here reconstructs
+# terrain, palette, turrets or waves any more.
 # ---------------------------------------------------------------------------
 L1_NAME = "level1"
-L1_PALETTE = {"background": 0, "multicolour1": 11, "multicolour2": 14, "character": 1}
-L1_DIVIDER = 2
-L1_TOP_BAND = range(1, 6)          # M13 GRILLE - FAR / end band
-L1_BOTTOM_BAND = range(94, 98)     # M1 R_FILL  - START / beginning band
-
-# (metatile_row, metatile_col). Distinct rows. Metatile rows 92/91/90/89/88 sit
-# inside one 23-logical-row gameplay screen (world rows 369/365/361/357/353,
-# span 16) - FIVE turrets visible at once, all > 255 (16-bit rows). The rest are
-# solo, one per screen.
-L1_TURRETS = [(92, 6), (91, 3), (90, 8), (89, 1), (88, 5),
-              (60, 4), (40, 2), (20, 8), (8, 1)]
-
-L1_WAVE_DEFS = [
-    {"id": "wd_top_sweep", "name": "Top sweep",
-     "attackId": 0,  # ATTACK_TOP_TURN_LEFT
-     "composition": [{"enemyType": 0, "count": 5}], "spawnInterval": None},
-    {"id": "wd_flank_up", "name": "Left flank U-turn",
-     "attackId": 5,  # ATTACK_LEFT_U_TURN_UP
-     "composition": [{"enemyType": 2, "count": 5}], "spawnInterval": 14},
-]
-# worldRow < STAGE_LOGICAL_ROWS (= 400). 372 & 340 are > 255 (16-bit rows).
-L1_WAVE_TRIGGERS = [
-    {"id": "wt_intro", "worldRow": 372, "waveDef": "wd_top_sweep"},
-    {"id": "wt_ridge", "worldRow": 340, "waveDef": "wd_flank_up"},
-    {"id": "wt_mid", "worldRow": 300, "waveDef": "wd_top_sweep"},
-    {"id": "wt_deep", "worldRow": 200, "waveDef": "wd_flank_up"},
-    {"id": "wt_far", "worldRow": 90, "waveDef": "wd_top_sweep"},
-]
-
-
-def _committed_stage_test():
-    for ref in ("HEAD:src/generated/level1/stage_test.asm",
-                "HEAD:src/generated/stage_test.asm"):
-        try:
-            return subprocess.check_output(["git", "-C", str(REPO), "show", ref], text=True,
-                                           stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            continue
-    # Not committed anywhere yet - fall back to the working copy.
-    p = REPO / "src" / "generated" / "level1" / "stage_test.asm"
-    return p.read_text(encoding="utf-8")
 
 
 def build_level1(engine):
-    src = _committed_stage_test()
-    rows = [r[:] for r in _parse_byte_rows(src, "stageMetatileRows", "STAGE_METATILE_ROWS_END")]
-    if len(rows) != 100 or any(len(r) != 10 for r in rows):
-        raise SystemExit(f"expected a 100 x 10 committed map, got {len(rows)} rows")
-
-    rows[0] = [M0] * 10
-    rows[99] = [M0] * 10
-    for r in L1_TOP_BAND:
-        rows[r] = [M13_GRILLE] * 10
-    for r in L1_BOTTOM_BAND:
-        rows[r] = [M1_RFILL] * 10
-    for mrow, mcol in L1_TURRETS:
-        rows[mrow][mcol] = M14_MACH
-
-    tileset = {
-        "glyphCount": engine.glyph_count,
-        "glyphs": [list(engine.glyphs[TERRAIN_GLYPH_BASE + i]) for i in range(engine.glyph_count)],
-        "metatileDefs": [list(m) for m in engine.metatiles],
-    }
-    return LevelProject(
-        name=L1_NAME,
-        metatile_rows=rows,
-        palette=dict(L1_PALETTE),
-        scroll_frame_divider=L1_DIVIDER,
-        objects=[{"type": "turret", "metatileRow": mr, "metatileCol": mc}
-                 for mr, mc in L1_TURRETS],
-        metatile_metadata={},
-        tileset=tileset,
-        wave_definitions=[dict(d) for d in L1_WAVE_DEFS],
-        wave_triggers=[dict(t) for t in L1_WAVE_TRIGGERS],
-    )
+    """Load Level 1 from its canonical JSON. No reconstruction, no defaults."""
+    json_path = LEVELS_DIR / L1_NAME / "level.json"
+    if not json_path.exists():
+        raise SystemExit(
+            f"{json_path} is missing. Level 1 is JSON-owned; recover it with\n"
+            f"    python3 tools/level_editor/import_generated_level.py level1"
+        )
+    return load_project(json_path)
 
 
 # ---------------------------------------------------------------------------

@@ -877,6 +877,45 @@
 // ($D027 + slot, driven by OBJECT_COLOUR), not the shared $D025/$D026 pair that
 // every other sprite also uses -- so the player can be recoloured without
 // touching enemy or turret colours at all. See the note above playerSprite.
+// ===========================================================================
+// EXPERIMENT: three-layer hires player (branch experimental-three-layer-player)
+// ---------------------------------------------------------------------------
+// One LOGICAL player (object slot 0, protected invariant) expanded by the
+// RENDERER into PLAYER_LAYER_COUNT co-located physical sprite assignments, so
+// the ship can carry that many independent hires colours at full horizontal
+// resolution. The expansion happens in buildSortedObjectList: the player is
+// emitted once per layer, with the layer index packed into the high nibble of
+// the sorted entry. Everything downstream -- the Y sort, initial snapshot,
+// batch scheduler, slot recycling, pointer publication and HUD handoff --
+// then treats each layer as an ordinary sprite, which is exactly the point:
+// no bypass of the proven render-plan architecture.
+//
+// Comment out to build the ORIGINAL single-sprite baseline from the same tree
+// (the pre-experiment code path, byte-identical to accepted main).
+#define OPT_THREE_LAYER_PLAYER
+// EXPERIMENTAL LAYER-COUNT SELECTOR, 1..3. This is the only thing that changes
+// between the 1 / 2 / 3-layer comparison builds: the same expansion path, the
+// same tables, the same publication -- so the comparison measures LAYER COUNT
+// and not three different implementations. PLAYER_LAYER_COUNT = 1 still goes
+// through the experimental path (one bundle member), which is what makes it a
+// controlled baseline rather than a different renderer.
+// LEFT AT 2 for manual playtesting: the 1/2/3 comparison showed the third layer
+// is the cliff. At 2 the longest visible scroll stop is 2 frames (the normal
+// divider-2 cadence) and coarse cadence is the ideal 16.0 frames/row; at 3 it is
+// 61 frames and 18.2. See /reports/two-layer-player-comparative-feasibility.md.
+.const PLAYER_LAYER_COUNT = 2
+// Sorted-entry packing: low nibble = logical object (0..MAX_OBJECTS-1),
+// high nibble = player layer index. Non-player entries always have layer 0.
+.const SORTED_OBJ_MASK   = $0f
+.const SORTED_LAYER_MASK = $f0
+// Three 64-byte HIRES diagnostic bitmaps in the free VIC-bank-0 gap
+// $2c00..$2eff (page B screen ends at $2bff; the HUD sprite block starts at
+// $2f00). Deliberately unmistakable complementary patterns, NOT final art.
+.const PLAYER_LAYER_BASE = $2c00
+.const PLAYER_LAYER_PTR  = PLAYER_LAYER_BASE / 64
+.const PLAYER_LAYER_COL_0 = 14                  // light blue  (hull)
+.const PLAYER_LAYER_COL_1 = 7                   // yellow      (spine)
+.const PLAYER_LAYER_COL_2 = 3                   // cyan        (wing tips)
 .const PLAYER_COLOUR_NORMAL    = 14             // VIC-II light blue: reads clearly over the grey terrain.
 .const PLAYER_COLOUR_MUZZLE    = 2              // VIC-II red: the hull flashes on each volley.
 .const PLAYER_LEFT_CANNON_X    = 4              // Horizontal ray offset from player sprite X.
@@ -3193,6 +3232,9 @@ accelerateEnemyDive:
 buildSortedObjectList:
     lda #0                                  // Load A from #0.
     sta SORTED_COUNT                        // Store A in SORTED_COUNT.
+#if OPT_THREE_LAYER_PLAYER
+    sta PLAYER_IN_SORTED
+#endif
     ldx #0                                  // Load X from #0.
 !collect:
     lda OBJECT_ACTIVE,x                     // Load A from OBJECT_ACTIVE,x.
@@ -3204,12 +3246,37 @@ buildSortedObjectList:
     bcs !next+
     ldy SORTED_COUNT                        // Load Y from SORTED_COUNT.
     txa                                     // Copy X into A.
-    sta SORTED_OBJECTS,y                    // Store A in SORTED_OBJECTS,y.
+    sta SORTED_OBJECTS,y                    // Layer 0 in the high nibble = 0.
     inc SORTED_COUNT                        // Increment SORTED_COUNT by one.
+#if OPT_THREE_LAYER_PLAYER
+    cpx #0                                  // Note whether the PLAYER made the list; its extra
+    bne !next+                              // layers are appended after the WHOLE scan, below.
+    inc PLAYER_IN_SORTED
+#endif
 !next:
     inx                                     // Increment X by one.
     cpx #MAX_OBJECTS                        // Compare X with #MAX_OBJECTS; set flags, leaving X unchanged.
     bne !collect-                           // Branch to !collect- if the previous result was non-zero/not equal.
+#if OPT_THREE_LAYER_PLAYER
+    // The player's EXTRA layers are appended LAST, after every other object,
+    // rather than next to layer 0 at the head of the list.
+    //
+    // WHY: this list is unsorted, and sortObjectsByY is an insertion sort. The
+    // player has the HIGHEST Y of anything on screen, so entries that belong at
+    // the END of the sorted order used to sit at the FRONT of the input -- and
+    // every subsequent enemy insertion then had to shift past all of them. That
+    // is one extra shift per enemy per extra layer, and it was the whole
+    // measured sort cost of the second layer (+86 cycles).
+    //
+    // The SORTED RESULT IS IDENTICAL either way: the inner loop inserts an
+    // equal key AFTER the existing equals (`beq !insert+`), so layer 0 still
+    // precedes layer 1, and an enemy sharing the player's Y still lands after
+    // both. Only the amount of shifting changes.
+    lda PLAYER_IN_SORTED
+    beq !noPlayerLayers+
+    jsr playerLayerEmit                     // append the extra layers
+!noPlayerLayers:
+#endif
     rts                                     // Return to the calling routine.
 
 // --- Routine: sortObjectsByY ------------------------------------------------
@@ -3230,7 +3297,11 @@ sortObjectsByY:
                                             // prefix every pass (a front insertion restarted the whole
                                             // list), which is pure wasted CPU before prepareBackgroundCoarse.
     lda SORTED_OBJECTS,y                    // Load A from SORTED_OBJECTS,y.
-    sta TEMP_OBJECT                         // Store A in TEMP_OBJECT.
+    sta TEMP_OBJECT                         // Keep the PACKED entry: the shift below moves whole
+                                            // bytes, so the layer tag travels with its object.
+#if OPT_THREE_LAYER_PLAYER
+    and #SORTED_OBJ_MASK                    // Strip the layer tag before indexing OBJECT_Y.
+#endif
     tax                                     // Copy A into X.
     lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
     sta TEMP_SORT_Y                         // Store A in TEMP_SORT_Y.
@@ -3238,6 +3309,9 @@ sortObjectsByY:
 
 !inner:
     lda SORTED_OBJECTS,y                    // Load A from SORTED_OBJECTS,y.
+#if OPT_THREE_LAYER_PLAYER
+    and #SORTED_OBJ_MASK                    // Strip the layer tag before indexing OBJECT_Y.
+#endif
     tax                                     // Copy A into X.
     lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
     cmp TEMP_SORT_Y                         // Compare A with TEMP_SORT_Y; set flags, leaving A unchanged.
@@ -3283,6 +3357,14 @@ buildInitialSpriteSnapshot:
     ldx #0                                  // Load X from #0.
 !snapshotLoop:
     ldy SORTED_OBJECTS,x                    // Load Y from SORTED_OBJECTS,x.
+#if OPT_THREE_LAYER_PLAYER
+    sty PLAYER_LAYER_TMP                    // Keep the packed entry for the layer index.
+    tya
+    and #SORTED_LAYER_MASK                  // Layer nibble: 0 for every ordinary object.
+    bne !playerExtraLayer+                  // Player layer > 0 -> specialised path below.
+    // Layer 0: the packed byte IS the logical object index (high nibble zero),
+    // so the common path needs no masking at all and this test is free.
+#endif
     sty TEMP_OBJECT                         // Store Y in TEMP_OBJECT.
 
     txa                                     // Copy X into A.
@@ -3307,6 +3389,19 @@ buildInitialSpriteSnapshot:
     sta INITIAL_COLOUR,y                    // Store A in INITIAL_COLOUR,y.
     txa                                     // Copy the logical object index into A.
     sta INITIAL_OBJECT,y                    // Remember which logical object owns this hardware snapshot entry.
+#if OPT_THREE_LAYER_PLAYER
+    // Player entries take their BITMAP and COLOUR from the layer tables; X/Y,
+    // X-MSB and ownership are the shared logical player values written above,
+    // which is what makes the three layers co-located by construction.
+    // (The player can never be a straddler -- its Y floor is
+    // GAMEPLAY_SPRITE_MIN_Y -- so snapshotSpritePointer's clip path never
+    // applies to it and overwriting its pointer here is safe.)
+    cpx #0
+    bne !notPlayerLayer+
+    jsr playerLayerSnapshot                 // Y = plan entry; restores X = 0.
+!notPlayerLayer:
+!snapshotTail:
+#endif
 
     lda SNAPSHOT_INDEX                      // Load A from SNAPSHOT_INDEX.
     sec                                     // Set carry before subtraction or a carry-dependent operation.
@@ -3317,6 +3412,61 @@ buildInitialSpriteSnapshot:
     bne !snapshotLoop-                      // Branch to !snapshotLoop- if the previous result was non-zero/not equal.
 !done:
     rts                                     // Return to the calling routine.
+#if OPT_THREE_LAYER_PLAYER
+
+// --- Player layer > 0: specialised snapshot ---------------------------------
+// Entry: X = sorted index (== hardware slot), PLAYER_LAYER_TMP = packed entry.
+//
+// WHY THIS IS SAFE TO SHORT-CUT -- what the generic path above would do, and
+// why none of it is needed for an extra player layer:
+//
+//   * X / X-MSB / Y are read from logical object 0 exactly as the generic path
+//     would. Co-location is therefore guaranteed BY CONSTRUCTION, not by
+//     assuming the layers ended up adjacent in the plan: both layers read the
+//     same OBJECT_X / OBJECT_X_MSB / OBJECT_Y in the same frame.
+//   * snapshotSpritePointer is skipped. It exists to give a STRADDLER (Y below
+//     GAMEPLAY_SPRITE_MIN_Y) a private top-clipped bitmap. The living player's
+//     Y floor IS GAMEPLAY_SPRITE_MIN_Y (updateObjects refuses to move it
+//     higher), so the player can never be a straddler and the clip decision can
+//     never apply. Its one side effect that matters -- clearing this plan
+//     entry's clip shadow -- is reproduced below, so the clip cache behaves
+//     exactly as before.
+//   * the generic OBJECT_SPRITE / OBJECT_COLOUR pair was immediately
+//     overwritten by playerLayerSnapshot anyway; here the layer's own pointer
+//     and colour are written once, directly.
+//   * playerLayerEmit only emits extra layers while PLAYER_STATE == 0, and
+//     nothing changes PLAYER_STATE between it and here, so the living-player
+//     test inside playerLayerSnapshot is not needed on this path.
+//
+// Cost: ~121 cycles against ~210 for the generic path, with two nested
+// jsr/rts pairs removed.
+!playerExtraLayer:
+    txa                                     // Plan entry index = slot + BUILD_PLAN.
+    clc
+    adc BUILD_PLAN
+    sta SNAPSHOT_INDEX
+    tay
+    lda OBJECT_X                            // Logical object 0 is permanently the player.
+    sta INITIAL_X,y
+    lda OBJECT_X_MSB
+    sta INITIAL_X_MSB,y
+    lda OBJECT_Y
+    sta INITIAL_Y,y
+    lda #0
+    sta CLIP_SHADOW_PTR,y                   // As snapshotSpritePointer's plain path would.
+    sta INITIAL_OBJECT,y                    // Owner is logical object 0, the player.
+    lda PLAYER_LAYER_TMP                    // Layer index from the packed entry's high nibble.
+    lsr
+    lsr
+    lsr
+    lsr
+    tax
+    lda playerLayerSprite,x
+    sta INITIAL_SPRITE,y
+    lda playerLayerColour,x
+    sta INITIAL_COLOUR,y
+    jmp !snapshotTail-
+#endif
 
 // --- Routine: snapshotSpritePointer --------------------------------------------
 // Entry: X = logical object, Y = SNAPSHOT_INDEX = plan entry index (BUILD_PLAN +
@@ -3517,7 +3667,11 @@ buildBatchSpriteSchedule:
     ldy BUILD_PLAN
     lda #0
     sta BATCH_COUNT,y
+#if OPT_THREE_LAYER_PLAYER
+    jmp playerLayerAudit                    // ends in rts
+#else
     rts
+#endif
 !hasReuse:
 #endif
     jsr beginRasterPlanMasks               // BUILD-only final hardware masks, outside the IRQ loop.
@@ -3534,6 +3688,9 @@ buildBatchSpriteSchedule:
     bcs !unusedSlot+                        // Branch to !unusedSlot+ if carry is set.
 
     lda SORTED_OBJECTS,y                    // Load A from SORTED_OBJECTS,y.
+#if OPT_THREE_LAYER_PLAYER
+    and #SORTED_OBJ_MASK                    // Strip the layer tag before indexing OBJECT_Y.
+#endif
     tax                                     // Copy A into X.
     lda OBJECT_Y,x                          // Load A from OBJECT_Y,x.
     clc                                     // Clear carry before an addition or shift-dependent operation.
@@ -3578,7 +3735,11 @@ buildBatchSpriteSchedule:
     lda SORTED_COUNT                        // Load A from SORTED_COUNT.
     cmp #9                                  // Compare A with #9; set flags, leaving A unchanged.
     bcs !needsSchedule+                     // Branch to !needsSchedule+ if carry is set.
+#if OPT_THREE_LAYER_PLAYER
+    jmp playerLayerAudit                    // ends in rts
+#else
     rts                                     // Return to the calling routine.
+#endif
 
 !needsSchedule:
     lda #8                                  // Load A from #8.
@@ -3588,7 +3749,11 @@ buildBatchSpriteSchedule:
     lda SCHED_OBJECT_INDEX                  // Load A from SCHED_OBJECT_INDEX.
     cmp SORTED_COUNT                        // Compare A with SORTED_COUNT; set flags, leaving A unchanged.
     bcc !objectsRemain+                     // Branch to !objectsRemain+ if carry is clear.
+#if OPT_THREE_LAYER_PLAYER
+    jmp playerLayerAudit                    // ends in rts
+#else
     rts                                     // Return to the calling routine.
+#endif
 
 !objectsRemain:
     lda #0                                  // Load A from #0.
@@ -3599,6 +3764,10 @@ buildBatchSpriteSchedule:
 !tryObject:
     ldy SCHED_OBJECT_INDEX                  // Load Y from SCHED_OBJECT_INDEX.
     lda SORTED_OBJECTS,y                    // Load A from SORTED_OBJECTS,y.
+#if OPT_THREE_LAYER_PLAYER
+    sta PLAYER_LAYER_TMP                    // Keep the packed entry for the layer lookup below.
+    and #SORTED_OBJ_MASK
+#endif
     sta TEMP_OBJECT                         // Store A in TEMP_OBJECT.
     tax                                     // Copy A into X.
 
@@ -3689,6 +3858,12 @@ buildBatchSpriteSchedule:
     sta ASSIGN_COLOUR,x                     // Store A in ASSIGN_COLOUR,x.
     tya                                     // Copy the logical object index into A.
     sta ASSIGN_OBJECT,x                     // Remember which object will own the recycled hardware slot.
+#if OPT_THREE_LAYER_PLAYER
+    cpy #0                                  // Player layer? Take bitmap + colour from the layer tables.
+    bne !notPlayerAssign+
+    jsr playerLayerAssign                   // X = assignment index; restores Y = 0.
+!notPlayerAssign:
+#endif
     jsr extendRasterPlanMasks              // Snapshot final masks without changing slot selection.
 
     inc SCHED_ASSIGN_INDEX                  // Increment SCHED_ASSIGN_INDEX by one.
@@ -3727,6 +3902,27 @@ buildBatchSpriteSchedule:
     sta BATCH_ASSIGN_COUNT,x                // Store A in BATCH_ASSIGN_COUNT,x.
     lda SCHED_PLAYER_MASK
     sta BATCH_PLAYER_MASK,x
+#if OPT_THREE_LAYER_PLAYER
+    // $D01C for this batch, resolved HERE (BUILD) rather than in the IRQ, so the
+    // IRQ never has to reason about who owns the HUD slots.
+    //
+    // The rule: every gameplay sprite is multicolour EXCEPT the player's layers,
+    // which are hires -- i.e. ~PLAYER_MASK. That is correct for the whole
+    // register only AFTER hudBorderHandoff has given slots HUD_SLOT_FIRST..7
+    // back to gameplay. A batch scheduled BEFORE the handoff must leave those
+    // slots HIRES, because the HUD sprites are still being fetched; writing the
+    // whole register there would flip the score sprites to multicolour mid-DMA.
+    // Masking the HUD block to hires for such a batch makes that structurally
+    // impossible instead of merely unlikely.
+    lda SCHED_PLAYER_MASK
+    eor #$ff                                // all gameplay slots MC, player slots hires
+    ldy SCHED_BATCH_LATEST                  // this batch's raster (stored to BATCH_RASTER above)
+    cpy #HUD_HANDOFF_COMPLETE_RASTER
+    bcs !batchModeReady+                    // fires after the handoff: whole register is gameplay
+    and #(($01 << HUD_SLOT_FIRST) - 1)      // fires before it: HUD slots stay hires (bits clear)
+!batchModeReady:
+    sta BATCH_MODE_MASK,x
+#endif
     lda SCHED_X_MSB_MASK
     sta BATCH_X_MSB_MASK,x
 
@@ -3741,7 +3937,11 @@ buildBatchSpriteSchedule:
     bcs !done+                              // Branch to !done+ if carry is set.
     jmp !startBatch-                        // Long loop transfer
 !done:
+#if OPT_THREE_LAYER_PLAYER
+    jmp playerLayerAudit                    // ends in rts
+#else
     rts                                     // Return to the calling routine.
+#endif
 
 
 // --- Routine: setupLivesDisplay --------------------------------------------
@@ -4099,6 +4299,9 @@ renderSprites:
     lda INITIAL_OBJECT,y                    // Which logical object owns this snapshot entry?
     bne !notPlayer+                         // Object 0 is permanently reserved for the player.
     lda HW_BIT_MASK,x                       // Convert the hardware sprite slot into its collision bit.
+#if OPT_THREE_LAYER_PLAYER
+    ora PLAYER_HW_MASK                      // ACCUMULATE: the player now owns one slot PER LAYER.
+#endif
     sta PLAYER_HW_MASK                      // Remember where the player currently lives in VIC hardware.
 !notPlayer:
 
@@ -4129,6 +4332,16 @@ rasterInitialApplied:                       // Diagnostic trace: X is hardware s
     ora #HUD_D010_KEEP                      // keep the HUD sprites' X-MSB bit(s) through their DMA
 #endif
     sta SPRITE_OVERFLOW_REGISTER            // Store A in SPRITE_OVERFLOW_REGISTER.
+#if OPT_THREE_LAYER_PLAYER
+    // $D01C follows one rule everywhere: every gameplay sprite is multicolour
+    // EXCEPT the player's layers, which are hires. So the whole register is
+    // just ~PLAYER_HW_MASK -- no extra per-slot table, and it stays correct
+    // automatically as the player moves between physical slots.
+    // Here only the non-HUD slots may be touched: hudBorderSetup owns
+    // HUD_SLOT_FIRST..7 (hires) until hudBorderHandoff re-applies the gameplay
+    // mode for them.
+    jsr playerLayerModeInitial
+#endif
 rasterInitialMasksApplied:
     rts                                     // Return to the calling routine.
 
@@ -4739,11 +4952,16 @@ spritePointers:
     .byte enemySpriteA / 64             // Object 15
 
 // --- Read-only engine lookup tables ----------------------------------------
-// Base was $1f00 until the sprite-pointer publication-race repair added a call
-// at armFirstBatch's entry and the main code block reached $1f01. These are
-// alignment-free read-only tables and the block below still ends far short of
-// the $1fc0 border-marker sprite, so the origin simply moves up.
-.const ENGINE_LOOKUP_SEGMENT = $1f20
+// Base was $1f00, then $1f20, then $1f60: each time the main code block below
+// $1f00 grew, this alignment-free read-only block simply moved up. It has now
+// run out of room there -- the block is $5a bytes and the $1fc0 border-marker
+// sprite caps it -- so it moves out of the low region entirely, into the free
+// hole above the authored wave-trigger tables ($7100..$723d). These are plain
+// CPU-side lookup tables (bit masks, star row addresses, HUD proof tables);
+// nothing here is VIC-fetched or alignment-sensitive, and every reader uses
+// absolute or absolute-indexed addressing, so the address is unconstrained.
+// Placed on a page boundary so no table straddles one.
+.const ENGINE_LOOKUP_SEGMENT = $7300
 * = ENGINE_LOOKUP_SEGMENT
 HW_BIT_MASK:
     .byte %00000001,%00000010,%00000100,%00001000
@@ -4787,8 +5005,8 @@ hudProofColour: .byte HUD_SCORE_COLOUR, HUD_SCORE_COLOUR, 0, 0
 #endif
 
 LOOKUP_TABLES_END:
-.if (LOOKUP_TABLES_END > $2000) {
-    .error "Lookup tables overlap engine runtime state"
+.if (LOOKUP_TABLES_END > $8000) {
+    .error "Lookup tables run into the $8000 score module"
 }
 
 #if BORDER_PROOF_ENABLE
@@ -4871,7 +5089,13 @@ OBJECT_BASE_SPRITE:    .fill MAX_OBJECTS, 0     // Immutable formation bitmap us
 OBJECT_HEALTH:         .fill MAX_OBJECTS, 0     // Current enemy HP; player slot is presently unused.
 OBJECT_HIT_TIMER:      .fill MAX_OBJECTS, 0     // Remaining colour-flash frames after ballistic impact.
 OBJECT_DEATH_TIMER:    .fill MAX_OBJECTS, 0     // Non-zero while an enemy death animation owns the active slot.
+#if OPT_THREE_LAYER_PLAYER
+// One logical object no longer produces exactly one sorted entry: the player
+// produces PLAYER_LAYER_COUNT. This is the capacity that assumption lived in.
+SORTED_OBJECTS:        .fill MAX_OBJECTS + PLAYER_LAYER_COUNT - 1, $ff
+#else
 SORTED_OBJECTS:        .fill MAX_OBJECTS, $ff
+#endif
 SORTED_COUNT:          .byte 0
 
 OBJECT_PATTERN:        .fill MAX_OBJECTS, 0
@@ -8244,12 +8468,30 @@ startAuthoredWave:
 // Authored wave-trigger tables, materialised at assembly time from the generated
 // stage_waves.asm lists (sorted DESCENDING by world row). Empty labels when
 // WAVE_TRIGGER_COUNT == 0 (autonomous path stays active).
+//
+// LEVEL-OWNED, VARIABLE LENGTH: 6 * WAVE_TRIGGER_COUNT bytes. These used to sit
+// inline in this background/HUD code block, which is capped at $5a00 by the
+// terrain glyph block -- so a level with a dense wave schedule displaced timing
+// code and broke the build (Level 1's five-enemy rebalance needs 53 triggers =
+// 318 bytes, against ~211 bytes of headroom). They now live in their own fixed
+// segment for exactly the reason terrainGlyphs ($5a00) and the metatile stage
+// tables ($6600) already do: a variable-length LEVEL block must never sit inside
+// a code segment. The program counter is saved and restored around it, so the
+// code that follows is unmoved and this is a pure relocation of level bytes.
+.const WAVE_TRIGGER_TABLE_SEGMENT = $7100
+.var waveTrigResumePC = *
+* = WAVE_TRIGGER_TABLE_SEGMENT
 waveTrigRowLo:    .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerRowLo.get(i) }
 waveTrigRowHi:    .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerRowHi.get(i) }
 waveTrigAttackId: .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerAttackId.get(i) }
 waveTrigCount:    .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerCount.get(i) }
 waveTrigSprite:   .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerSprite.get(i) }
 waveTrigInterval: .if (WAVE_TRIGGER_COUNT > 0) { .fill WAVE_TRIGGER_COUNT, waveTriggerInterval.get(i) }
+WAVE_TRIGGER_TABLE_END:
+.if (WAVE_TRIGGER_TABLE_END > $8000) {
+    .error "authored wave-trigger tables overflow their $7100 segment (too many wave triggers)"
+}
+* = waveTrigResumePC
 
 BACKGROUND_CODE_END:
 .if (BACKGROUND_CODE_END > $a000) {
@@ -8342,7 +8584,7 @@ hudBorderHandoff:
     sta HUD_HO_RC                          // gameplay initial-sprite count (IRQ scratch)
     lda SPRITE_MODE                        // restore MC for the HUD slots (gameplay sprites are MC)
     ora #(($ff << HUD_SLOT_FIRST) & $ff)
-    sta SPRITE_MODE
+    sta SPRITE_MODE                        // (three-layer build re-derives $D01C after the reclaim loop)
     lda SPRITE_OVERFLOW_REGISTER           // start $D010 fixup: clear the HUD slots' X-MSB
     and #(($01 << HUD_SLOT_FIRST) - 1)
     sta HUD_HO_MSB
@@ -8402,6 +8644,15 @@ hudSlotReclaimed:                          // Diagnostic trace: X is the hardwar
 !done:
     lda HUD_HO_MSB
     sta SPRITE_OVERFLOW_REGISTER
+#if OPT_THREE_LAYER_PLAYER
+    // The HUD has now handed slots HUD_SLOT_FIRST..7 back, so every slot is a
+    // gameplay slot and the one rule applies to the whole register: all
+    // multicolour except the player's layers. The reclaim loop above has just
+    // OR-ed any deferred player slots into PLAYER_HW_MASK, so this is exact.
+    lda PLAYER_HW_MASK
+    eor #$ff
+    sta SPRITE_MODE
+#endif
     ldx HUD_HO_RC                          // $D015 = exactly the gameplay initial slots (drop HUD-leftover bits)
     lda SPRITE_ENABLE_MASK,x
     sta SPRITE_ENABLE
@@ -9267,4 +9518,249 @@ hudScoreCodeEnd:
     .error "score sprite bitmaps must be 64-byte aligned"
 }
 #endif
+#endif
+
+#if OPT_THREE_LAYER_PLAYER
+// ===========================================================================
+// Three-layer player experiment: CPU-only helper + per-layer tables.
+// Its own fixed segment in the free $6e19..$7fff hole so it cannot displace
+// the tightly packed lookup-table / BASIC-end blocks or the 64-byte-aligned
+// sprite bitmaps.
+// ===========================================================================
+.const PLAYER_LAYER_SEGMENT = $7000
+* = PLAYER_LAYER_SEGMENT
+
+// --- Routine: playerLayerIndex --------------------------------------------
+// A = the layer index (0..PLAYER_LAYER_COUNT-1) of the sorted entry currently
+// being expanded, taken from the high nibble PLAYER_LAYER_TMP was loaded with.
+// Preserves X. Clobbers A only.
+playerLayerIndex:
+    lda PLAYER_LAYER_TMP
+    lsr
+    lsr
+    lsr
+    lsr
+    rts
+
+PLAYER_LAYER_TMP:  .byte 0                 // packed sorted entry of the entry being expanded
+PLAYER_IN_SORTED:  .byte 0                 // 1 => the player was collected this frame, so its
+                                           // extra layers are appended after the whole scan
+
+// Per-layer bitmap pointer and colour. Only these two differ between layers;
+// position, X-MSB, visibility and logical ownership are shared.
+// --- Routine: playerLayerEmit ---------------------------------------------
+// Append the player's EXTRA layers to the sorted list (layer 0 was already
+// emitted by the normal path). Preserves X, the caller's object loop counter.
+playerLayerEmit:
+.if (PLAYER_LAYER_COUNT > 1) {
+    lda PLAYER_STATE                       // Layers are the LIVING player's presentation only.
+    bne !single+                           // Exploding / respawning: fall back to the existing
+                                           // single-sprite presentation (see playerLayerSnapshot).
+    // One extra sorted entry per layer above the first; layer 0 was already
+    // emitted by the normal path. Unrolled by PLAYER_LAYER_COUNT so the 1-layer
+    // build emits nothing at all here and costs nothing.
+    .for (var layer = 1; layer < PLAYER_LAYER_COUNT; layer++) {
+        ldy SORTED_COUNT
+        lda #(layer << 4)                  // object 0, this layer
+        sta SORTED_OBJECTS,y
+        inc SORTED_COUNT
+    }
+!single:
+}
+    rts
+
+// --- Routine: playerLayerSnapshot -----------------------------------------
+// Entry: Y = BUILD plan entry index, PLAYER_LAYER_TMP = packed sorted entry.
+// Overwrites this entry's bitmap pointer and colour with the layer's. Position,
+// X-MSB and ownership were already written from the shared logical player, so
+// the layers are co-located by construction. Exit: X = 0 (logical player).
+playerLayerSnapshot:
+    lda PLAYER_STATE                       // Only the LIVING player is layered. During
+    bne !keep+                             // explosion / respawn-blink the existing single-sprite
+    jsr playerLayerIndex                   // presentation (OBJECT_SPRITE / OBJECT_COLOUR: explosion
+    tax                                    // frames, blankSprite blink) is used unchanged, which is
+    lda playerLayerSprite,x                // what playerLayerEmit's matching gate arranges.
+    sta INITIAL_SPRITE,y
+    cpx #0                                 // Layer 0 is the HULL: leave the colour the object's own
+    beq !keep+                             // OBJECT_COLOUR, so the existing colour state machine
+    lda playerLayerColour,x                // (normal blue / red muzzle flash) still drives it.
+    sta INITIAL_COLOUR,y
+!keep:
+    ldx #0
+    rts
+
+// --- Routine: playerLayerAssign -------------------------------------------
+// Entry: X = buffered assignment index, PLAYER_LAYER_TMP = packed sorted entry.
+// Exit: Y = 0 (logical player), X unchanged for extendRasterPlanMasks.
+playerLayerAssign:
+    lda PLAYER_STATE                       // See playerLayerSnapshot.
+    bne !keep+
+    jsr playerLayerIndex
+    tay
+    lda playerLayerSprite,y
+    sta ASSIGN_SPRITE,x
+    cpy #0                                 // Layer 0 keeps OBJECT_COLOUR (hull / muzzle flash).
+    beq !keep+
+    lda playerLayerColour,y
+    sta ASSIGN_COLOUR,x
+!keep:
+    ldy #0
+    rts
+
+// --- Routine: playerLayerModeInitial --------------------------------------
+// $D01C for the frame-top initial write. One rule: every gameplay sprite is
+// multicolour EXCEPT the player's layers, so the register is just
+// ~PLAYER_HW_MASK -- no per-slot table, and it stays correct automatically as
+// the player moves between physical slots. Only the non-HUD slots may be
+// touched here: hudBorderSetup owns HUD_SLOT_FIRST..7 (hires) until
+// hudBorderHandoff re-applies the gameplay mode for them.
+playerLayerModeInitial:
+    lda PLAYER_HW_MASK
+    eor #$ff
+    and #(($01 << HUD_SLOT_FIRST) - 1)
+    sta PLAYER_LAYER_TMP
+    lda SPRITE_MODE
+    and #(($ff << HUD_SLOT_FIRST) & $ff)
+    ora PLAYER_LAYER_TMP
+    sta SPRITE_MODE
+    rts
+
+// --- Routine: playerLayerAudit --------------------------------------------
+// ATOMIC BUNDLE INSTRUMENTATION. Called at every exit of
+// buildBatchSpriteSchedule. Works out how many physical slots the finished
+// BUILD plan actually gives the player and records a shortfall rather than
+// hiding it -- for a feasibility experiment, a visible capacity failure is
+// worth far more than a plausible-looking picture.
+//
+// The player is the lowest object, so its batch is the last one; the final
+// batch's player mask is therefore the ownership in force when the player's
+// DMA happens. With no batches at all, every sorted entry is an INITIAL entry.
+playerLayerAudit:
+    lda PLAYER_STATE                       // Only the LIVING player has a bundle to allocate.
+    beq !alive+                            // While exploding / respawning playerLayerEmit
+    rts                                    // deliberately emits ONE entry, which is not a
+!alive:                                    // shortfall -- counting it made PLAYER_BUNDLE_SHORT
+                                           // read as a capacity failure when it was just death.
+    ldy BUILD_PLAN
+    lda BATCH_COUNT,y
+    beq !fromInitial+
+    clc
+    adc BUILD_PLAN
+    tax
+    dex                                    // last batch index
+    lda BATCH_PLAYER_MASK,x
+    jmp !count+
+!fromInitial:
+    lda #0
+    sta PLAYER_LAYER_TMP
+    ldx #0
+!ini:
+    ldy BUILD_PLAN
+    txa                                    // no cpx abs,y on NMOS 6502
+    cmp RENDER_COUNT,y
+    bcs !haveMask+
+    txa
+    clc
+    adc BUILD_PLAN
+    tay
+    lda INITIAL_OBJECT,y
+    bne !iniNext+
+    lda PLAYER_LAYER_TMP
+    ora HW_BIT_MASK,x
+    sta PLAYER_LAYER_TMP
+!iniNext:
+    inx
+    cpx #8
+    bcc !ini-
+!haveMask:
+    lda PLAYER_LAYER_TMP
+!count:
+    ldy #0                                 // popcount A -> Y
+    ldx #8
+!pc:
+    lsr
+    bcc !pcSkip+
+    iny
+!pcSkip:
+    dex
+    bne !pc-
+    sty PLAYER_LAYERS_LIVE
+    cpy #PLAYER_LAYER_COUNT
+    bcs !full+
+    inc PLAYER_BUNDLE_SHORT                // this frame could not place the whole bundle
+    bne !full+
+    inc PLAYER_BUNDLE_SHORT + 1
+!full:
+    rts
+
+PLAYER_LAYERS_LIVE:   .byte 0              // layers the finished BUILD plan gives the player
+PLAYER_BUNDLE_SHORT:  .word 0              // frames where that was < PLAYER_LAYER_COUNT
+
+// One entry per layer, sized by PLAYER_LAYER_COUNT so 1 / 2 / 3-layer builds
+// share exactly this code. Layer 0 is the hull (its colour comes from the
+// object's own OBJECT_COLOUR, so the entry below is unused for it).
+playerLayerSprite: .fill PLAYER_LAYER_COUNT, PLAYER_LAYER_PTR + i
+playerLayerColour: .byte PLAYER_LAYER_COL_0
+    .if (PLAYER_LAYER_COUNT > 1) { .byte PLAYER_LAYER_COL_1 }
+    .if (PLAYER_LAYER_COUNT > 2) { .byte PLAYER_LAYER_COL_2 }
+.if (playerLayerColour - playerLayerSprite != PLAYER_LAYER_COUNT) {
+    .error "playerLayerSprite must hold exactly PLAYER_LAYER_COUNT entries"
+}
+.if (PLAYER_LAYER_COUNT < 1 || PLAYER_LAYER_COUNT > 3) {
+    .error "PLAYER_LAYER_COUNT must be 1, 2 or 3"
+}
+.if (* > $7100) {
+    .error "three-layer player helper/tables overflowed their $7000 segment"
+}
+#endif
+
+#if OPT_THREE_LAYER_PLAYER
+// ===========================================================================
+// Three diagnostic HIRES player layers, 64-byte aligned in the free VIC-bank-0
+// gap $2c00..$2eff (page B screen ends $2bff, HUD sprites start $2f00).
+//
+// DIAGNOSTIC, NOT FINAL ART. Deliberately complementary so the overlay is
+// unmistakable and each layer's own colour is identifiable in a screenshot:
+//   layer 0 (light blue) full 12-px-wide hull outline
+//   layer 1 (yellow)     central spine only
+//   layer 2 (cyan)       the two wing tips only
+// No pixel is set in more than one layer, so a correct three-layer render
+// shows all three colours and a missing layer is immediately visible.
+// ===========================================================================
+* = PLAYER_LAYER_BASE
+playerLayer0:                               // hull outline
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$00,$00,  $01,$00,$80
+    .byte $02,$00,$40,  $04,$00,$20,  $08,$00,$10,  $10,$00,$08
+    .byte $20,$00,$04,  $20,$00,$04,  $20,$00,$04,  $20,$00,$04
+    .byte $10,$00,$08,  $08,$00,$10,  $04,$00,$20,  $02,$00,$40
+    .byte $01,$00,$80,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $00,$00,$00,  $00
+playerLayer1:                               // central spine
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$18,$00,  $00,$18,$00
+    .byte $00,$18,$00,  $00,$18,$00,  $00,$18,$00,  $00,$18,$00
+    .byte $00,$18,$00,  $00,$3c,$00,  $00,$3c,$00,  $00,$18,$00
+    .byte $00,$18,$00,  $00,$18,$00,  $00,$18,$00,  $00,$18,$00
+    .byte $00,$18,$00,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $00,$00,$00,  $00
+playerLayer2:                               // wing tips
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $c0,$00,$03,  $c0,$00,$03,  $c0,$00,$03,  $c0,$00,$03
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $00,$00,$00,  $00,$00,$00,  $00,$00,$00,  $00,$00,$00
+    .byte $00,$00,$00,  $00
+playerLayersEnd:
+// All three bitmaps are assembled whatever PLAYER_LAYER_COUNT is, so the 1 / 2 /
+// 3-layer comparison builds have an IDENTICAL memory footprint here and differ
+// only in how many of them the renderer actually publishes. Layers beyond the
+// count are simply never pointed at.
+.if (playerLayer0 != PLAYER_LAYER_BASE || playerLayersEnd != PLAYER_LAYER_BASE + 3 * 64) {
+    .error "player layer bitmaps must be exactly 3 x 64 bytes at PLAYER_LAYER_BASE"
+}
+.if ((PLAYER_LAYER_BASE & 63) != 0) {
+    .error "player layer bitmaps must be 64-byte aligned"
+}
+.if (playerLayersEnd > HUD_SPRITE_BASE) {
+    .error "player layer bitmaps run into the HUD sprite block"
+}
 #endif

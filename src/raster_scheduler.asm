@@ -888,6 +888,11 @@ rasterAssignmentApplied:
     sta SPRITE_OVERFLOW_REGISTER
     lda BATCH_PLAYER_MASK,x
     sta PLAYER_HW_MASK
+#if OPT_THREE_LAYER_PLAYER
+    lda BATCH_MODE_MASK,x                  // $D01C resolved in BUILD (see buildBatchSpriteSchedule):
+    sta SPRITE_MODE                        // gameplay MC, player layers hires, and the HUD block left
+                                           // hires for any batch that fires before hudBorderHandoff.
+#endif
 rasterBatchMasksApplied:
     inc BATCH_INDEX
     inc RASTER_BATCH_OFFSET
@@ -910,6 +915,9 @@ beginRasterPlanMasks:
     lda INITIAL_OBJECT,y
     bne !x+
     lda HW_BIT_MASK,x
+#if OPT_THREE_LAYER_PLAYER
+    ora SCHED_PLAYER_MASK                  // ACCUMULATE: one slot per player layer.
+#endif
     sta SCHED_PLAYER_MASK
 !x:
     lda INITIAL_X_MSB,y
@@ -934,6 +942,9 @@ extendRasterPlanMasks:
     lda ASSIGN_OBJECT,y
     bne !x+
     lda HW_BIT_MASK,x
+#if OPT_THREE_LAYER_PLAYER
+    ora SCHED_PLAYER_MASK                  // ACCUMULATE: sibling layers keep their bits.
+#endif
     sta SCHED_PLAYER_MASK
 !x:
     lda SCHED_X_MSB_MASK
@@ -987,6 +998,9 @@ SCHED_PLAYER_MASK:             .byte 0
 SCHED_X_MSB_MASK:              .byte 0
 BATCH_PLAYER_MASK:             .fill 16, 0
 BATCH_X_MSB_MASK:              .fill 16, 0
+#if OPT_THREE_LAYER_PLAYER
+BATCH_MODE_MASK:               .fill 16, $ff   // per-batch $D01C, resolved in BUILD
+#endif
 // Top-clipped sprite bookkeeping (see buildClippedInitialSprite in main.asm).
 // Zeroed here at game start; CLIP_SHADOW_PTR=0 means the matching pool slot
 // does not currently mirror a straddler bitmap.
